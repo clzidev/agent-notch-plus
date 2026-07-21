@@ -1242,6 +1242,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.setExpanded(false)
             }
         }
+        // global monitors don't see clicks in our own windows — this local
+        // monitor closes the panel when a click lands on the terminal,
+        // settings or gallery windows
+        NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] e in
+            if let self, self.expanded, e.window !== self.window {
+                self.setExpanded(false)
+            }
+            return e
+        }
         window.orderFrontRegardless()
         indicatorWindow.orderFrontRegardless()
 
@@ -1666,6 +1675,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc fileprivate func showSettings() {
         NSApp.activate(ignoringOtherApps: true)
+        // the notch panel folds away — otherwise it lingers behind the
+        // settings window with no mouse route left to dismiss it
+        if expanded { hoverOpened = false; setExpanded(false) }
         settingsWindow?.close()  // rebuild fresh so staged values start from disk
 
         func row(_ title: String, _ views: [NSView]) -> NSStackView {
@@ -1740,19 +1752,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 14
-        stack.edgeInsets = NSEdgeInsets(top: 24, left: 24, bottom: 24, right: 24)
+        stack.spacing = 20
+        stack.edgeInsets = NSEdgeInsets(top: 32, left: 32, bottom: 32, right: 32)
 
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 320),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 660, height: 460),
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
         w.title = L("settings_title")
         w.isReleasedWhenClosed = false
         w.contentView = stack
-        w.setContentSize(stack.fittingSize)
-        w.center()
+        let fit = stack.fittingSize
+        w.setContentSize(NSSize(width: max(660, fit.width + 48), height: fit.height))
+        // always above the notch panel AND the terminal, on the notch's screen
+        w.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 2)
+        positionOnNotchScreen(w)
         settingsWindow = w
         w.makeKeyAndOrderFront(nil)
-        saveRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
+        saveRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -64).isActive = true
+    }
+
+    /// Center a utility window on the screen that owns the notch, not
+    /// whatever screen happens to be "main".
+    private func positionOnNotchScreen(_ w: NSWindow) {
+        let s = screen.frame
+        let f = w.frame
+        w.setFrameOrigin(NSPoint(x: s.midX - f.width / 2, y: s.midY - f.height / 2))
     }
 
     @objc private func saveSettings() {
@@ -1914,6 +1937,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showGifGallery() {
         NSApp.activate(ignoringOtherApps: true)
+        if expanded { hoverOpened = false; setExpanded(false) }
         galleryWindow?.close()
         let search = NSTextField(string: "")
         search.placeholderString = "fire, robot, corazón…"
@@ -1969,7 +1993,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         w.isReleasedWhenClosed = false
         w.contentView = root
         w.setContentSize(root.fittingSize)
-        w.center()
+        w.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 2)
+        positionOnNotchScreen(w)
         galleryWindow = w
         w.makeKeyAndOrderFront(nil)
         populateGallery(filter: "")

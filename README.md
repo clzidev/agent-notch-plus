@@ -70,6 +70,14 @@ open /Applications/AgentNotchPlus.app
 
 Then enable **Launch at login** from the settings panel (right-click the indicator → Settings). If you quit the app, reopen it from Launchpad/Spotlight.
 
+To share it, build a **universal DMG** (Apple Silicon + Intel, needs only Command Line Tools):
+
+```sh
+./scripts/make-dmg.sh   # → build/AgentNotchPlus.dmg
+```
+
+Note: the app is ad-hoc signed and not notarized (that needs a paid Apple Developer ID). People who download the DMG must right-click → Open the first time, or allow it in System Settings → Privacy & Security.
+
 Or as a bare binary:
 
 ```sh
