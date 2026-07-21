@@ -44,6 +44,7 @@ The collapsed window is transparent and fully click-through except the tiny indi
 - **Animated emoji mascots — no API, no account** — a scrollable gallery of 60 [Noto Animated Emoji](https://googlefonts.github.io/noto-emoji-animation/) (small transparent-background GIFs served by Google's public CDN). Search by name (EN/ES), click one and it instantly replaces the Claude or Codex mascot; one click restores the original. Fetching these emoji is the app's only network access.
 - **Sounds** (optional, off by default) — a chime when an agent finishes (Glass) and when it goes quiet awaiting your input (Ping). At most once per activity episode.
 - **Bilingual UI** — English/Spanish, selectable in settings (defaults to the system language).
+- **Real app bundle** — `scripts/build-app.sh` produces `AgentNotchPlus.app` (icon, Launchpad entry, no Dock clutter) with a **Launch at login** toggle in settings (`SMAppService`).
 - Config lives in `~/.config/agent-notch/` (`pet`, `claude-gif`, `codex-gif`, `lang`, `zoom`, `term-hotkey`, `sound-done`, `sound-attention`; downloaded emoji land in `gifs/`) and is re-read every 3 s, so changes apply live.
 - The Codex pet spritesheets are now resolved relative to the binary (with the original hardcoded path as fallback), so the app works from any clone location.
 
@@ -58,6 +59,18 @@ echo dewey > ~/.config/agent-notch/pet
 Options: `codex`, `dewey`, `fireball`, `rocky`, `seedy`, `stacky`, `bsod`, `null-signal`. Takes effect within a couple of seconds, no restart needed. (Spritesheets © OpenAI, from their public pets CDN.)
 
 ## Build & run
+
+As a regular app (recommended — icon in Launchpad, launch-at-login support):
+
+```sh
+./scripts/build-app.sh
+cp -R build/AgentNotchPlus.app /Applications/
+open /Applications/AgentNotchPlus.app
+```
+
+Then enable **Launch at login** from the settings panel (right-click the indicator → Settings). If you quit the app, reopen it from Launchpad/Spotlight.
+
+Or as a bare binary:
 
 ```sh
 swift build -c release

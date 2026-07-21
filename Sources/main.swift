@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import Carbon.HIToolbox
+import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
@@ -40,6 +41,11 @@ enum L10n {
         "language": ["Language:", "Idioma:"],
         "codex_pet": ["Codex pet:", "Pet de Codex:"],
         "mascots": ["Animated mascots:", "Mascotas animadas:"],
+        "startup": ["Startup:", "Inicio:"],
+        "login_item": ["Launch at login", "Iniciar al iniciar la Mac"],
+        "login_needs_app": ["Install the app first", "Primero instalá la app"],
+        "login_needs_app_info": ["Launch at login needs the installed app: run scripts/build-app.sh and copy build/AgentNotchPlus.app to /Applications.",
+                                 "Iniciar al arrancar requiere la app instalada: corré scripts/build-app.sh y copiá build/AgentNotchPlus.app a /Applications."],
         "restore_default": ["Restore original mascot", "Restaurar mascota original"],
         "save": ["Save", "Guardar"],
         "sounds_title": ["Sounds:", "Sonidos:"],
@@ -861,6 +867,9 @@ final class IndicatorView: NSView {
             .resolvingSymlinksInPath().deletingLastPathComponent()
         let candidates = [
             exeDir.appendingPathComponent("pets/pet-\(currentPetID).webp").path,
+            // app bundle: Contents/MacOS/../Resources/pets
+            exeDir.appendingPathComponent("../Resources/pets/pet-\(currentPetID).webp")
+                .standardizedFileURL.path,
             FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Documents/GitHub/agent-notch/pets/pet-\(currentPetID).webp").path,
         ]
@@ -1069,6 +1078,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var termSplit: NSSplitView?
     private var termViews: [LocalProcessTerminalView] = []
     private var termHotkeyPopupRef: NSPopUpButton?
+    private var loginCheckRef: NSButton?
     private var galleryWindow: NSWindow?
     private var gallerySearchField: NSTextField?
     private var galleryTargetPopup: NSPopUpButton?
@@ -1692,6 +1702,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         termHotkeyPopupRef = hotkeyPopup
 
+        let loginCheck = NSButton(checkboxWithTitle: L("login_item"), target: nil, action: nil)
+        if #available(macOS 13.0, *) {
+            loginCheck.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        } else {
+            loginCheck.isEnabled = false
+        }
+        loginCheckRef = loginCheck
+
         let soundDoneCheck = NSButton(checkboxWithTitle: L("sound_done"), target: nil, action: nil)
         soundDoneCheck.state = soundDone ? .on : .off
         soundDoneRef = soundDoneCheck
@@ -1716,6 +1734,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             row(L("zoom_pct"), [zoomField, zoomPctLabel]),
             row(L("term_hotkey"), [hotkeyPopup]),
             row(L("mascots"), [button(L("gif_gallery"), #selector(showGifGallery))]),
+            row(L("startup"), [loginCheck]),
             row(L("sounds_title"), [soundCol]),
             saveRow,
         ])
@@ -1746,6 +1765,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let idx = termHotkeyPopupRef?.indexOfSelectedItem, idx >= 0, idx < Self.termHotkeyOptions.count {
             writeConfig("term-hotkey", Self.termHotkeyOptions[idx].id)
             registerTermHotkey()
+        }
+        if #available(macOS 13.0, *), let check = loginCheckRef, check.isEnabled {
+            if check.state == .on {
+                if Bundle.main.bundleIdentifier == nil {
+                    alert(L("login_needs_app"), L("login_needs_app_info"))
+                } else if SMAppService.mainApp.status != .enabled {
+                    try? SMAppService.mainApp.register()
+                }
+            } else if SMAppService.mainApp.status == .enabled {
+                try? SMAppService.mainApp.unregister()
+            }
         }
         L10n.refresh()
         readSoundPrefs()
