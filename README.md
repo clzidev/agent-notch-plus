@@ -1,6 +1,8 @@
-# Agent Notch
+# Agent Notch Plus
 
 Your AI agents, living next to the MacBook notch.
+
+> Fork of [realfishsam/agent-notch](https://github.com/realfishsam/agent-notch) — all credit for the original concept, design and implementation goes to its author. This fork adds a global keyboard shortcut, hover-to-open, and a settings panel with custom animated-GIF mascots. See [What this fork adds](#what-this-fork-adds).
 
 While **Claude Code** or **Codex** is working, its mascot walks beside the notch — the Claude Code banner critter for Claude, the official Codex pet for Codex. Each agent has its own slot: the moment one finishes, its mascot becomes a green blob (even while the other keeps working). The green is a "finished since you last looked" notification — focusing your terminal clears it. Click to open a panel of your sessions, grouped by prompt, with every subagent tucked under a dropdown.
 
@@ -30,6 +32,16 @@ Busy/idle is inferred from transcript write times, and transcript writes are bur
 
 The collapsed window is transparent and fully click-through except the tiny indicator zone, so it never blocks menu items or apps underneath. In fullscreen spaces the bar spans the whole top edge.
 
+## What this fork adds
+
+- **Global hotkey — ⌃⌥N (Control + Option + N)** toggles the panel, no mouse needed. Registered via Carbon `RegisterEventHotKey`, so it needs no Accessibility/Input-Monitoring permission.
+- **Hover to open** — rest the cursor on the indicator (~0.35 s) and the panel opens; it closes when the mouse leaves it. Click/hotkey opens stay put until dismissed.
+- **Settings panel** — right-click the indicator (or the open panel) → *Configuración…*:
+  - pick the Codex pet from a dropdown (no more editing config files by hand)
+  - set a **custom animated GIF** per agent that replaces its mascot in the notch and in the panel rows — transparent-background GIFs look best on the black bar
+- Config lives in `~/.config/agent-notch/` (`pet`, `claude-gif`, `codex-gif`) and is re-read every 3 s, so changes apply live.
+- The Codex pet spritesheets are now resolved relative to the binary (with the original hardcoded path as fallback), so the app works from any clone location.
+
 ## Codex pet
 
 The Codex animation uses the official Codex Pets spritesheets (in `pets/`). Switch pets with:
@@ -50,3 +62,10 @@ swiftc -O main.swift -o AgentNotch
 - **Click** the indicator → open the panel. Click anywhere → close.
 - To start at login: System Settings → General → Login Items → add `AgentNotch`.
 - Requires macOS 12+ (built and tested on a notched MacBook; on notchless displays it centers on a virtual notch).
+
+## Credits
+
+- **[realfishsam](https://github.com/realfishsam)** — author of the original [agent-notch](https://github.com/realfishsam/agent-notch), which is all of the core of this project (MIT license, kept intact in [LICENSE](LICENSE)).
+- **[open-vibe-island](https://github.com/Octane0411/open-vibe-island)** — the process-discovery liveness model the original follows.
+- **OpenAI** — the Codex Pets spritesheets in `pets/` (© OpenAI, from their public pets CDN).
+- The walking Claude mascot is drawn from the Claude Code launch-banner block characters.
