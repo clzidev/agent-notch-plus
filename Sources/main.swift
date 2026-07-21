@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.5.0"
+let appVersion = "2.5.1"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 // MARK: - Localization
@@ -654,6 +654,9 @@ final class SessionListController: NSViewController {
     // hover zoom: snippets get extra lines (same font size), so the bigger
     // panel shows MORE text, not bigger text
     var zoomFactor: CGFloat = 1 { didSet { if zoomFactor != oldValue { rebuild() } } }
+    // actual panel content width — text stretches to fill it instead of
+    // leaving dead black space on the right
+    var contentWidth: CGFloat = 480 { didSet { if contentWidth != oldValue { rebuild() } } }
     var onLayoutChange: (() -> Void)?
     private let stack = NSStackView()
     private var icons: [DitherIconView] = []
@@ -747,7 +750,9 @@ final class SessionListController: NSViewController {
         if !s.snippet.isEmpty {
             let snip = label(s.snippet, size: 11, color: .secondaryLabelColor, bold: false,
                              lines: zoomFactor >= 1.5 ? 3 : zoomFactor > 1 ? 2 : 1)
-            snip.widthAnchor.constraint(lessThanOrEqualToConstant: 400 * zoomFactor).isActive = true
+            let w = contentWidth - 70
+            snip.preferredMaxLayoutWidth = w
+            snip.widthAnchor.constraint(lessThanOrEqualToConstant: w).isActive = true
             views.append(snip)
         }
         let col = NSStackView(views: views)
@@ -785,7 +790,9 @@ final class SessionListController: NSViewController {
         if !line.isEmpty {
             let snippet = label(line, size: 11, color: .secondaryLabelColor, bold: false,
                                 lines: zoomFactor >= 1.5 ? 4 : zoomFactor > 1 ? 3 : 1)
-            snippet.widthAnchor.constraint(lessThanOrEqualToConstant: 440 * zoomFactor).isActive = true
+            let w = contentWidth - 40
+            snippet.preferredMaxLayoutWidth = w
+            snippet.widthAnchor.constraint(lessThanOrEqualToConstant: w).isActive = true
             views.append(snippet)
         }
         let col = NSStackView(views: views)
@@ -2005,6 +2012,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         expanded = on
         zoomed = false
         listController.zoomFactor = 1
+        listController.contentWidth = panelContentWidth()
         // Attach the list only while expanded — its Auto Layout content would
         // otherwise force the borderless window wider than the collapsed frame.
         let listView = listController.view
@@ -2202,9 +2210,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Grow the open panel 25% while the mouse is over it; shrink back when it
     /// leaves. Only for sticky opens — hover-opens already auto-dismiss.
+    /// Width available to the panel's text at the current zoom state.
+    private func panelContentWidth() -> CGFloat {
+        let z: CGFloat = zoomed ? 1 + zoomPct / 100 : 1.0
+        return max(expandedSize.width, notchWidth + sidePad * 2) * z - 40
+    }
+
     private func setZoomed(_ on: Bool) {
         guard expanded, zoomed != on, !animating else { return }
         zoomed = on
+        listController.contentWidth = panelContentWidth()
         listController.zoomFactor = on ? 1 + zoomPct / 100 : 1  // rebuilds with scaled text
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.18
@@ -2354,10 +2369,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// The quick-folders pane navigated — `cd` the terminal to match.
+    /// ^U first clears anything half-typed on the input line, and \r is the
+    /// real Enter — a raw \n mid-redraw used to leave broken fragments behind.
     private func cdTerminal(to url: URL) {
         guard let term = focusedTerminal else { return }
         let quoted = "'" + url.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
-        term.send(txt: " cd " + quoted + "\n")
+        term.send(txt: "\u{15} cd " + quoted + "\r")
     }
 
     /// Terminal → pane: mirror the shell's real cwd (read from the kernel)
