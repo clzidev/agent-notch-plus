@@ -5,6 +5,9 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
+let appVersion = "2.1.0"
+let projectURL = "https://github.com/clzidev/agent-notch-plus"
+
 // MARK: - Localization
 
 /// Tiny EN/ES string table. Language comes from ~/.config/agent-notch/lang
@@ -30,6 +33,10 @@ enum L10n {
                           "Atajos: ⌃⌥N panel · ⌘D dividir terminal"],
         "terminal": ["Notch terminal", "Terminal del notch"],
         "term_hotkey": ["Terminal shortcut:", "Atajo de terminal:"],
+        "term_dir": ["Terminal start folder:", "Carpeta inicial de la terminal:"],
+        "choose_dir": ["Choose…", "Elegir…"],
+        "clear_dir": ["Reset", "Quitar"],
+        "project": ["Project:", "Proyecto:"],
         "gif_gallery": ["Open gallery…", "Abrir galería…"],
         "gallery_title": ["Animated Emoji Gallery", "Galería de emojis animados"],
         "gallery_hint": ["Google Noto animated emoji — no API or account needed. Search by name; click one to apply it instantly.",
@@ -980,6 +987,25 @@ final class FlippedView: NSView {
     override var isFlipped: Bool { true }
 }
 
+/// Terminal pane that accepts dragged files/folders: their shell-quoted
+/// paths are typed into the shell, like every serious terminal does.
+final class DropTerminalView: LocalProcessTerminalView {
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        registerForDraggedTypes([.fileURL])
+    }
+    required init?(coder: NSCoder) { super.init(coder: coder) }
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL],
+              !urls.isEmpty else { return false }
+        let paths = urls.map { "'" + $0.path.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+            .joined(separator: " ")
+        send(txt: paths + " ")
+        return true
+    }
+}
+
 /// Header strip of the notch terminal — visual only. The terminal is part of
 /// the notch: it cannot be moved, it only hangs centered under it.
 final class TermDragStrip: NSView {
@@ -1079,6 +1105,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var termViews: [LocalProcessTerminalView] = []
     private var termHotkeyPopupRef: NSPopUpButton?
     private var loginCheckRef: NSButton?
+    private var pendTermDir = ""
+    private var termDirLabel: NSTextField?
     private var galleryWindow: NSWindow?
     private var gallerySearchField: NSTextField?
     private var galleryTargetPopup: NSPopUpButton?
@@ -1576,7 +1604,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// ⌘D: add another shell pane to the notch terminal (up to 3).
     @objc fileprivate func addTerminalPane() {
         guard let split = termSplit, termViews.count < 3 else { return }
-        let term = LocalProcessTerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
+        let term = DropTerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
         term.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         term.nativeBackgroundColor = .black
         term.nativeForegroundColor = NSColor(white: 0.92, alpha: 1)
@@ -1591,6 +1619,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         env["COLORTERM"] = "truecolor"
         env["ZDOTDIR"] = notchZshDir().path
         let shell = env["SHELL"] ?? "/bin/zsh"
+        // start folder (config "term-dir"); root if unset or gone
+        var startDir = (try? String(contentsOf: configURL("term-dir"), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if startDir.isEmpty || !FileManager.default.fileExists(atPath: startDir) { startDir = "/" }
+        FileManager.default.changeCurrentDirectoryPath(startDir)
         term.startProcess(executable: shell, args: ["-l"],
                           environment: env.map { "\($0.key)=\($0.value)" })
         termViews.append(term)
@@ -1608,10 +1641,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         export ZDOTDIR="$HOME"
         [ -f "$HOME/.zshrc" ] && source "$HOME/.zshrc"
         autoload -Uz vcs_info
-        zstyle ':vcs_info:git:*' formats '%b'
-        precmd() { vcs_info; print -Pn '\\e[1 q' }
+        zstyle ':vcs_info:*' enable git
+        zstyle ':vcs_info:git:*' formats ' %F{cyan}%b%f'
         setopt PROMPT_SUBST
-        PROMPT='%F{green}%1~%f${vcs_info_msg_0_:+ %F{cyan}${vcs_info_msg_0_}%f} %F{green}❯%f '
+        # inside a git repo: "project branch ❯" — anywhere else just "❯".
+        # (No ${:+} nesting: %F{...} braces inside it break the expansion.)
+        precmd() {
+          vcs_info
+          if [[ -n "$vcs_info_msg_0_" ]]; then
+            PROMPT="%F{green}%1~%f$vcs_info_msg_0_ %F{green}❯%f "
+          else
+            PROMPT="%F{green}❯%f "
+          fi
+          print -Pn '\\e[1 q'
+        }
         RPROMPT=''
         """
         try? rc.write(to: dir.appendingPathComponent(".zshrc"), atomically: true, encoding: .utf8)
@@ -1714,6 +1757,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         termHotkeyPopupRef = hotkeyPopup
 
+        pendTermDir = (try? String(contentsOf: configURL("term-dir"), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let termDirLbl = NSTextField(labelWithString: pendTermDir.isEmpty ? "/" : pendTermDir)
+        termDirLbl.textColor = .secondaryLabelColor
+        termDirLbl.lineBreakMode = .byTruncatingMiddle
+        termDirLbl.widthAnchor.constraint(lessThanOrEqualToConstant: 260).isActive = true
+        termDirLabel = termDirLbl
+
+        let linkBtn = NSButton(title: "github.com/clzidev/agent-notch-plus", target: self,
+                               action: #selector(openProjectPage))
+        linkBtn.isBordered = false
+        linkBtn.contentTintColor = .linkColor
+        let versionLbl = NSTextField(labelWithString: "v\(appVersion) · @clzidev")
+        versionLbl.textColor = .secondaryLabelColor
+        versionLbl.font = .systemFont(ofSize: 11)
+
         let loginCheck = NSButton(checkboxWithTitle: L("login_item"), target: nil, action: nil)
         if #available(macOS 13.0, *) {
             loginCheck.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -1745,9 +1804,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             row(L("codex_pet"), [petPopup]),
             row(L("zoom_pct"), [zoomField, zoomPctLabel]),
             row(L("term_hotkey"), [hotkeyPopup]),
+            row(L("term_dir"), [termDirLbl, button(L("choose_dir"), #selector(chooseTermDir)),
+                                button(L("clear_dir"), #selector(clearTermDir))]),
             row(L("mascots"), [button(L("gif_gallery"), #selector(showGifGallery))]),
             row(L("startup"), [loginCheck]),
             row(L("sounds_title"), [soundCol]),
+            row(L("project"), [linkBtn, versionLbl]),
             saveRow,
         ])
         stack.orientation = .vertical
@@ -1761,7 +1823,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         w.isReleasedWhenClosed = false
         w.contentView = stack
         let fit = stack.fittingSize
-        w.setContentSize(NSSize(width: max(660, fit.width + 48), height: fit.height))
+        w.setContentSize(NSSize(width: fit.width + 8, height: fit.height))
         // always above the notch panel AND the terminal, on the notch's screen
         w.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 2)
         positionOnNotchScreen(w)
@@ -1789,6 +1851,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             writeConfig("term-hotkey", Self.termHotkeyOptions[idx].id)
             registerTermHotkey()
         }
+        writeConfig("term-dir", pendTermDir)
         if #available(macOS 13.0, *), let check = loginCheckRef, check.isEnabled {
             if check.state == .on {
                 if Bundle.main.bundleIdentifier == nil {
@@ -1807,6 +1870,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         IndicatorView.refreshCustomGifs()
         settingsWindow?.close()
         settingsWindow = nil
+    }
+
+    @objc private func openProjectPage() {
+        NSWorkspace.shared.open(URL(string: projectURL)!)
+    }
+
+    @objc private func chooseTermDir() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        pendTermDir = url.path
+        termDirLabel?.stringValue = url.path
+    }
+
+    @objc private func clearTermDir() {
+        pendTermDir = ""
+        termDirLabel?.stringValue = "/"
     }
 
     private func readSoundPrefs() {
