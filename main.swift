@@ -1,5 +1,7 @@
 import AppKit
 import ApplicationServices
+import Carbon.HIToolbox
+import UniformTypeIdentifiers
 
 // MARK: - Model
 
@@ -409,6 +411,35 @@ final class SessionScanner {
     }
 }
 
+// MARK: - Custom GIF animations
+
+/// An animated GIF chosen in the Configuración panel that replaces the
+/// built-in mascot for an agent. Frames advance from the shared `t` clock.
+final class GifAnimation {
+    private let rep: NSBitmapImageRep
+    private let frames: Int
+    private let delay: Double
+    let aspect: CGFloat
+
+    init?(path: String) {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let rep = NSBitmapImageRep(data: data),
+              let n = (rep.value(forProperty: .frameCount) as? NSNumber)?.intValue, n > 0
+        else { return nil }
+        self.rep = rep
+        self.frames = n
+        let d = (rep.value(forProperty: .currentFrameDuration) as? NSNumber)?.doubleValue ?? 0.1
+        self.delay = max(d, 0.02)
+        self.aspect = CGFloat(rep.pixelsWide) / CGFloat(max(1, rep.pixelsHigh))
+    }
+
+    func draw(in rect: NSRect, t: CGFloat, alpha: CGFloat = 1) {
+        rep.setProperty(.currentFrame, withValue: NSNumber(value: Int(Double(t) / delay) % frames))
+        _ = rep.draw(in: rect, from: .zero, operation: .sourceOver, fraction: alpha,
+                     respectFlipped: false, hints: nil)
+    }
+}
+
 // MARK: - Dither theme views
 
 /// Row icon: mini mascot / Codex pet while running, green pixel checkmark when done.
@@ -437,6 +468,11 @@ final class DitherIconView: NSView {
             return
         }
         let alpha: CGFloat = idle ? 0.4 : 1.0
+        if let gif = (kind == .claude ? IndicatorView.claudeGif : IndicatorView.codexGif) {
+            gif.draw(in: NSRect(x: 1, y: 0, width: min(20, 16 * gif.aspect), height: 16),
+                     t: idle ? 0 : t, alpha: alpha)
+            return
+        }
         if kind == .codex, let sprite = IndicatorView.codexSprite {
             let fw: CGFloat = 192, fh: CGFloat = 208
             let idx = idle ? 0 : Int(t / 0.12) % 8
@@ -696,7 +732,7 @@ final class IndicatorView: NSView {
         // each agent keeps its own slot: mascot while running, green blob when
         // freshly done (cleared once you revisit the terminal)
         switch claudeState {
-        case .running: x = drawCrab(ctx, right: x, cy: cy) - 6
+        case .running: x = drawClaudeRunning(ctx, right: x, cy: cy) - 6
         case .done: drawGreenBlob(ctx, right: x, cy: cy); x -= 24
         case .inactive: break
         }
@@ -765,11 +801,21 @@ final class IndicatorView: NSView {
     private static var spriteCache: [String: NSImage] = [:]
     static var codexSprite: NSImage? {
         if let img = spriteCache[currentPetID] { return img }
-        let path = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Documents/GitHub/agent-notch/pets/pet-\(currentPetID).webp").path
-        guard let img = NSImage(contentsOfFile: path) else { return nil }
-        spriteCache[currentPetID] = img
-        return img
+        // pets/ lives next to the binary; the old Documents/GitHub clone is the fallback
+        let exeDir = URL(fileURLWithPath: Bundle.main.executablePath ?? CommandLine.arguments[0])
+            .resolvingSymlinksInPath().deletingLastPathComponent()
+        let candidates = [
+            exeDir.appendingPathComponent("pets/pet-\(currentPetID).webp").path,
+            FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Documents/GitHub/agent-notch/pets/pet-\(currentPetID).webp").path,
+        ]
+        for path in candidates {
+            if let img = NSImage(contentsOfFile: path) {
+                spriteCache[currentPetID] = img
+                return img
+            }
+        }
+        return nil
     }
     static func refreshPetChoice() {
         let cfg = FileManager.default.homeDirectoryForCurrentUser
@@ -780,7 +826,43 @@ final class IndicatorView: NSView {
         }
     }
 
+    // Custom GIF overrides (Configuración panel): ~/.config/agent-notch/{claude,codex}-gif
+    // hold a path to an animated GIF that replaces that agent's mascot.
+    static var claudeGif: GifAnimation?
+    static var codexGif: GifAnimation?
+    private static var claudeGifPath = ""
+    private static var codexGifPath = ""
+    static func refreshCustomGifs() {
+        func readCfg(_ name: String) -> String {
+            let url = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".config/agent-notch/\(name)")
+            return (try? String(contentsOf: url, encoding: .utf8))?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        }
+        let cp = readCfg("claude-gif")
+        if cp != claudeGifPath { claudeGifPath = cp; claudeGif = cp.isEmpty ? nil : GifAnimation(path: cp) }
+        let xp = readCfg("codex-gif")
+        if xp != codexGifPath { codexGifPath = xp; codexGif = xp.isEmpty ? nil : GifAnimation(path: xp) }
+    }
+
+    /// Claude slot: custom GIF if configured, else the built-in walking mascot.
+    private func drawClaudeRunning(_ ctx: CGContext, right: CGFloat, cy: CGFloat) -> CGFloat {
+        if let gif = Self.claudeGif {
+            let h: CGFloat = 26, w = h * gif.aspect
+            let dest = NSRect(x: right - w, y: cy - h / 2, width: w, height: h)
+            gif.draw(in: dest, t: t)
+            return dest.minX
+        }
+        return drawCrab(ctx, right: right, cy: cy)
+    }
+
     private func drawCodexPet(_ ctx: CGContext, right: CGFloat, cy: CGFloat) -> CGFloat {
+        if let gif = Self.codexGif {
+            let h: CGFloat = 26, w = h * gif.aspect
+            let dest = NSRect(x: right - w, y: cy - h / 2, width: w, height: h)
+            gif.draw(in: dest, t: t)
+            return dest.minX
+        }
         guard let sprite = Self.codexSprite else {
             return drawRing(ctx, right: right, cy: cy, color: Self.codexTeal)
         }
@@ -828,11 +910,16 @@ final class NotchView: NSView {
     var expanded = false { didSet { needsDisplay = true } }
     var barHeight: CGFloat = 32
     var onCollapse: (() -> Void)?
+    var onSettings: (() -> Void)?
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func mouseDown(with event: NSEvent) { }
     override func mouseUp(with event: NSEvent) { onCollapse?() }
+    @objc private func openSettings() { onSettings?() }
     override func rightMouseUp(with event: NSEvent) {
         let menu = NSMenu()
+        let cfg = NSMenuItem(title: "Configuración…", action: #selector(openSettings), keyEquivalent: "")
+        cfg.target = self
+        menu.addItem(cfg)
         menu.addItem(NSMenuItem(title: "Quit Agent Notch", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
@@ -877,6 +964,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var claudeState: AgentGlyphState = .inactive
     private var codexState: AgentGlyphState = .inactive
     private var expanded = false
+    private var hotKeyRef: EventHotKeyRef?
+    private var hoverTicks = 0
+    private var hoverOpened = false  // opened by hover → auto-close on mouse-leave
+    private var settingsWindow: NSWindow?
+    private var claudeGifLabel: NSTextField?
+    private var codexGifLabel: NSTextField?
 
     // Geometry
     private var screen: NSScreen { NSScreen.screens.first { $0.frame.origin == .zero } ?? NSScreen.main! }
@@ -956,6 +1049,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self, self.expanded else { return }
             self.setExpanded(false)
         }
+        notchView.onSettings = { [weak self] in self?.showSettings() }
+
+        // Global hotkey ⌃⌥N toggles the panel. Carbon RegisterEventHotKey works
+        // without Accessibility/Input-Monitoring permission, unlike key monitors.
+        var keySpec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: OSType(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, userData -> OSStatus in
+            guard let userData else { return noErr }
+            let me = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
+            DispatchQueue.main.async {
+                me.hoverOpened = false
+                me.setExpanded(!me.expanded)
+            }
+            return noErr
+        }, 1, &keySpec, Unmanaged.passUnretained(self).toOpaque(), nil)
+        let hotKeyID = EventHotKeyID(signature: OSType(0x414E_4348), id: 1)  // 'ANCH'
+        RegisterEventHotKey(UInt32(kVK_ANSI_N), UInt32(controlKey | optionKey), hotKeyID,
+                            GetApplicationEventTarget(), 0, &hotKeyRef)
+
+        // Right-click on the indicator → settings menu (the indicator window
+        // ignores mouse events, so this rides the same global-monitor route)
+        NSEvent.addGlobalMonitorForEvents(matching: [.rightMouseDown]) { [weak self] _ in
+            guard let self, !self.expanded else { return }
+            let loc = NSEvent.mouseLocation
+            guard self.indicatorScreenRect.insetBy(dx: -4, dy: 0).contains(loc) else { return }
+            let menu = NSMenu()
+            let cfg = NSMenuItem(title: "Configuración…", action: #selector(self.showSettings), keyEquivalent: "")
+            cfg.target = self
+            menu.addItem(cfg)
+            menu.addItem(NSMenuItem(title: "Quit Agent Notch", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+            menu.popUp(positioning: nil, at: loc, in: nil)
+        }
         // The indicator window never takes mouse input (routing to tiny borderless
         // menu-bar windows is unreliable) — a global monitor catches its clicks,
         // and also handles click-away dismissal.
@@ -967,6 +1091,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if !self.expanded {
                 if self.indicatorScreenRect.insetBy(dx: -4, dy: 0).contains(loc), now - lastToggle > 0.15 {
                     lastToggle = now
+                    self.hoverOpened = false  // click-open is sticky, unlike hover-open
                     self.setExpanded(true)
                 }
             } else if !self.window.frame.contains(loc) {
@@ -1126,6 +1251,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     if self.indicatorWindow.frame != r { self.indicatorWindow.setFrame(r, display: true) }
                 }
                 IndicatorView.refreshPetChoice()
+                IndicatorView.refreshCustomGifs()
                 self.listController.sessions = result
                 // busy → mascot; alive-but-quiet → nothing (idle, not done);
                 // process exited → done blob (cleared on terminal focus)
@@ -1148,13 +1274,152 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func tick() {
         frame += 1
+        checkHover()
         render()
+    }
+
+    /// Hover peek: resting the cursor on the indicator (~0.35 s) opens the
+    /// panel; it closes again once the mouse leaves it. Click/hotkey opens
+    /// stay put until dismissed.
+    private func checkHover() {
+        let loc = NSEvent.mouseLocation
+        if !expanded {
+            if indicatorScreenRect.insetBy(dx: -4, dy: 0).contains(loc) {
+                hoverTicks += 1
+                if hoverTicks >= 3 {
+                    hoverTicks = 0
+                    hoverOpened = true
+                    setExpanded(true)
+                }
+            } else { hoverTicks = 0 }
+        } else if hoverOpened, !window.frame.insetBy(dx: -24, dy: -24).contains(loc) {
+            hoverOpened = false
+            setExpanded(false)
+        }
     }
 
     private func render() {
         indicatorView.claudeState = claudeState
         indicatorView.codexState = codexState
         indicatorView.t = CGFloat(frame) * 0.12
+    }
+
+    // MARK: - Settings panel
+
+    @objc fileprivate func showSettings() {
+        NSApp.activate(ignoringOtherApps: true)
+        if let w = settingsWindow { w.makeKeyAndOrderFront(nil); return }
+
+        func row(_ title: String, _ views: [NSView]) -> NSStackView {
+            let l = NSTextField(labelWithString: title)
+            l.font = .systemFont(ofSize: 12, weight: .semibold)
+            let r = NSStackView(views: [l] + views)
+            r.orientation = .horizontal
+            r.spacing = 8
+            return r
+        }
+
+        let petPopup = NSPopUpButton()
+        petPopup.addItems(withTitles: ["codex", "dewey", "fireball", "rocky", "seedy", "stacky", "bsod", "null-signal"])
+        petPopup.selectItem(withTitle: IndicatorView.currentPetID)
+        petPopup.target = self
+        petPopup.action = #selector(petChanged(_:))
+
+        claudeGifLabel = gifPathLabel("claude-gif")
+        codexGifLabel = gifPathLabel("codex-gif")
+
+        let hint = NSTextField(labelWithString: "Atajo del panel: ⌃⌥N (Control + Option + N)")
+        hint.textColor = .secondaryLabelColor
+        let gifTitle = NSTextField(labelWithString: "GIF animado personalizado (reemplaza la mascota mientras trabaja):")
+        gifTitle.font = .systemFont(ofSize: 12, weight: .semibold)
+
+        let stack = NSStackView(views: [
+            hint,
+            row("Pet de Codex:", [petPopup]),
+            gifTitle,
+            row("Claude:", [claudeGifLabel!, button("Elegir…", #selector(chooseClaudeGif)),
+                            button("Quitar", #selector(clearClaudeGif))]),
+            row("Codex:", [codexGifLabel!, button("Elegir…", #selector(chooseCodexGif)),
+                           button("Quitar", #selector(clearCodexGif))]),
+        ])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 220),
+                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        w.title = "Agent Notch — Configuración"
+        w.isReleasedWhenClosed = false
+        w.contentView = stack
+        w.setContentSize(stack.fittingSize)
+        w.center()
+        settingsWindow = w
+        w.makeKeyAndOrderFront(nil)
+    }
+
+    private func button(_ title: String, _ action: Selector) -> NSButton {
+        let b = NSButton(title: title, target: self, action: action)
+        b.bezelStyle = .rounded
+        b.controlSize = .small
+        return b
+    }
+
+    private func gifPathLabel(_ name: String) -> NSTextField {
+        let path = (try? String(contentsOf: configURL(name), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let l = NSTextField(labelWithString: path.isEmpty ? "— ninguno —" : (path as NSString).lastPathComponent)
+        l.textColor = .secondaryLabelColor
+        l.lineBreakMode = .byTruncatingMiddle
+        l.widthAnchor.constraint(lessThanOrEqualToConstant: 180).isActive = true
+        return l
+    }
+
+    private func configURL(_ name: String) -> URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/agent-notch/\(name)")
+    }
+
+    private func writeConfig(_ name: String, _ value: String) {
+        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/agent-notch")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        if value.isEmpty { try? FileManager.default.removeItem(at: configURL(name)) }
+        else { try? value.write(to: configURL(name), atomically: true, encoding: .utf8) }
+    }
+
+    @objc private func petChanged(_ sender: NSPopUpButton) {
+        guard let id = sender.titleOfSelectedItem else { return }
+        writeConfig("pet", id)
+        IndicatorView.refreshPetChoice()
+        render()
+    }
+
+    @objc private func chooseClaudeGif() { chooseGif("claude-gif", label: claudeGifLabel) }
+    @objc private func chooseCodexGif() { chooseGif("codex-gif", label: codexGifLabel) }
+    @objc private func clearClaudeGif() { clearGif("claude-gif", label: claudeGifLabel) }
+    @objc private func clearCodexGif() { clearGif("codex-gif", label: codexGifLabel) }
+
+    private func chooseGif(_ name: String, label: NSTextField?) {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.gif]
+        panel.allowsMultipleSelection = false
+        panel.message = "Elegí un GIF animado para la mascota"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard GifAnimation(path: url.path) != nil else {
+            let a = NSAlert()
+            a.messageText = "No se pudo leer ese GIF"
+            a.informativeText = "El archivo no parece un GIF animado válido."
+            a.runModal()
+            return
+        }
+        writeConfig(name, url.path)
+        IndicatorView.refreshCustomGifs()
+        label?.stringValue = url.lastPathComponent
+    }
+
+    private func clearGif(_ name: String, label: NSTextField?) {
+        writeConfig(name, "")
+        IndicatorView.refreshCustomGifs()
+        label?.stringValue = "— ninguno —"
     }
 }
 
