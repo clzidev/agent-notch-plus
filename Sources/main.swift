@@ -5,7 +5,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.1.0"
+let appVersion = "2.1.1"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 // MARK: - Localization
@@ -48,6 +48,7 @@ enum L10n {
         "language": ["Language:", "Idioma:"],
         "codex_pet": ["Codex pet:", "Pet de Codex:"],
         "mascots": ["Animated mascots:", "Mascotas animadas:"],
+        "preview": ["Preview (actual size):", "Vista previa (tamaño real):"],
         "startup": ["Startup:", "Inicio:"],
         "login_item": ["Launch at login", "Iniciar al iniciar la Mac"],
         "login_needs_app": ["Install the app first", "Primero instalá la app"],
@@ -987,6 +988,37 @@ final class FlippedView: NSView {
     override var isFlipped: Bool { true }
 }
 
+/// Settings preview: a mini black notch bar showing the CURRENT mascot of an
+/// agent at its real size, animated exactly as it renders next to the notch.
+final class MascotBarPreview: NSView {
+    private let ind = IndicatorView()
+    private var timer: Timer?
+    private var t: CGFloat = 0
+
+    init(kind: AgentKind) {
+        super.init(frame: NSRect(x: 0, y: 0, width: 140, height: 32))
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.black.cgColor
+        layer?.cornerRadius = 8
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: 140).isActive = true
+        heightAnchor.constraint(equalToConstant: 32).isActive = true
+        ind.frame = NSRect(x: 6, y: 2, width: 128, height: 28)
+        ind.autoresizingMask = [.width, .height]
+        if kind == .claude { ind.claudeState = .running } else { ind.codexState = .running }
+        addSubview(ind)
+        timer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.t += 0.12
+            self.ind.t = self.t
+        }
+    }
+    required init?(coder: NSCoder) { nil }
+    override func viewDidMoveToWindow() {
+        if window == nil { timer?.invalidate(); timer = nil }
+    }
+}
+
 /// Terminal pane that accepts dragged files/folders: their shell-quoted
 /// paths are typed into the shell, like every serious terminal does.
 final class DropTerminalView: LocalProcessTerminalView {
@@ -1112,6 +1144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var galleryTargetPopup: NSPopUpButton?
     private var galleryStack: NSStackView?
     private var galleryResults: [(code: String, names: String)] = []
+    private var gallerySelectedCell: NSView?
 
     // Geometry
     private var screen: NSScreen { NSScreen.screens.first { $0.frame.origin == .zero } ?? NSScreen.main! }
@@ -1807,6 +1840,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             row(L("term_dir"), [termDirLbl, button(L("choose_dir"), #selector(chooseTermDir)),
                                 button(L("clear_dir"), #selector(clearTermDir))]),
             row(L("mascots"), [button(L("gif_gallery"), #selector(showGifGallery))]),
+            row(L("preview"), [smallLabel("Claude"), MascotBarPreview(kind: .claude),
+                               smallLabel("Codex"), MascotBarPreview(kind: .codex)]),
             row(L("startup"), [loginCheck]),
             row(L("sounds_title"), [soundCol]),
             row(L("project"), [linkBtn, versionLbl]),
@@ -1870,6 +1905,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         IndicatorView.refreshCustomGifs()
         settingsWindow?.close()
         settingsWindow = nil
+    }
+
+    private func smallLabel(_ text: String) -> NSTextField {
+        let l = NSTextField(labelWithString: text)
+        l.textColor = .secondaryLabelColor
+        l.font = .systemFont(ofSize: 11)
+        return l
     }
 
     @objc private func openProjectPage() {
@@ -2063,7 +2105,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             scroll.heightAnchor.constraint(equalToConstant: 380),
         ])
 
-        let root = NSStackView(views: [top, hint, scroll])
+        let previewRow = NSStackView(views: [smallLabel("Claude"), MascotBarPreview(kind: .claude),
+                                             smallLabel("Codex"), MascotBarPreview(kind: .codex)])
+        previewRow.orientation = .horizontal
+        previewRow.spacing = 8
+
+        let root = NSStackView(views: [top, hint, previewRow, scroll])
         root.orientation = .vertical
         root.alignment = .leading
         root.spacing = 10
@@ -2103,14 +2150,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             rowStack.orientation = .horizontal
             rowStack.spacing = 8
             for j in i..<min(i + perRow, matched.count) {
+                // animated image view + a transparent button on top: NSButton
+                // clicks are rock-solid, NSImageView keeps the animation
+                let cell = NSView()
+                cell.wantsLayer = true
+                cell.layer?.cornerRadius = 8
+                cell.translatesAutoresizingMaskIntoConstraints = false
+                cell.widthAnchor.constraint(equalToConstant: 64).isActive = true
+                cell.heightAnchor.constraint(equalToConstant: 64).isActive = true
                 let iv = NSImageView()
                 iv.animates = true
                 iv.imageScaling = .scaleProportionallyUpOrDown
-                iv.widthAnchor.constraint(equalToConstant: 64).isActive = true
-                iv.heightAnchor.constraint(equalToConstant: 64).isActive = true
-                iv.tag = j
-                iv.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(galleryClicked(_:))))
-                rowStack.addArrangedSubview(iv)
+                iv.translatesAutoresizingMaskIntoConstraints = false
+                cell.addSubview(iv)
+                let btn = NSButton(title: "", target: self, action: #selector(galleryClicked(_:)))
+                btn.isTransparent = true
+                btn.tag = j
+                btn.translatesAutoresizingMaskIntoConstraints = false
+                cell.addSubview(btn)
+                NSLayoutConstraint.activate([
+                    iv.topAnchor.constraint(equalTo: cell.topAnchor),
+                    iv.bottomAnchor.constraint(equalTo: cell.bottomAnchor),
+                    iv.leadingAnchor.constraint(equalTo: cell.leadingAnchor),
+                    iv.trailingAnchor.constraint(equalTo: cell.trailingAnchor),
+                    btn.topAnchor.constraint(equalTo: cell.topAnchor),
+                    btn.bottomAnchor.constraint(equalTo: cell.bottomAnchor),
+                    btn.leadingAnchor.constraint(equalTo: cell.leadingAnchor),
+                    btn.trailingAnchor.constraint(equalTo: cell.trailingAnchor),
+                ])
+                rowStack.addArrangedSubview(cell)
                 let code = matched[j].code
                 if let img = Self.emojiPreviewCache[code] {
                     iv.image = img
@@ -2129,10 +2197,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Click: download the emoji GIF and set it as the mascot right away.
-    @objc private func galleryClicked(_ g: NSClickGestureRecognizer) {
-        guard let iv = g.view as? NSImageView, iv.tag < galleryResults.count else { return }
-        let code = galleryResults[iv.tag].code
+    /// Click: download the emoji GIF, set it as the mascot right away and
+    /// outline the chosen cell in green as confirmation.
+    @objc private func galleryClicked(_ sender: NSButton) {
+        guard sender.tag < galleryResults.count else { return }
+        let code = galleryResults[sender.tag].code
         let claude = galleryTargetPopup?.indexOfSelectedItem != 1
         let dir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".config/agent-notch/gifs")
@@ -2147,6 +2216,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 self.writeConfig(claude ? "claude-gif" : "codex-gif", dest.path)
                 IndicatorView.refreshCustomGifs()
+                self.gallerySelectedCell?.layer?.borderWidth = 0
+                if let cell = sender.superview {
+                    cell.layer?.borderColor = NSColor.systemGreen.cgColor
+                    cell.layer?.borderWidth = 2
+                    self.gallerySelectedCell = cell
+                }
             }
         }.resume()
     }
