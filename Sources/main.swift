@@ -25,9 +25,9 @@ enum L10n {
         "settings": ["Settings…", "Configuración…"],
         "quit": ["Quit Agent Notch", "Salir de Agent Notch"],
         "no_sessions": ["No recent agent sessions", "Sin sesiones recientes de agentes"],
-        "shortcut_hint": ["Shortcuts: ⌃⌥N panel · ⌃⌥⇧T terminal · ⌘D split",
-                          "Atajos: ⌃⌥N panel · ⌃⌥⇧T terminal · ⌘D dividir"],
-        "terminal": ["Notch terminal (⌃⌥⇧T)", "Terminal del notch (⌃⌥⇧T)"],
+        "shortcut_hint": ["Shortcuts: ⌃⌥N panel · ⌥Space terminal · ⌘D split",
+                          "Atajos: ⌃⌥N panel · ⌥Espacio terminal · ⌘D dividir"],
+        "terminal": ["Notch terminal (⌥Space)", "Terminal del notch (⌥Espacio)"],
         "zoom_pct": ["Hover zoom (%):", "Zoom al pasar el mouse (%):"],
         "gif_search": ["Search GIFs online:", "Buscar GIFs en internet:"],
         "search": ["Search", "Buscar"],
@@ -974,9 +974,9 @@ final class KeyPanel: NSPanel {
     override var canBecomeKey: Bool { true }
 }
 
-/// Thin grab bar at the top of the notch terminal: drag to move the window.
+/// Header strip of the notch terminal — visual only. The terminal is part of
+/// the notch: it cannot be moved, it only hangs centered under it.
 final class TermDragStrip: NSView {
-    override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         let w: CGFloat = 36
@@ -1140,7 +1140,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.isOpaque = false
         window.backgroundColor = .clear
         window.hasShadow = false
-        window.level = .statusBar
+        // one notch above .statusBar so the panel always beats the terminal
+        window.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
         window.ignoresMouseEvents = true
         window.appearance = NSAppearance(named: .darkAqua)  // panel is always black
@@ -1154,7 +1155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         indicatorWindow.isOpaque = false
         indicatorWindow.backgroundColor = .clear
         indicatorWindow.hasShadow = false
-        indicatorWindow.level = .statusBar
+        indicatorWindow.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)
         indicatorWindow.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
         indicatorWindow.ignoresMouseEvents = true  // visual only — clicks are caught by the global monitor
         indicatorWindow.contentView = indicatorView
@@ -1192,9 +1193,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let panelKeyID = EventHotKeyID(signature: OSType(0x414E_4348), id: 1)  // 'ANCH'
         RegisterEventHotKey(UInt32(kVK_ANSI_N), UInt32(controlKey | optionKey), panelKeyID,
                             GetApplicationEventTarget(), 0, &hotKeyRef)
-        // ⌃⌥⇧T — plain ⌃⌥T collides with browser/tab shortcuts in some apps
+        // ⌥Space — two keys, quake-console style; ⌃⌥T collides with browsers
+        // and ⌃⌥⇧T was too much of a finger twister
         let termKeyID = EventHotKeyID(signature: OSType(0x414E_4348), id: 2)
-        RegisterEventHotKey(UInt32(kVK_ANSI_T), UInt32(controlKey | optionKey | shiftKey), termKeyID,
+        RegisterEventHotKey(UInt32(kVK_Space), UInt32(optionKey), termKeyID,
                             GetApplicationEventTarget(), 0, &hotKeyRef2)
 
         // ⌘D splits the notch terminal (local monitor: only our own windows)
@@ -1420,18 +1422,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                    (claudeWaits && self.claudeAttArmed) || (codexWaits && self.codexAttArmed) {
                     self.playSound("Ping")
                 }
-                if claudeGone { self.claudeDoneArmed = false; self.claudeAttArmed = false }
-                if codexGone { self.codexDoneArmed = false; self.codexAttArmed = false }
                 if claudeWaits { self.claudeAttArmed = false }
                 if codexWaits { self.codexAttArmed = false }
                 self.claudePrevBusy = claudeBusy
                 self.codexPrevBusy = codexBusy
+                // the green "done" blob also requires an armed episode — a
+                // liveness flap without real work no longer conjures it up
                 self.claudeState = claudeBusy ? .running
                     : claudeLive ? .inactive
-                    : (self.claudeWasLive ? .done : self.claudeState)
+                    : (claudeGone && self.claudeDoneArmed ? .done : self.claudeState)
                 self.codexState = codexBusy ? .running
                     : codexLive ? .inactive
-                    : (self.codexWasLive ? .done : self.codexState)
+                    : (codexGone && self.codexDoneArmed ? .done : self.codexState)
+                if claudeGone { self.claudeDoneArmed = false; self.claudeAttArmed = false }
+                if codexGone { self.codexDoneArmed = false; self.codexAttArmed = false }
                 self.claudeWasLive = claudeLive
                 self.codexWasLive = codexLive
                 self.render()
@@ -1516,6 +1520,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
         panel.minSize = NSSize(width: 480, height: 280)
+        panel.isMovable = false  // the terminal IS part of the notch — it doesn't move
+        // any resize re-centers under the notch, so dragging a corner grows
+        // the window symmetrically around it
+        NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification,
+                                               object: panel, queue: .main) { [weak self] _ in
+            guard let self, let w = self.termWindow else { return }
+            let s = self.screen.frame
+            var f = w.frame
+            let tx = s.midX - f.width / 2
+            let ty = s.maxY - self.barHeight - f.height
+            if abs(f.origin.x - tx) > 0.5 || abs(f.origin.y - ty) > 0.5 {
+                f.origin.x = tx
+                f.origin.y = ty
+                w.setFrame(f, display: true)
+            }
+        }
         let container = NSView(frame: NSRect(origin: .zero, size: NSSize(width: tw, height: th)))
         container.wantsLayer = true
         container.layer?.backgroundColor = NSColor.black.cgColor
@@ -1551,13 +1571,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         term.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         term.nativeBackgroundColor = .black
         term.nativeForegroundColor = NSColor(white: 0.92, alpha: 1)
+        term.caretColor = NSColor(red: 0.1, green: 0.95, blue: 0.35, alpha: 1)  // matrix green
         term.processDelegate = self
         split.addArrangedSubview(term)
         split.adjustSubviews()
-        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
-        term.startProcess(executable: shell, args: ["-l"])
+        // minimal prompt (project + git branch + blinking green block cursor)
+        // via our own ZDOTDIR; the user's ~/.zshrc is still sourced first
+        var env = ProcessInfo.processInfo.environment
+        env["TERM"] = "xterm-256color"
+        env["COLORTERM"] = "truecolor"
+        env["ZDOTDIR"] = notchZshDir().path
+        let shell = env["SHELL"] ?? "/bin/zsh"
+        term.startProcess(executable: shell, args: ["-l"],
+                          environment: env.map { "\($0.key)=\($0.value)" })
         termViews.append(term)
         termWindow?.makeFirstResponder(term)
+    }
+
+    /// Writes the notch terminal's zsh profile: source the user's zshrc, then
+    /// override the prompt with `dir branch ❯` and a blinking block cursor.
+    private func notchZshDir() -> URL {
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/agent-notch/zsh")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let rc = """
+        # Agent Notch Plus terminal profile (regenerated on each terminal open)
+        export ZDOTDIR="$HOME"
+        [ -f "$HOME/.zshrc" ] && source "$HOME/.zshrc"
+        autoload -Uz vcs_info
+        zstyle ':vcs_info:git:*' formats '%b'
+        precmd() { vcs_info; print -Pn '\\e[1 q' }
+        setopt PROMPT_SUBST
+        PROMPT='%F{green}%1~%f${vcs_info_msg_0_:+ %F{cyan}${vcs_info_msg_0_}%f} %F{green}❯%f '
+        RPROMPT=''
+        """
+        try? rc.write(to: dir.appendingPathComponent(".zshrc"), atomically: true, encoding: .utf8)
+        return dir
     }
 
     private func showTerminal(_ panel: NSWindow) {
