@@ -5,7 +5,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.1.1"
+let appVersion = "2.1.2"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 // MARK: - Localization
@@ -1919,13 +1919,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func chooseTermDir() {
+        guard let w = settingsWindow else { return }
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        pendTermDir = url.path
-        termDirLabel?.stringValue = url.path
+        // as a sheet: the settings window sits above statusBar level, so a
+        // free-floating open panel would be buried underneath it
+        panel.beginSheetModal(for: w) { [weak self] resp in
+            guard let self, resp == .OK, let url = panel.url else { return }
+            self.pendTermDir = url.path
+            self.termDirLabel?.stringValue = url.path
+        }
     }
 
     @objc private func clearTermDir() {
