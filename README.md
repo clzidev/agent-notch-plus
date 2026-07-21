@@ -39,11 +39,12 @@ The collapsed window is transparent and fully click-through except the tiny indi
 - **Settings panel** — right-click the indicator (or the open panel) → *Configuración…*:
   - pick the Codex pet from a dropdown (no more editing config files by hand)
   - set a **custom animated GIF** per agent that replaces its mascot in the notch and in the panel rows — transparent-background GIFs look best on the black bar
-- **Hover zoom** — while the panel is open (via click/hotkey), hovering it grows it 25%; it shrinks back when the mouse leaves.
-- **Sounds** (optional, off by default) — a chime when an agent finishes (Glass) and when it goes quiet awaiting your input (Ping).
+- **Hover zoom** — while the panel is open (via click/hotkey), hovering it grows it by a configurable percentage (default 25%); text scales up too and snippets get extra lines, so you actually read more. It shrinks back when the mouse leaves. Hover-opened panels don't zoom (they already auto-dismiss).
+- **Notch terminal — ⌃⌥T** — a real terminal ([SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)) hanging from the notch: borderless, black, always on top, shell survives hide/show. Run `claude` or `codex` in it and answer their confirmations right from the notch.
+- **Sounds** (optional, off by default) — a chime when an agent finishes (Glass) and when it goes quiet awaiting your input (Ping). At most once per activity episode.
 - **Bilingual UI** — English/Spanish, selectable in settings (defaults to the system language).
 - The settings panel shows an **animated preview** of each chosen GIF, and changes only apply when you press **Save**.
-- Config lives in `~/.config/agent-notch/` (`pet`, `claude-gif`, `codex-gif`, `lang`, `sound-done`, `sound-attention`) and is re-read every 3 s, so changes apply live.
+- Config lives in `~/.config/agent-notch/` (`pet`, `claude-gif`, `codex-gif`, `lang`, `zoom`, `sound-done`, `sound-attention`) and is re-read every 3 s, so changes apply live.
 - The Codex pet spritesheets are now resolved relative to the binary (with the original hardcoded path as fallback), so the app works from any clone location.
 
 ## Codex pet
@@ -59,9 +60,12 @@ Options: `codex`, `dewey`, `fireball`, `rocky`, `seedy`, `stacky`, `bsod`, `null
 ## Build & run
 
 ```sh
-swiftc -O main.swift -o AgentNotch
+swift build -c release
+cp .build/release/AgentNotchPlus AgentNotch
 ./AgentNotch &
 ```
+
+(The first build fetches [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) via Swift Package Manager.)
 
 - **Click** the indicator → open the panel. Click anywhere → close.
 - To start at login: System Settings → General → Login Items → add `AgentNotch`.
@@ -72,4 +76,5 @@ swiftc -O main.swift -o AgentNotch
 - **[realfishsam](https://github.com/realfishsam)** — author of the original [agent-notch](https://github.com/realfishsam/agent-notch), which is all of the core of this project (MIT license, kept intact in [LICENSE](LICENSE)).
 - **[open-vibe-island](https://github.com/Octane0411/open-vibe-island)** — the process-discovery liveness model the original follows.
 - **OpenAI** — the Codex Pets spritesheets in `pets/` (© OpenAI, from their public pets CDN).
+- **[SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)** by Miguel de Icaza — the terminal emulator embedded in the notch terminal (MIT).
 - The walking Claude mascot is drawn from the Claude Code launch-banner block characters.

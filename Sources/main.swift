@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import Carbon.HIToolbox
+import SwiftTerm
 import UniformTypeIdentifiers
 
 // MARK: - Localization
@@ -24,8 +25,10 @@ enum L10n {
         "settings": ["Settings…", "Configuración…"],
         "quit": ["Quit Agent Notch", "Salir de Agent Notch"],
         "no_sessions": ["No recent agent sessions", "Sin sesiones recientes de agentes"],
-        "shortcut_hint": ["Panel shortcut: ⌃⌥N (Control + Option + N)",
-                          "Atajo del panel: ⌃⌥N (Control + Option + N)"],
+        "shortcut_hint": ["Shortcuts: ⌃⌥N panel · ⌃⌥T terminal",
+                          "Atajos: ⌃⌥N panel · ⌃⌥T terminal"],
+        "terminal": ["Notch terminal (⌃⌥T)", "Terminal del notch (⌃⌥T)"],
+        "zoom_pct": ["Hover zoom (%):", "Zoom al pasar el mouse (%):"],
         "language": ["Language:", "Idioma:"],
         "codex_pet": ["Codex pet:", "Pet de Codex:"],
         "gif_title": ["Custom animated GIF (replaces the mascot while working):",
@@ -574,6 +577,9 @@ final class DitherSeparator: NSView {
 
 final class SessionListController: NSViewController {
     var sessions: [AgentSession] = [] { didSet { rebuild() } }
+    // hover zoom: fonts scale by this and snippets get extra lines, so the
+    // bigger panel actually shows more (and bigger) text
+    var zoomFactor: CGFloat = 1 { didSet { if zoomFactor != oldValue { rebuild() } } }
     var onLayoutChange: (() -> Void)?
     private let stack = NSStackView()
     private var icons: [DitherIconView] = []
@@ -664,8 +670,8 @@ final class SessionListController: NSViewController {
         var views: [NSView] = [top]
         if !s.snippet.isEmpty {
             let snip = label(s.snippet, size: 11, color: .secondaryLabelColor, bold: false)
-            snip.maximumNumberOfLines = 1
-            snip.widthAnchor.constraint(lessThanOrEqualToConstant: 400).isActive = true
+            snip.maximumNumberOfLines = zoomFactor > 1 ? 2 : 1
+            snip.widthAnchor.constraint(lessThanOrEqualToConstant: 400 * zoomFactor).isActive = true
             views.append(snip)
         }
         let col = NSStackView(views: views)
@@ -702,8 +708,8 @@ final class SessionListController: NSViewController {
         let line = s.prompt.isEmpty ? s.snippet : L("you") + s.prompt
         if !line.isEmpty {
             let snippet = label(line, size: 11, color: .secondaryLabelColor, bold: false)
-            snippet.maximumNumberOfLines = 1
-            snippet.widthAnchor.constraint(lessThanOrEqualToConstant: 440).isActive = true
+            snippet.maximumNumberOfLines = zoomFactor > 1 ? 3 : 1
+            snippet.widthAnchor.constraint(lessThanOrEqualToConstant: 440 * zoomFactor).isActive = true
             views.append(snippet)
         }
         let col = NSStackView(views: views)
@@ -717,7 +723,7 @@ final class SessionListController: NSViewController {
 
     private func label(_ text: String, size: CGFloat, color: NSColor, bold: Bool) -> NSTextField {
         let l = NSTextField(labelWithString: text)
-        l.font = NSFont.monospacedSystemFont(ofSize: size, weight: bold ? .semibold : .regular)
+        l.font = NSFont.monospacedSystemFont(ofSize: size * zoomFactor, weight: bold ? .semibold : .regular)
         l.textColor = color
         l.lineBreakMode = .byTruncatingTail
         // Truncate rather than force the window wider than its frame
@@ -953,17 +959,27 @@ final class IndicatorView: NSView {
     }
 }
 
+/// Borderless panel that can take keyboard focus (for the notch terminal).
+final class KeyPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
+
 final class NotchView: NSView {
     var expanded = false { didSet { needsDisplay = true } }
     var barHeight: CGFloat = 32
     var onCollapse: (() -> Void)?
     var onSettings: (() -> Void)?
+    var onTerminal: (() -> Void)?
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func mouseDown(with event: NSEvent) { }
     override func mouseUp(with event: NSEvent) { onCollapse?() }
     @objc private func openSettings() { onSettings?() }
+    @objc private func openTerminal() { onTerminal?() }
     override func rightMouseUp(with event: NSEvent) {
         let menu = NSMenu()
+        let term = NSMenuItem(title: L("terminal"), action: #selector(openTerminal), keyEquivalent: "")
+        term.target = self
+        menu.addItem(term)
         let cfg = NSMenuItem(title: L("settings"), action: #selector(openSettings), keyEquivalent: "")
         cfg.target = self
         menu.addItem(cfg)
@@ -1030,6 +1046,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var soundAttRef: NSButton?
     private var pendClaudeGif = ""   // settings are staged; applied on Save
     private var pendCodexGif = ""
+    private var pendZoomField: NSTextField?
+    private var zoomPct: CGFloat = 25   // hover-zoom percentage (config "zoom")
+    private var hotKeyRef2: EventHotKeyRef?
+    // one sound per episode: armed while busy, disarmed once played
+    private var claudeDoneArmed = false, claudeAttArmed = false
+    private var codexDoneArmed = false, codexAttArmed = false
+    private var lastSoundAt = Date.distantPast
+    private var termWindow: NSPanel?
+    private var termView: LocalProcessTerminalView?
 
     // Geometry
     private var screen: NSScreen { NSScreen.screens.first { $0.frame.origin == .zero } ?? NSScreen.main! }
@@ -1069,9 +1094,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     private func expandedFrame() -> NSRect {
         let s = screen.frame
-        let z: CGFloat = zoomed ? 1.25 : 1.0
+        // width scales by the configured zoom; height follows the content,
+        // which already grew because the list's fonts scale with zoomFactor
+        let z: CGFloat = zoomed ? 1 + zoomPct / 100 : 1.0
         let w = max(expandedSize.width, notchWidth + sidePad * 2) * z
-        let h = (barHeight + max(60, listController.contentHeight) + 10) * z
+        let h = barHeight + max(60, listController.contentHeight) + 10
         return NSRect(x: s.midX - w / 2, y: s.maxY - h, width: w, height: h)
     }
 
@@ -1079,6 +1106,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
         L10n.refresh()
         readSoundPrefs()
+        readZoomPref()
 
         // Panel window: full-width, mouse-transparent unless expanded
         window = NSWindow(contentRect: collapsedFrame(), styleMask: .borderless, backing: .buffered, defer: false)
@@ -1113,22 +1141,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.setExpanded(false)
         }
         notchView.onSettings = { [weak self] in self?.showSettings() }
+        notchView.onTerminal = { [weak self] in self?.toggleTerminal() }
 
         // Global hotkey ⌃⌥N toggles the panel. Carbon RegisterEventHotKey works
         // without Accessibility/Input-Monitoring permission, unlike key monitors.
         var keySpec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: OSType(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, userData -> OSStatus in
-            guard let userData else { return noErr }
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, userData -> OSStatus in
+            guard let userData, let event else { return noErr }
+            var hkID = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                              nil, MemoryLayout<EventHotKeyID>.size, nil, &hkID)
             let me = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
             DispatchQueue.main.async {
-                me.hoverOpened = false
-                me.setExpanded(!me.expanded)
+                if hkID.id == 2 {
+                    me.toggleTerminal()
+                } else {
+                    me.hoverOpened = false
+                    me.setExpanded(!me.expanded)
+                }
             }
             return noErr
         }, 1, &keySpec, Unmanaged.passUnretained(self).toOpaque(), nil)
-        let hotKeyID = EventHotKeyID(signature: OSType(0x414E_4348), id: 1)  // 'ANCH'
-        RegisterEventHotKey(UInt32(kVK_ANSI_N), UInt32(controlKey | optionKey), hotKeyID,
+        let panelKeyID = EventHotKeyID(signature: OSType(0x414E_4348), id: 1)  // 'ANCH'
+        RegisterEventHotKey(UInt32(kVK_ANSI_N), UInt32(controlKey | optionKey), panelKeyID,
                             GetApplicationEventTarget(), 0, &hotKeyRef)
+        let termKeyID = EventHotKeyID(signature: OSType(0x414E_4348), id: 2)
+        RegisterEventHotKey(UInt32(kVK_ANSI_T), UInt32(controlKey | optionKey), termKeyID,
+                            GetApplicationEventTarget(), 0, &hotKeyRef2)
 
         // Right-click on the indicator → settings menu (the indicator window
         // ignores mouse events, so this rides the same global-monitor route)
@@ -1137,6 +1176,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let loc = NSEvent.mouseLocation
             guard self.indicatorScreenRect.insetBy(dx: -4, dy: 0).contains(loc) else { return }
             let menu = NSMenu()
+            let term = NSMenuItem(title: L("terminal"), action: #selector(self.toggleTerminal), keyEquivalent: "")
+            term.target = self
+            menu.addItem(term)
             let cfg = NSMenuItem(title: L("settings"), action: #selector(self.showSettings), keyEquivalent: "")
             cfg.target = self
             menu.addItem(cfg)
@@ -1204,6 +1246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard expanded != on else { return }
         expanded = on
         zoomed = false
+        listController.zoomFactor = 1
         // Attach the list only while expanded — its Auto Layout content would
         // otherwise force the borderless window wider than the collapsed frame.
         let listView = listController.view
@@ -1323,16 +1366,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let claudeBusy = result.contains { $0.kind == .claude && $0.anyBusy }
                 let codexLive = result.contains { $0.kind == .codex && $0.anyLive }
                 let codexBusy = result.contains { $0.kind == .codex && $0.anyBusy }
-                // sounds (settings): finished = process gone; needs-you = went
-                // quiet while still alive (inherits the ~30 s busy afterglow)
+                // sounds (settings): once per episode. An agent "arms" its
+                // sounds while busy and each fires at most once until it gets
+                // busy again — liveness flaps under load can't re-trigger them.
+                if claudeBusy { self.claudeDoneArmed = true; self.claudeAttArmed = true }
+                if codexBusy { self.codexDoneArmed = true; self.codexAttArmed = true }
+                let claudeGone = self.claudeWasLive && !claudeLive
+                let codexGone = self.codexWasLive && !codexLive
+                let claudeWaits = self.claudePrevBusy && !claudeBusy && claudeLive
+                let codexWaits = self.codexPrevBusy && !codexBusy && codexLive
                 if self.soundDone,
-                   (self.claudeWasLive && !claudeLive) || (self.codexWasLive && !codexLive) {
-                    NSSound(named: "Glass")?.play()
+                   (claudeGone && self.claudeDoneArmed) || (codexGone && self.codexDoneArmed) {
+                    self.playSound("Glass")
                 }
                 if self.soundAttention,
-                   (self.claudePrevBusy && !claudeBusy && claudeLive) || (self.codexPrevBusy && !codexBusy && codexLive) {
-                    NSSound(named: "Ping")?.play()
+                   (claudeWaits && self.claudeAttArmed) || (codexWaits && self.codexAttArmed) {
+                    self.playSound("Ping")
                 }
+                if claudeGone { self.claudeDoneArmed = false; self.claudeAttArmed = false }
+                if codexGone { self.codexDoneArmed = false; self.codexAttArmed = false }
+                if claudeWaits { self.claudeAttArmed = false }
+                if codexWaits { self.codexAttArmed = false }
                 self.claudePrevBusy = claudeBusy
                 self.codexPrevBusy = codexBusy
                 self.claudeState = claudeBusy ? .running
@@ -1384,6 +1438,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setZoomed(_ on: Bool) {
         guard expanded, zoomed != on, !animating else { return }
         zoomed = on
+        listController.zoomFactor = on ? 1 + zoomPct / 100 : 1  // rebuilds with scaled text
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.18
             ctx.timingFunction = CAMediaTimingFunction(name: on ? .easeOut : .easeIn)
@@ -1395,6 +1450,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         indicatorView.claudeState = claudeState
         indicatorView.codexState = codexState
         indicatorView.t = CGFloat(frame) * 0.12
+    }
+
+    // MARK: - Notch terminal (SwiftTerm)
+
+    /// A real terminal hanging from the notch — borderless, black, rounded
+    /// bottom corners, always on top. The shell survives hide/show; ⌃⌥T or
+    /// the context menus toggle it. Run `claude` here and its confirmations
+    /// are answered right in the notch.
+    @objc fileprivate func toggleTerminal() {
+        if let w = termWindow {
+            if w.isVisible {
+                w.orderOut(nil)
+            } else {
+                w.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
+            }
+            return
+        }
+        let s = screen.frame
+        let tw: CGFloat = 760, th: CGFloat = 460
+        let frame = NSRect(x: s.midX - tw / 2, y: s.maxY - barHeight - th, width: tw, height: th)
+        let panel = KeyPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel],
+                             backing: .buffered, defer: false)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.level = .statusBar
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.isReleasedWhenClosed = false
+        let container = NSView(frame: NSRect(origin: .zero, size: NSSize(width: tw, height: th)))
+        container.wantsLayer = true
+        container.layer?.backgroundColor = NSColor.black.cgColor
+        container.layer?.cornerRadius = 16
+        container.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        let term = LocalProcessTerminalView(frame: container.bounds.insetBy(dx: 12, dy: 12))
+        term.autoresizingMask = [.width, .height]
+        term.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        term.nativeBackgroundColor = .black
+        term.nativeForegroundColor = NSColor(white: 0.92, alpha: 1)
+        container.addSubview(term)
+        panel.contentView = container
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        term.startProcess(executable: shell, args: ["-l"])
+        termWindow = panel
+        termView = term
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     // MARK: - Settings panel
@@ -1443,6 +1545,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         petPopup.selectItem(withTitle: IndicatorView.currentPetID)
         petPopupRef = petPopup
 
+        let zoomField = NSTextField(string: String(Int(zoomPct)))
+        zoomField.widthAnchor.constraint(equalToConstant: 48).isActive = true
+        pendZoomField = zoomField
+        let zoomPctLabel = NSTextField(labelWithString: "%")
+        zoomPctLabel.textColor = .secondaryLabelColor
+
         let gifTitle = NSTextField(labelWithString: L("gif_title"))
         gifTitle.font = .systemFont(ofSize: 12, weight: .semibold)
 
@@ -1474,6 +1582,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             hint,
             row(L("language"), [langPopup]),
             row(L("codex_pet"), [petPopup]),
+            row(L("zoom_pct"), [zoomField, zoomPctLabel]),
             gifTitle,
             row("Claude:", [claudeGifLabel!, button(L("choose"), #selector(chooseClaudeGif)),
                             button(L("remove"), #selector(clearClaudeGif)), claudePreview!]),
@@ -1506,8 +1615,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         writeConfig("lang", langPopupRef?.indexOfSelectedItem == 1 ? "es" : "en")
         writeConfig("sound-done", soundDoneRef?.state == .on ? "1" : "")
         writeConfig("sound-attention", soundAttRef?.state == .on ? "1" : "")
+        let pct = Int(min(100, max(0, Double(pendZoomField?.stringValue ?? "") ?? 25)))
+        writeConfig("zoom", String(pct))
         L10n.refresh()
         readSoundPrefs()
+        readZoomPref()
         IndicatorView.refreshPetChoice()
         IndicatorView.refreshCustomGifs()
         settingsWindow?.close()
@@ -1517,6 +1629,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func readSoundPrefs() {
         soundDone = FileManager.default.fileExists(atPath: configURL("sound-done").path)
         soundAttention = FileManager.default.fileExists(atPath: configURL("sound-attention").path)
+    }
+
+    /// Extra belt-and-suspenders: never chime more than once per 5 s.
+    private func playSound(_ name: String) {
+        guard Date().timeIntervalSince(lastSoundAt) > 5 else { return }
+        lastSoundAt = Date()
+        NSSound(named: name)?.play()
+    }
+
+    private func readZoomPref() {
+        let v = (try? String(contentsOf: configURL("zoom"), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        zoomPct = CGFloat(min(100, max(0, Double(v ?? "") ?? 25)))
     }
 
     private func pathLabel(_ path: String) -> NSTextField {
