@@ -3,6 +3,53 @@ import ApplicationServices
 import Carbon.HIToolbox
 import UniformTypeIdentifiers
 
+// MARK: - Localization
+
+/// Tiny EN/ES string table. Language comes from ~/.config/agent-notch/lang
+/// ("en"/"es", set in the settings panel), defaulting to the system language.
+enum L10n {
+    static var lang = "en"
+    static func refresh() {
+        let cfg = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/agent-notch/lang")
+        if let v = (try? String(contentsOf: cfg, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines), ["en", "es"].contains(v) {
+            lang = v
+        } else {
+            lang = (Locale.preferredLanguages.first ?? "en").hasPrefix("es") ? "es" : "en"
+        }
+    }
+    // key: [english, spanish]
+    private static let table: [String: [String]] = [
+        "settings": ["Settings…", "Configuración…"],
+        "quit": ["Quit Agent Notch", "Salir de Agent Notch"],
+        "no_sessions": ["No recent agent sessions", "Sin sesiones recientes de agentes"],
+        "shortcut_hint": ["Panel shortcut: ⌃⌥N (Control + Option + N)",
+                          "Atajo del panel: ⌃⌥N (Control + Option + N)"],
+        "language": ["Language:", "Idioma:"],
+        "codex_pet": ["Codex pet:", "Pet de Codex:"],
+        "gif_title": ["Custom animated GIF (replaces the mascot while working):",
+                      "GIF animado personalizado (reemplaza la mascota mientras trabaja):"],
+        "choose": ["Choose…", "Elegir…"],
+        "remove": ["Remove", "Quitar"],
+        "none": ["— none —", "— ninguno —"],
+        "save": ["Save", "Guardar"],
+        "sounds_title": ["Sounds:", "Sonidos:"],
+        "sound_done": ["When an agent finishes", "Cuando un agente termina"],
+        "sound_attention": ["When an agent awaits your input", "Cuando un agente espera tu respuesta"],
+        "settings_title": ["Agent Notch Plus — Settings", "Agent Notch Plus — Configuración"],
+        "bad_gif": ["Could not read that GIF", "No se pudo leer ese GIF"],
+        "bad_gif_info": ["The file does not look like a valid animated GIF.",
+                         "El archivo no parece un GIF animado válido."],
+        "choose_gif_msg": ["Choose an animated GIF for the mascot", "Elegí un GIF animado para la mascota"],
+        "subagents": ["subagents", "subagentes"],
+        "subagent": ["subagent", "subagente"],
+        "you": ["You: ", "Vos: "],
+    ]
+    static func t(_ key: String) -> String { table[key]?[lang == "es" ? 1 : 0] ?? key }
+}
+func L(_ key: String) -> String { L10n.t(key) }
+
 // MARK: - Model
 
 enum AgentKind: String { case claude = "Claude Code", codex = "Codex" }
@@ -293,7 +340,7 @@ final class SessionScanner {
             var kid = AgentSession(id: c.path, kind: .claude, title: "subagent",
                                    snippet: info.snippet, model: info.model, lastModified: mtime)
             // no nicknames here — label with the task it was given
-            kid.nickname = info.prompt.isEmpty ? "subagent" : String(info.prompt.prefix(40))
+            kid.nickname = info.prompt.isEmpty ? L("subagent") : String(info.prompt.prefix(40))
             // subagents share the parent process (open-vibe-island tracks them
             // as parent metadata) — liveness inherits, busyness from writes
             kid.isLive = parentLive
@@ -554,7 +601,7 @@ final class SessionListController: NSViewController {
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         icons.removeAll()
         if sessions.isEmpty {
-            stack.addArrangedSubview(label("No recent agent sessions", size: 12, color: .secondaryLabelColor, bold: false))
+            stack.addArrangedSubview(label(L("no_sessions"), size: 12, color: .secondaryLabelColor, bold: false))
             return
         }
         for (i, s) in sessions.prefix(6).enumerated() {
@@ -567,7 +614,7 @@ final class SessionListController: NSViewController {
             stack.addArrangedSubview(row(for: s))
             if !s.children.isEmpty {
                 let open = expandedIDs.contains(s.id)
-                let btn = NSButton(title: "\(open ? "▾" : "▸") \(s.children.count) subagent\(s.children.count == 1 ? "" : "s")",
+                let btn = NSButton(title: "\(open ? "▾" : "▸") \(s.children.count) \(s.children.count == 1 ? L("subagent") : L("subagents"))",
                                    target: self, action: #selector(toggleChildren(_:)))
                 btn.isBordered = false
                 btn.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold)
@@ -652,7 +699,7 @@ final class SessionListController: NSViewController {
         top.translatesAutoresizingMaskIntoConstraints = false
 
         var views: [NSView] = [top]
-        let line = s.prompt.isEmpty ? s.snippet : "You: " + s.prompt
+        let line = s.prompt.isEmpty ? s.snippet : L("you") + s.prompt
         if !line.isEmpty {
             let snippet = label(line, size: 11, color: .secondaryLabelColor, bold: false)
             snippet.maximumNumberOfLines = 1
@@ -917,10 +964,10 @@ final class NotchView: NSView {
     @objc private func openSettings() { onSettings?() }
     override func rightMouseUp(with event: NSEvent) {
         let menu = NSMenu()
-        let cfg = NSMenuItem(title: "Configuración…", action: #selector(openSettings), keyEquivalent: "")
+        let cfg = NSMenuItem(title: L("settings"), action: #selector(openSettings), keyEquivalent: "")
         cfg.target = self
         menu.addItem(cfg)
-        menu.addItem(NSMenuItem(title: "Quit Agent Notch", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: L("quit"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 
@@ -967,9 +1014,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotKeyRef: EventHotKeyRef?
     private var hoverTicks = 0
     private var hoverOpened = false  // opened by hover → auto-close on mouse-leave
+    private var zoomed = false       // sticky-open panel grows 25% under the mouse
+    private var soundDone = false
+    private var soundAttention = false
+    private var claudePrevBusy = false
+    private var codexPrevBusy = false
     private var settingsWindow: NSWindow?
     private var claudeGifLabel: NSTextField?
     private var codexGifLabel: NSTextField?
+    private var claudePreview: NSImageView?
+    private var codexPreview: NSImageView?
+    private var petPopupRef: NSPopUpButton?
+    private var langPopupRef: NSPopUpButton?
+    private var soundDoneRef: NSButton?
+    private var soundAttRef: NSButton?
+    private var pendClaudeGif = ""   // settings are staged; applied on Save
+    private var pendCodexGif = ""
 
     // Geometry
     private var screen: NSScreen { NSScreen.screens.first { $0.frame.origin == .zero } ?? NSScreen.main! }
@@ -1009,13 +1069,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     private func expandedFrame() -> NSRect {
         let s = screen.frame
-        let w = max(expandedSize.width, notchWidth + sidePad * 2)
-        let h = barHeight + max(60, listController.contentHeight) + 10
+        let z: CGFloat = zoomed ? 1.25 : 1.0
+        let w = max(expandedSize.width, notchWidth + sidePad * 2) * z
+        let h = (barHeight + max(60, listController.contentHeight) + 10) * z
         return NSRect(x: s.midX - w / 2, y: s.maxY - h, width: w, height: h)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        L10n.refresh()
+        readSoundPrefs()
 
         // Panel window: full-width, mouse-transparent unless expanded
         window = NSWindow(contentRect: collapsedFrame(), styleMask: .borderless, backing: .buffered, defer: false)
@@ -1074,10 +1137,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let loc = NSEvent.mouseLocation
             guard self.indicatorScreenRect.insetBy(dx: -4, dy: 0).contains(loc) else { return }
             let menu = NSMenu()
-            let cfg = NSMenuItem(title: "Configuración…", action: #selector(self.showSettings), keyEquivalent: "")
+            let cfg = NSMenuItem(title: L("settings"), action: #selector(self.showSettings), keyEquivalent: "")
             cfg.target = self
             menu.addItem(cfg)
-            menu.addItem(NSMenuItem(title: "Quit Agent Notch", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+            menu.addItem(NSMenuItem(title: L("quit"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
             menu.popUp(positioning: nil, at: loc, in: nil)
         }
         // The indicator window never takes mouse input (routing to tiny borderless
@@ -1140,6 +1203,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setExpanded(_ on: Bool) {
         guard expanded != on else { return }
         expanded = on
+        zoomed = false
         // Attach the list only while expanded — its Auto Layout content would
         // otherwise force the borderless window wider than the collapsed frame.
         let listView = listController.view
@@ -1259,6 +1323,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let claudeBusy = result.contains { $0.kind == .claude && $0.anyBusy }
                 let codexLive = result.contains { $0.kind == .codex && $0.anyLive }
                 let codexBusy = result.contains { $0.kind == .codex && $0.anyBusy }
+                // sounds (settings): finished = process gone; needs-you = went
+                // quiet while still alive (inherits the ~30 s busy afterglow)
+                if self.soundDone,
+                   (self.claudeWasLive && !claudeLive) || (self.codexWasLive && !codexLive) {
+                    NSSound(named: "Glass")?.play()
+                }
+                if self.soundAttention,
+                   (self.claudePrevBusy && !claudeBusy && claudeLive) || (self.codexPrevBusy && !codexBusy && codexLive) {
+                    NSSound(named: "Ping")?.play()
+                }
+                self.claudePrevBusy = claudeBusy
+                self.codexPrevBusy = codexBusy
                 self.claudeState = claudeBusy ? .running
                     : claudeLive ? .inactive
                     : (self.claudeWasLive ? .done : self.claudeState)
@@ -1292,9 +1368,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     setExpanded(true)
                 }
             } else { hoverTicks = 0 }
-        } else if hoverOpened, !window.frame.insetBy(dx: -24, dy: -24).contains(loc) {
-            hoverOpened = false
-            setExpanded(false)
+        } else if hoverOpened {
+            if !window.frame.insetBy(dx: -24, dy: -24).contains(loc) {
+                hoverOpened = false
+                setExpanded(false)
+            }
+        } else {
+            // sticky opens (click/hotkey): hovering grows the panel 25%
+            setZoomed(window.frame.contains(loc))
+        }
+    }
+
+    /// Grow the open panel 25% while the mouse is over it; shrink back when it
+    /// leaves. Only for sticky opens — hover-opens already auto-dismiss.
+    private func setZoomed(_ on: Bool) {
+        guard expanded, zoomed != on, !animating else { return }
+        zoomed = on
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.18
+            ctx.timingFunction = CAMediaTimingFunction(name: on ? .easeOut : .easeIn)
+            window.animator().setFrame(expandedFrame(), display: true)
         }
     }
 
@@ -1308,7 +1401,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc fileprivate func showSettings() {
         NSApp.activate(ignoringOtherApps: true)
-        if let w = settingsWindow { w.makeKeyAndOrderFront(nil); return }
+        settingsWindow?.close()  // rebuild fresh so staged values start from disk
+
+        func cfg(_ name: String) -> String {
+            (try? String(contentsOf: configURL(name), encoding: .utf8))?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        }
+        pendClaudeGif = cfg("claude-gif")
+        pendCodexGif = cfg("codex-gif")
 
         func row(_ title: String, _ views: [NSView]) -> NSStackView {
             let l = NSTextField(labelWithString: title)
@@ -1318,44 +1418,117 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             r.spacing = 8
             return r
         }
+        func preview() -> NSImageView {
+            let iv = NSImageView()
+            iv.animates = true  // NSImageView plays animated GIFs on its own
+            iv.imageScaling = .scaleProportionallyUpOrDown
+            iv.wantsLayer = true
+            iv.layer?.backgroundColor = NSColor.black.cgColor
+            iv.layer?.cornerRadius = 6
+            iv.widthAnchor.constraint(equalToConstant: 72).isActive = true
+            iv.heightAnchor.constraint(equalToConstant: 44).isActive = true
+            return iv
+        }
+
+        let hint = NSTextField(labelWithString: L("shortcut_hint"))
+        hint.textColor = .secondaryLabelColor
+
+        let langPopup = NSPopUpButton()
+        langPopup.addItems(withTitles: ["English", "Español"])
+        langPopup.selectItem(at: L10n.lang == "es" ? 1 : 0)
+        langPopupRef = langPopup
 
         let petPopup = NSPopUpButton()
         petPopup.addItems(withTitles: ["codex", "dewey", "fireball", "rocky", "seedy", "stacky", "bsod", "null-signal"])
         petPopup.selectItem(withTitle: IndicatorView.currentPetID)
-        petPopup.target = self
-        petPopup.action = #selector(petChanged(_:))
+        petPopupRef = petPopup
 
-        claudeGifLabel = gifPathLabel("claude-gif")
-        codexGifLabel = gifPathLabel("codex-gif")
-
-        let hint = NSTextField(labelWithString: "Atajo del panel: ⌃⌥N (Control + Option + N)")
-        hint.textColor = .secondaryLabelColor
-        let gifTitle = NSTextField(labelWithString: "GIF animado personalizado (reemplaza la mascota mientras trabaja):")
+        let gifTitle = NSTextField(labelWithString: L("gif_title"))
         gifTitle.font = .systemFont(ofSize: 12, weight: .semibold)
+
+        claudeGifLabel = pathLabel(pendClaudeGif)
+        codexGifLabel = pathLabel(pendCodexGif)
+        claudePreview = preview()
+        codexPreview = preview()
+        setPreview(claudePreview, path: pendClaudeGif)
+        setPreview(codexPreview, path: pendCodexGif)
+
+        let soundDoneCheck = NSButton(checkboxWithTitle: L("sound_done"), target: nil, action: nil)
+        soundDoneCheck.state = soundDone ? .on : .off
+        soundDoneRef = soundDoneCheck
+        let soundAttCheck = NSButton(checkboxWithTitle: L("sound_attention"), target: nil, action: nil)
+        soundAttCheck.state = soundAttention ? .on : .off
+        soundAttRef = soundAttCheck
+        let soundCol = NSStackView(views: [soundDoneCheck, soundAttCheck])
+        soundCol.orientation = .vertical
+        soundCol.alignment = .leading
+        soundCol.spacing = 4
+
+        let saveBtn = NSButton(title: L("save"), target: self, action: #selector(saveSettings))
+        saveBtn.bezelStyle = .rounded
+        saveBtn.keyEquivalent = "\r"
+        let saveRow = NSStackView(views: [NSView(), saveBtn])
+        saveRow.orientation = .horizontal
 
         let stack = NSStackView(views: [
             hint,
-            row("Pet de Codex:", [petPopup]),
+            row(L("language"), [langPopup]),
+            row(L("codex_pet"), [petPopup]),
             gifTitle,
-            row("Claude:", [claudeGifLabel!, button("Elegir…", #selector(chooseClaudeGif)),
-                            button("Quitar", #selector(clearClaudeGif))]),
-            row("Codex:", [codexGifLabel!, button("Elegir…", #selector(chooseCodexGif)),
-                           button("Quitar", #selector(clearCodexGif))]),
+            row("Claude:", [claudeGifLabel!, button(L("choose"), #selector(chooseClaudeGif)),
+                            button(L("remove"), #selector(clearClaudeGif)), claudePreview!]),
+            row("Codex:", [codexGifLabel!, button(L("choose"), #selector(chooseCodexGif)),
+                           button(L("remove"), #selector(clearCodexGif)), codexPreview!]),
+            row(L("sounds_title"), [soundCol]),
+            saveRow,
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 12
         stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
 
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 220),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 300),
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        w.title = "Agent Notch — Configuración"
+        w.title = L("settings_title")
         w.isReleasedWhenClosed = false
         w.contentView = stack
         w.setContentSize(stack.fittingSize)
         w.center()
         settingsWindow = w
         w.makeKeyAndOrderFront(nil)
+        saveRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
+    }
+
+    @objc private func saveSettings() {
+        writeConfig("claude-gif", pendClaudeGif)
+        writeConfig("codex-gif", pendCodexGif)
+        if let id = petPopupRef?.titleOfSelectedItem { writeConfig("pet", id) }
+        writeConfig("lang", langPopupRef?.indexOfSelectedItem == 1 ? "es" : "en")
+        writeConfig("sound-done", soundDoneRef?.state == .on ? "1" : "")
+        writeConfig("sound-attention", soundAttRef?.state == .on ? "1" : "")
+        L10n.refresh()
+        readSoundPrefs()
+        IndicatorView.refreshPetChoice()
+        IndicatorView.refreshCustomGifs()
+        settingsWindow?.close()
+        settingsWindow = nil
+    }
+
+    private func readSoundPrefs() {
+        soundDone = FileManager.default.fileExists(atPath: configURL("sound-done").path)
+        soundAttention = FileManager.default.fileExists(atPath: configURL("sound-attention").path)
+    }
+
+    private func pathLabel(_ path: String) -> NSTextField {
+        let l = NSTextField(labelWithString: path.isEmpty ? L("none") : (path as NSString).lastPathComponent)
+        l.textColor = .secondaryLabelColor
+        l.lineBreakMode = .byTruncatingMiddle
+        l.widthAnchor.constraint(lessThanOrEqualToConstant: 160).isActive = true
+        return l
+    }
+
+    private func setPreview(_ iv: NSImageView?, path: String) {
+        iv?.image = path.isEmpty ? nil : NSImage(contentsOfFile: path)
     }
 
     private func button(_ title: String, _ action: Selector) -> NSButton {
@@ -1363,16 +1536,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         b.bezelStyle = .rounded
         b.controlSize = .small
         return b
-    }
-
-    private func gifPathLabel(_ name: String) -> NSTextField {
-        let path = (try? String(contentsOf: configURL(name), encoding: .utf8))?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let l = NSTextField(labelWithString: path.isEmpty ? "— ninguno —" : (path as NSString).lastPathComponent)
-        l.textColor = .secondaryLabelColor
-        l.lineBreakMode = .byTruncatingMiddle
-        l.widthAnchor.constraint(lessThanOrEqualToConstant: 180).isActive = true
-        return l
     }
 
     private func configURL(_ name: String) -> URL {
@@ -1386,40 +1549,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         else { try? value.write(to: configURL(name), atomically: true, encoding: .utf8) }
     }
 
-    @objc private func petChanged(_ sender: NSPopUpButton) {
-        guard let id = sender.titleOfSelectedItem else { return }
-        writeConfig("pet", id)
-        IndicatorView.refreshPetChoice()
-        render()
+    @objc private func chooseClaudeGif() { chooseGif(claude: true) }
+    @objc private func chooseCodexGif() { chooseGif(claude: false) }
+    @objc private func clearClaudeGif() {
+        pendClaudeGif = ""
+        claudeGifLabel?.stringValue = L("none")
+        setPreview(claudePreview, path: "")
+    }
+    @objc private func clearCodexGif() {
+        pendCodexGif = ""
+        codexGifLabel?.stringValue = L("none")
+        setPreview(codexPreview, path: "")
     }
 
-    @objc private func chooseClaudeGif() { chooseGif("claude-gif", label: claudeGifLabel) }
-    @objc private func chooseCodexGif() { chooseGif("codex-gif", label: codexGifLabel) }
-    @objc private func clearClaudeGif() { clearGif("claude-gif", label: claudeGifLabel) }
-    @objc private func clearCodexGif() { clearGif("codex-gif", label: codexGifLabel) }
-
-    private func chooseGif(_ name: String, label: NSTextField?) {
+    /// Stages the choice (applied on Save) and shows it in the animated preview.
+    private func chooseGif(claude: Bool) {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.gif]
         panel.allowsMultipleSelection = false
-        panel.message = "Elegí un GIF animado para la mascota"
+        panel.message = L("choose_gif_msg")
         guard panel.runModal() == .OK, let url = panel.url else { return }
         guard GifAnimation(path: url.path) != nil else {
             let a = NSAlert()
-            a.messageText = "No se pudo leer ese GIF"
-            a.informativeText = "El archivo no parece un GIF animado válido."
+            a.messageText = L("bad_gif")
+            a.informativeText = L("bad_gif_info")
             a.runModal()
             return
         }
-        writeConfig(name, url.path)
-        IndicatorView.refreshCustomGifs()
-        label?.stringValue = url.lastPathComponent
-    }
-
-    private func clearGif(_ name: String, label: NSTextField?) {
-        writeConfig(name, "")
-        IndicatorView.refreshCustomGifs()
-        label?.stringValue = "— ninguno —"
+        if claude {
+            pendClaudeGif = url.path
+            claudeGifLabel?.stringValue = url.lastPathComponent
+            setPreview(claudePreview, path: url.path)
+        } else {
+            pendCodexGif = url.path
+            codexGifLabel?.stringValue = url.lastPathComponent
+            setPreview(codexPreview, path: url.path)
+        }
     }
 }
 

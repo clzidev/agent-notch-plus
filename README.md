@@ -39,7 +39,11 @@ The collapsed window is transparent and fully click-through except the tiny indi
 - **Settings panel** — right-click the indicator (or the open panel) → *Configuración…*:
   - pick the Codex pet from a dropdown (no more editing config files by hand)
   - set a **custom animated GIF** per agent that replaces its mascot in the notch and in the panel rows — transparent-background GIFs look best on the black bar
-- Config lives in `~/.config/agent-notch/` (`pet`, `claude-gif`, `codex-gif`) and is re-read every 3 s, so changes apply live.
+- **Hover zoom** — while the panel is open (via click/hotkey), hovering it grows it 25%; it shrinks back when the mouse leaves.
+- **Sounds** (optional, off by default) — a chime when an agent finishes (Glass) and when it goes quiet awaiting your input (Ping).
+- **Bilingual UI** — English/Spanish, selectable in settings (defaults to the system language).
+- The settings panel shows an **animated preview** of each chosen GIF, and changes only apply when you press **Save**.
+- Config lives in `~/.config/agent-notch/` (`pet`, `claude-gif`, `codex-gif`, `lang`, `sound-done`, `sound-attention`) and is re-read every 3 s, so changes apply live.
 - The Codex pet spritesheets are now resolved relative to the binary (with the original hardcoded path as fallback), so the app works from any clone location.
 
 ## Codex pet
