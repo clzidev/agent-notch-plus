@@ -39,12 +39,13 @@ The collapsed window is transparent and fully click-through except the tiny indi
 - **Settings panel** — right-click the indicator (or the open panel) → *Configuración…*:
   - pick the Codex pet from a dropdown (no more editing config files by hand)
   - set a **custom animated GIF** per agent that replaces its mascot in the notch and in the panel rows — transparent-background GIFs look best on the black bar
-- **Hover zoom** — while the panel is open (via click/hotkey), hovering it grows it by a configurable percentage (default 25%); text scales up too and snippets get extra lines, so you actually read more. It shrinks back when the mouse leaves. Hover-opened panels don't zoom (they already auto-dismiss).
-- **Notch terminal — ⌃⌥T** — a real terminal ([SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)) hanging from the notch: borderless, black, always on top, shell survives hide/show. Run `claude` or `codex` in it and answer their confirmations right from the notch. Resizable from its edges, movable by its top grab bar; `exit` closes it, and the ✕ button force-closes it even if the shell hangs.
+- **Hover zoom** — while the panel is open, hovering it grows it by a configurable percentage (default 25%); the font size stays the same but snippets unfold into several lines, so you read *more* text. It shrinks back when the mouse leaves.
+- **Notch terminal — ⌃⌥⇧T** — a real terminal ([SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)) that unrolls from the notch like a curtain and rolls back up when hidden, with its shells kept running. **⌘D** splits it into up to 3 side-by-side panes. Run `claude` or `codex` in one and answer their confirmations right from the notch. Resizable from its edges, movable by its grab bar; `exit` closes a pane, ✕ force-closes everything even if a shell hangs.
+- **Online GIF search** — search GIPHY from the settings panel and pick a mascot with one click (needs a free API key from [developers.giphy.com](https://developers.giphy.com); this is the app's only network access, used only when you search).
 - **Sounds** (optional, off by default) — a chime when an agent finishes (Glass) and when it goes quiet awaiting your input (Ping). At most once per activity episode.
 - **Bilingual UI** — English/Spanish, selectable in settings (defaults to the system language).
 - The settings panel shows an **animated preview** of each chosen GIF, and changes only apply when you press **Save**.
-- Config lives in `~/.config/agent-notch/` (`pet`, `claude-gif`, `codex-gif`, `lang`, `zoom`, `sound-done`, `sound-attention`) and is re-read every 3 s, so changes apply live.
+- Config lives in `~/.config/agent-notch/` (`pet`, `claude-gif`, `codex-gif`, `lang`, `zoom`, `sound-done`, `sound-attention`, `giphy-key`; downloaded GIFs land in `gifs/`) and is re-read every 3 s, so changes apply live.
 - The Codex pet spritesheets are now resolved relative to the binary (with the original hardcoded path as fallback), so the app works from any clone location.
 
 ## Codex pet

@@ -25,10 +25,20 @@ enum L10n {
         "settings": ["Settings…", "Configuración…"],
         "quit": ["Quit Agent Notch", "Salir de Agent Notch"],
         "no_sessions": ["No recent agent sessions", "Sin sesiones recientes de agentes"],
-        "shortcut_hint": ["Shortcuts: ⌃⌥N panel · ⌃⌥T terminal",
-                          "Atajos: ⌃⌥N panel · ⌃⌥T terminal"],
-        "terminal": ["Notch terminal (⌃⌥T)", "Terminal del notch (⌃⌥T)"],
+        "shortcut_hint": ["Shortcuts: ⌃⌥N panel · ⌃⌥⇧T terminal · ⌘D split",
+                          "Atajos: ⌃⌥N panel · ⌃⌥⇧T terminal · ⌘D dividir"],
+        "terminal": ["Notch terminal (⌃⌥⇧T)", "Terminal del notch (⌃⌥⇧T)"],
         "zoom_pct": ["Hover zoom (%):", "Zoom al pasar el mouse (%):"],
+        "gif_search": ["Search GIFs online:", "Buscar GIFs en internet:"],
+        "search": ["Search", "Buscar"],
+        "gif_for": ["for", "para"],
+        "giphy_key": ["GIPHY API key:", "API key de GIPHY:"],
+        "giphy_missing": ["GIPHY API key required", "Falta la API key de GIPHY"],
+        "giphy_missing_info": ["Get a free key at developers.giphy.com (create an app, type: API) and paste it in the settings field.",
+                               "Conseguí una key gratis en developers.giphy.com (creá una app, tipo API) y pegala en el campo de configuración."],
+        "gif_search_fail": ["GIF search failed — check the API key and your connection.",
+                            "Falló la búsqueda de GIFs — revisá la API key y tu conexión."],
+        "gif_dl_fail": ["Could not download that GIF", "No se pudo descargar ese GIF"],
         "language": ["Language:", "Idioma:"],
         "codex_pet": ["Codex pet:", "Pet de Codex:"],
         "gif_title": ["Custom animated GIF (replaces the mascot while working):",
@@ -577,8 +587,8 @@ final class DitherSeparator: NSView {
 
 final class SessionListController: NSViewController {
     var sessions: [AgentSession] = [] { didSet { rebuild() } }
-    // hover zoom: fonts scale by this and snippets get extra lines, so the
-    // bigger panel actually shows more (and bigger) text
+    // hover zoom: snippets get extra lines (same font size), so the bigger
+    // panel shows MORE text, not bigger text
     var zoomFactor: CGFloat = 1 { didSet { if zoomFactor != oldValue { rebuild() } } }
     var onLayoutChange: (() -> Void)?
     private let stack = NSStackView()
@@ -670,7 +680,7 @@ final class SessionListController: NSViewController {
         var views: [NSView] = [top]
         if !s.snippet.isEmpty {
             let snip = label(s.snippet, size: 11, color: .secondaryLabelColor, bold: false)
-            snip.maximumNumberOfLines = zoomFactor > 1 ? 2 : 1
+            snip.maximumNumberOfLines = zoomFactor > 1 ? 3 : 1
             snip.widthAnchor.constraint(lessThanOrEqualToConstant: 400 * zoomFactor).isActive = true
             views.append(snip)
         }
@@ -708,7 +718,7 @@ final class SessionListController: NSViewController {
         let line = s.prompt.isEmpty ? s.snippet : L("you") + s.prompt
         if !line.isEmpty {
             let snippet = label(line, size: 11, color: .secondaryLabelColor, bold: false)
-            snippet.maximumNumberOfLines = zoomFactor > 1 ? 3 : 1
+            snippet.maximumNumberOfLines = zoomFactor > 1 ? 4 : 1
             snippet.widthAnchor.constraint(lessThanOrEqualToConstant: 440 * zoomFactor).isActive = true
             views.append(snippet)
         }
@@ -723,7 +733,7 @@ final class SessionListController: NSViewController {
 
     private func label(_ text: String, size: CGFloat, color: NSColor, bold: Bool) -> NSTextField {
         let l = NSTextField(labelWithString: text)
-        l.font = NSFont.monospacedSystemFont(ofSize: size * zoomFactor, weight: bold ? .semibold : .regular)
+        l.font = NSFont.monospacedSystemFont(ofSize: size, weight: bold ? .semibold : .regular)
         l.textColor = color
         l.lineBreakMode = .byTruncatingTail
         // Truncate rather than force the window wider than its frame
@@ -1065,7 +1075,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var codexDoneArmed = false, codexAttArmed = false
     private var lastSoundAt = Date.distantPast
     private var termWindow: NSPanel?
-    private var termView: LocalProcessTerminalView?
+    private var termSplit: NSSplitView?
+    private var termViews: [LocalProcessTerminalView] = []
+    private var gifSearchField: NSTextField?
+    private var gifTargetPopup: NSPopUpButton?
+    private var giphyKeyField: NSTextField?
+    private var gifResults: [(id: String, preview: URL, full: URL)] = []
+    private var gifResultViews: [NSImageView] = []
 
     // Geometry
     private var screen: NSScreen { NSScreen.screens.first { $0.frame.origin == .zero } ?? NSScreen.main! }
@@ -1106,7 +1122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func expandedFrame() -> NSRect {
         let s = screen.frame
         // width scales by the configured zoom; height follows the content,
-        // which already grew because the list's fonts scale with zoomFactor
+        // which grows because snippets unfold into multiple lines when zoomed
         let z: CGFloat = zoomed ? 1 + zoomPct / 100 : 1.0
         let w = max(expandedSize.width, notchWidth + sidePad * 2) * z
         let h = barHeight + max(60, listController.contentHeight) + 10
@@ -1176,9 +1192,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let panelKeyID = EventHotKeyID(signature: OSType(0x414E_4348), id: 1)  // 'ANCH'
         RegisterEventHotKey(UInt32(kVK_ANSI_N), UInt32(controlKey | optionKey), panelKeyID,
                             GetApplicationEventTarget(), 0, &hotKeyRef)
+        // ⌃⌥⇧T — plain ⌃⌥T collides with browser/tab shortcuts in some apps
         let termKeyID = EventHotKeyID(signature: OSType(0x414E_4348), id: 2)
-        RegisterEventHotKey(UInt32(kVK_ANSI_T), UInt32(controlKey | optionKey), termKeyID,
+        RegisterEventHotKey(UInt32(kVK_ANSI_T), UInt32(controlKey | optionKey | shiftKey), termKeyID,
                             GetApplicationEventTarget(), 0, &hotKeyRef2)
+
+        // ⌘D splits the notch terminal (local monitor: only our own windows)
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            guard let self, let w = self.termWindow, e.window === w,
+                  e.modifierFlags.contains(.command),
+                  e.charactersIgnoringModifiers?.lowercased() == "d" else { return e }
+            self.addTerminalPane()
+            return nil
+        }
 
         // Right-click on the indicator → settings menu (the indicator window
         // ignores mouse events, so this rides the same global-monitor route)
@@ -1437,9 +1463,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if !window.frame.insetBy(dx: -24, dy: -24).contains(loc) {
                 hoverOpened = false
                 setExpanded(false)
+            } else {
+                setZoomed(window.frame.contains(loc))  // hover-opens zoom too
             }
         } else {
-            // sticky opens (click/hotkey): hovering grows the panel 25%
+            // sticky opens (click/hotkey): hovering grows the panel
             setZoomed(window.frame.contains(loc))
         }
     }
@@ -1466,17 +1494,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Notch terminal (SwiftTerm)
 
     /// A real terminal hanging from the notch — borderless, black, rounded
-    /// bottom corners, always on top. The shell survives hide/show; ⌃⌥T or
-    /// the context menus toggle it. Run `claude` here and its confirmations
-    /// are answered right in the notch.
+    /// bottom corners, always on top. ⌃⌥⇧T or the context menus toggle it:
+    /// it unrolls from the notch like a curtain and rolls back up on hide,
+    /// while the shells keep running in the background. ⌘D splits up to 3
+    /// panes side by side. Run `claude` in one and its confirmations are
+    /// answered right here in the notch.
     @objc fileprivate func toggleTerminal() {
         if let w = termWindow {
-            if w.isVisible {
-                w.orderOut(nil)
-            } else {
-                w.makeKeyAndOrderFront(nil)
-                NSApp.activate(ignoringOtherApps: true)
-            }
+            if w.isVisible { hideTerminal(w) } else { showTerminal(w) }
             return
         }
         let s = screen.frame
@@ -1505,31 +1530,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         closeBtn.contentTintColor = NSColor(white: 0.7, alpha: 1)
         closeBtn.frame = NSRect(x: 8, y: th - stripH, width: 20, height: stripH)
         closeBtn.autoresizingMask = [.minYMargin]
-        let term = LocalProcessTerminalView(frame: NSRect(x: 12, y: 12, width: tw - 24, height: th - stripH - 16))
-        term.autoresizingMask = [.width, .height]
+        let split = NSSplitView(frame: NSRect(x: 12, y: 12, width: tw - 24, height: th - stripH - 16))
+        split.isVertical = true
+        split.dividerStyle = .thin
+        split.autoresizingMask = [.width, .height]
+        container.addSubview(split)
+        container.addSubview(strip)
+        container.addSubview(closeBtn)
+        panel.contentView = container
+        termWindow = panel
+        termSplit = split
+        addTerminalPane()
+        showTerminal(panel)
+    }
+
+    /// ⌘D: add another shell pane to the notch terminal (up to 3).
+    @objc fileprivate func addTerminalPane() {
+        guard let split = termSplit, termViews.count < 3 else { return }
+        let term = LocalProcessTerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
         term.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         term.nativeBackgroundColor = .black
         term.nativeForegroundColor = NSColor(white: 0.92, alpha: 1)
         term.processDelegate = self
-        container.addSubview(term)
-        container.addSubview(strip)
-        container.addSubview(closeBtn)
-        panel.contentView = container
+        split.addArrangedSubview(term)
+        split.adjustSubviews()
         let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
         term.startProcess(executable: shell, args: ["-l"])
-        termWindow = panel
-        termView = term
-        panel.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        termViews.append(term)
+        termWindow?.makeFirstResponder(term)
     }
 
-    /// Full close: kills the shell if it is still alive (✕ button, hung
-    /// shells) and discards the window so the next ⌃⌥T starts fresh.
+    private func showTerminal(_ panel: NSWindow) {
+        // always re-anchor under the notch, keeping the user's chosen size
+        let s = screen.frame
+        var f = panel.frame
+        f.origin.x = s.midX - f.width / 2
+        f.origin.y = s.maxY - barHeight - f.height
+        panel.setFrame(f, display: true)
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        curtain(panel, open: true)
+    }
+
+    private func hideTerminal(_ panel: NSWindow) {
+        curtain(panel, open: false) { panel.orderOut(nil) }
+    }
+
+    /// Curtain animation: unroll down from the notch / roll back up into it.
+    private func curtain(_ panel: NSWindow, open: Bool, completion: (() -> Void)? = nil) {
+        guard let view = panel.contentView, let layer = view.layer else { completion?(); return }
+        let b = view.bounds
+        layer.anchorPoint = CGPoint(x: 0.5, y: 1)
+        layer.position = CGPoint(x: b.midX, y: b.maxY)
+        let rolled = CATransform3DMakeScale(1, 0.02, 1)
+        layer.transform = open ? CATransform3DIdentity : rolled
+        CATransaction.begin()
+        CATransaction.setCompletionBlock {
+            completion?()
+            if !open { layer.transform = CATransform3DIdentity }
+        }
+        let a = CABasicAnimation(keyPath: "transform")
+        a.fromValue = NSValue(caTransform3D: open ? rolled : CATransform3DIdentity)
+        a.toValue = NSValue(caTransform3D: open ? CATransform3DIdentity : rolled)
+        a.duration = 0.28
+        a.timingFunction = CAMediaTimingFunction(name: open ? .easeOut : .easeIn)
+        layer.add(a, forKey: "curtain")
+        CATransaction.commit()
+    }
+
+    /// Full close: kills every shell (✕ button, hung shells) and discards the
+    /// window so the next ⌃⌥⇧T starts fresh.
     @objc fileprivate func forceCloseTerminal() {
-        termView?.terminate()
+        for t in termViews { t.terminate() }
+        termViews.removeAll()
         termWindow?.orderOut(nil)
         termWindow = nil
-        termView = nil
+        termSplit = nil
     }
 
     // MARK: - Settings panel
@@ -1594,6 +1670,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setPreview(claudePreview, path: pendClaudeGif)
         setPreview(codexPreview, path: pendCodexGif)
 
+        let targetPopup = NSPopUpButton()
+        targetPopup.addItems(withTitles: ["Claude", "Codex"])
+        gifTargetPopup = targetPopup
+        let searchField = NSTextField(string: "")
+        searchField.placeholderString = "pixel cat…"
+        searchField.widthAnchor.constraint(equalToConstant: 150).isActive = true
+        gifSearchField = searchField
+        let keyField = NSTextField(string: cfg("giphy-key"))
+        keyField.placeholderString = "developers.giphy.com"
+        keyField.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        giphyKeyField = keyField
+        let resultsRow = NSStackView()
+        resultsRow.orientation = .horizontal
+        resultsRow.spacing = 6
+        gifResults = []
+        gifResultViews = (0..<6).map { i in
+            let iv = NSImageView()
+            iv.animates = true
+            iv.imageScaling = .scaleProportionallyUpOrDown
+            iv.wantsLayer = true
+            iv.layer?.backgroundColor = NSColor.black.cgColor
+            iv.layer?.cornerRadius = 6
+            iv.widthAnchor.constraint(equalToConstant: 76).isActive = true
+            iv.heightAnchor.constraint(equalToConstant: 56).isActive = true
+            iv.tag = i
+            iv.isHidden = true
+            iv.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(gifResultClicked(_:))))
+            resultsRow.addArrangedSubview(iv)
+            return iv
+        }
+
         let soundDoneCheck = NSButton(checkboxWithTitle: L("sound_done"), target: nil, action: nil)
         soundDoneCheck.state = soundDone ? .on : .off
         soundDoneRef = soundDoneCheck
@@ -1621,6 +1728,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             button(L("remove"), #selector(clearClaudeGif)), claudePreview!]),
             row("Codex:", [codexGifLabel!, button(L("choose"), #selector(chooseCodexGif)),
                            button(L("remove"), #selector(clearCodexGif)), codexPreview!]),
+            row(L("gif_search"), [searchField, button(L("search"), #selector(searchGifs)),
+                                  NSTextField(labelWithString: L("gif_for")), targetPopup]),
+            row(L("giphy_key"), [keyField]),
+            resultsRow,
             row(L("sounds_title"), [soundCol]),
             saveRow,
         ])
@@ -1650,6 +1761,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         writeConfig("sound-attention", soundAttRef?.state == .on ? "1" : "")
         let pct = Int(min(100, max(0, Double(pendZoomField?.stringValue ?? "") ?? 25)))
         writeConfig("zoom", String(pct))
+        writeConfig("giphy-key", giphyKeyField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
         L10n.refresh()
         readSoundPrefs()
         readZoomPref()
@@ -1687,6 +1799,88 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setPreview(_ iv: NSImageView?, path: String) {
         iv?.image = path.isEmpty ? nil : NSImage(contentsOfFile: path)
+    }
+
+    // MARK: - Online GIF search (GIPHY)
+    // The ONLY network access in the app, and only when the user hits Search.
+
+    @objc private func searchGifs() {
+        let key = giphyKeyField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !key.isEmpty else { alert(L("giphy_missing"), L("giphy_missing_info")); return }
+        let q = gifSearchField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !q.isEmpty else { return }
+        var comps = URLComponents(string: "https://api.giphy.com/v1/gifs/search")!
+        comps.queryItems = [URLQueryItem(name: "api_key", value: key), URLQueryItem(name: "q", value: q),
+                            URLQueryItem(name: "limit", value: "6"), URLQueryItem(name: "rating", value: "g")]
+        URLSession.shared.dataTask(with: comps.url!) { [weak self] data, _, _ in
+            var found: [(id: String, preview: URL, full: URL)] = []
+            if let data,
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let items = obj["data"] as? [[String: Any]] {
+                for it in items {
+                    guard let id = it["id"] as? String,
+                          let imgs = it["images"] as? [String: Any],
+                          let pv = ((imgs["fixed_height_small"] as? [String: Any])?["url"] as? String)
+                              .flatMap(URL.init(string:)),
+                          let full = ((imgs["original"] as? [String: Any])?["url"] as? String)
+                              .flatMap(URL.init(string:))
+                    else { continue }
+                    found.append((id, pv, full))
+                }
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard !found.isEmpty else { self.alert(L("gif_search_fail"), ""); return }
+                self.gifResults = found
+                for (i, iv) in self.gifResultViews.enumerated() {
+                    guard i < found.count else { iv.isHidden = true; continue }
+                    iv.isHidden = false
+                    iv.image = nil
+                    URLSession.shared.dataTask(with: found[i].preview) { d, _, _ in
+                        guard let d, let img = NSImage(data: d) else { return }
+                        DispatchQueue.main.async { iv.image = img }
+                    }.resume()
+                }
+                if let w = self.settingsWindow, let content = w.contentView {
+                    w.setContentSize(content.fittingSize)
+                }
+            }
+        }.resume()
+    }
+
+    /// Click on a result: download it and stage it for the chosen agent.
+    @objc private func gifResultClicked(_ g: NSClickGestureRecognizer) {
+        guard let iv = g.view as? NSImageView, iv.tag < gifResults.count else { return }
+        let r = gifResults[iv.tag]
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/agent-notch/gifs")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dest = dir.appendingPathComponent("giphy-\(r.id).gif")
+        URLSession.shared.dataTask(with: r.full) { [weak self] d, _, _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard let d, (try? d.write(to: dest)) != nil, GifAnimation(path: dest.path) != nil else {
+                    self.alert(L("gif_dl_fail"), "")
+                    return
+                }
+                if self.gifTargetPopup?.indexOfSelectedItem == 1 {
+                    self.pendCodexGif = dest.path
+                    self.codexGifLabel?.stringValue = dest.lastPathComponent
+                    self.setPreview(self.codexPreview, path: dest.path)
+                } else {
+                    self.pendClaudeGif = dest.path
+                    self.claudeGifLabel?.stringValue = dest.lastPathComponent
+                    self.setPreview(self.claudePreview, path: dest.path)
+                }
+            }
+        }.resume()
+    }
+
+    private func alert(_ msg: String, _ info: String) {
+        let a = NSAlert()
+        a.messageText = msg
+        a.informativeText = info
+        a.runModal()
     }
 
     private func button(_ title: String, _ action: Selector) -> NSButton {
@@ -1750,9 +1944,18 @@ extension AppDelegate: LocalProcessTerminalViewDelegate {
     func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
     func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}
     func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
-    /// The shell ended (`exit`, crash, kill) — close the notch terminal.
+    /// A shell ended (`exit`, crash, kill) — remove its pane; when the last
+    /// one goes, close the notch terminal.
     func processTerminated(source: TerminalView, exitCode: Int32?) {
-        DispatchQueue.main.async { [weak self] in self?.forceCloseTerminal() }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if let t = source as? LocalProcessTerminalView, let idx = self.termViews.firstIndex(of: t) {
+                self.termViews.remove(at: idx)
+                t.removeFromSuperview()
+                self.termSplit?.adjustSubviews()
+            }
+            if self.termViews.isEmpty { self.forceCloseTerminal() }
+        }
     }
 }
 
