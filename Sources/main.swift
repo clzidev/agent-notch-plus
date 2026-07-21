@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.3.0"
+let appVersion = "2.4.0"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 // MARK: - Localization
@@ -30,8 +30,13 @@ enum L10n {
         "settings": ["Settings…", "Configuración…"],
         "quit": ["Quit Agent Notch", "Salir de Agent Notch"],
         "no_sessions": ["No recent agent sessions", "Sin sesiones recientes de agentes"],
-        "shortcut_hint": ["Shortcuts: ⌃⌥N panel · ⌘D split terminal · ⌘F files",
-                          "Atajos: ⌃⌥N panel · ⌘D dividir terminal · ⌘F archivos"],
+        "shortcut_hint": ["Every shortcut below is configurable (⌘-keys work inside the terminal).",
+                          "Todos los atajos de abajo son configurables (las teclas ⌘ funcionan dentro de la terminal)."],
+        "panel_hotkey": ["Panel shortcut:", "Atajo del panel:"],
+        "term_keys": ["Terminal keys:", "Teclas de terminal:"],
+        "key_split": ["split", "dividir"],
+        "key_files": ["files", "archivos"],
+        "key_folders": ["folders", "carpetas"],
         "terminal": ["Notch terminal", "Terminal del notch"],
         "term_hotkey": ["Terminal shortcut:", "Atajo de terminal:"],
         "term_dir": ["Terminal start folder:", "Carpeta inicial de la terminal:"],
@@ -84,6 +89,16 @@ enum AgentKind: String { case claude = "Claude Code", codex = "Codex" }
 /// their sessions never read as live.
 func encodeProjectDir(_ path: String) -> String {
     String(path.map { $0.isLetter || $0.isNumber ? $0 : "-" })
+}
+
+/// Scale transform anchored at the top-center of `b` WITHOUT touching the
+/// layer's anchorPoint. AppKit resets layer geometry (anchor/position) on
+/// every layout pass, which used to send close/hide animations sliding off
+/// to one side instead of shrinking into the notch.
+func topAnchoredScale(_ sx: CGFloat, _ sy: CGFloat, _ b: NSRect) -> CATransform3D {
+    var m = CATransform3DMakeTranslation(b.midX * (1 - sx), b.maxY * (1 - sy), 0)
+    m = CATransform3DScale(m, sx, sy, 1)
+    return m
 }
 
 struct AgentSession {
@@ -485,7 +500,8 @@ final class SessionScanner {
         var t = s.trimmingCharacters(in: .whitespacesAndNewlines)
         if t.isEmpty || t.hasPrefix("<") || t.hasPrefix("{") { return nil }  // skip system-reminder / tool json
         t = t.replacingOccurrences(of: "\n", with: " ")
-        if t.count > 90 { t = String(t.prefix(90)) + "…" }
+        // keep enough text to fill the zoomed panel's wrapped lines
+        if t.count > 300 { t = String(t.prefix(300)) + "…" }
         return t
     }
 }
@@ -698,8 +714,8 @@ final class SessionListController: NSViewController {
         top.translatesAutoresizingMaskIntoConstraints = false
         var views: [NSView] = [top]
         if !s.snippet.isEmpty {
-            let snip = label(s.snippet, size: 11, color: .secondaryLabelColor, bold: false)
-            snip.maximumNumberOfLines = zoomFactor > 1 ? 3 : 1
+            let snip = label(s.snippet, size: 11, color: .secondaryLabelColor, bold: false,
+                             lines: zoomFactor > 1 ? 2 : 1)
             snip.widthAnchor.constraint(lessThanOrEqualToConstant: 400 * zoomFactor).isActive = true
             views.append(snip)
         }
@@ -736,8 +752,8 @@ final class SessionListController: NSViewController {
         var views: [NSView] = [top]
         let line = s.prompt.isEmpty ? s.snippet : L("you") + s.prompt
         if !line.isEmpty {
-            let snippet = label(line, size: 11, color: .secondaryLabelColor, bold: false)
-            snippet.maximumNumberOfLines = zoomFactor > 1 ? 4 : 1
+            let snippet = label(line, size: 11, color: .secondaryLabelColor, bold: false,
+                                lines: zoomFactor > 1 ? 3 : 1)
             snippet.widthAnchor.constraint(lessThanOrEqualToConstant: 440 * zoomFactor).isActive = true
             views.append(snippet)
         }
@@ -750,11 +766,22 @@ final class SessionListController: NSViewController {
         return col
     }
 
-    private func label(_ text: String, size: CGFloat, color: NSColor, bold: Bool) -> NSTextField {
-        let l = NSTextField(labelWithString: text)
+    private func label(_ text: String, size: CGFloat, color: NSColor, bold: Bool, lines: Int = 1) -> NSTextField {
+        let l: NSTextField
+        if lines > 1 {
+            // a real wrapping label — plain labels truncate to one line no
+            // matter what maximumNumberOfLines says
+            l = NSTextField(wrappingLabelWithString: text)
+            l.isEditable = false
+            l.isSelectable = false
+            l.maximumNumberOfLines = lines
+            l.preferredMaxLayoutWidth = 430 * zoomFactor
+        } else {
+            l = NSTextField(labelWithString: text)
+            l.lineBreakMode = .byTruncatingTail
+        }
         l.font = NSFont.monospacedSystemFont(ofSize: size, weight: bold ? .semibold : .regular)
         l.textColor = color
-        l.lineBreakMode = .byTruncatingTail
         // Truncate rather than force the window wider than its frame
         l.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         return l
@@ -1036,6 +1063,127 @@ final class MascotBarPreview: NSView {
     }
 }
 
+/// Compact quick-folders pane: a single-column browser to hop between
+/// directories fast (double-click navigates, files open, rows drag out).
+/// Lives on its own shortcut, separate from the Finder-style pane.
+final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
+    private var dir: URL
+    private var items: [URL] = []
+    private let table = NSTableView()
+    private let pathLabel = NSTextField(labelWithString: "")
+
+    init(startDir: URL) {
+        dir = startDir
+        super.init(frame: NSRect(x: 0, y: 0, width: 220, height: 300))
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.black.cgColor
+        let up = NSButton(title: "▲", target: self, action: #selector(goUp))
+        up.isBordered = false
+        up.contentTintColor = .systemGreen
+        up.translatesAutoresizingMaskIntoConstraints = false
+        pathLabel.textColor = .secondaryLabelColor
+        pathLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        pathLabel.lineBreakMode = .byTruncatingHead
+        pathLabel.translatesAutoresizingMaskIntoConstraints = false
+        table.addTableColumn(NSTableColumn(identifier: .init("file")))
+        table.headerView = nil
+        table.backgroundColor = .black
+        table.rowHeight = 22
+        table.style = .plain
+        table.dataSource = self
+        table.delegate = self
+        table.target = self
+        table.doubleAction = #selector(openRow)
+        table.setDraggingSourceOperationMask(.copy, forLocal: false)
+        let scroll = NSScrollView()
+        scroll.documentView = table
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(up)
+        addSubview(pathLabel)
+        addSubview(scroll)
+        NSLayoutConstraint.activate([
+            up.topAnchor.constraint(equalTo: topAnchor, constant: 2),
+            up.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
+            up.widthAnchor.constraint(equalToConstant: 20),
+            pathLabel.centerYAnchor.constraint(equalTo: up.centerYAnchor),
+            pathLabel.leadingAnchor.constraint(equalTo: up.trailingAnchor, constant: 4),
+            pathLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
+            scroll.topAnchor.constraint(equalTo: up.bottomAnchor, constant: 2),
+            scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+        reload()
+    }
+    required init?(coder: NSCoder) { nil }
+
+    private func reload() {
+        items = (try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
+        items.sort { a, b in
+            let ad = (try? a.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            let bd = (try? b.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            if ad != bd { return ad && !bd }  // folders first, for hopping around
+            return a.lastPathComponent.localizedCaseInsensitiveCompare(b.lastPathComponent) == .orderedAscending
+        }
+        pathLabel.stringValue = dir.path
+        table.reloadData()
+    }
+
+    @objc private func goUp() {
+        let parent = dir.deletingLastPathComponent()
+        guard parent.path != dir.path else { return }
+        dir = parent
+        reload()
+    }
+
+    @objc private func openRow() {
+        let row = table.clickedRow
+        guard row >= 0, row < items.count else { return }
+        let url = items[row]
+        let vals = try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
+        if vals?.isDirectory == true, vals?.isPackage != true {
+            dir = url
+            reload()
+        } else {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { items.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard row < items.count else { return nil }
+        let url = items[row]
+        let cell = NSTableCellView()
+        let icon = NSImageView(image: NSWorkspace.shared.icon(forFile: url.path))
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        let name = NSTextField(labelWithString: url.lastPathComponent)
+        name.textColor = NSColor(white: 0.9, alpha: 1)
+        name.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        name.lineBreakMode = .byTruncatingTail
+        name.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(icon)
+        cell.addSubview(name)
+        NSLayoutConstraint.activate([
+            icon.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+            icon.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 16),
+            icon.heightAnchor.constraint(equalToConstant: 16),
+            name.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 5),
+            name.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+            name.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+        ])
+        return cell
+    }
+
+    func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
+        row < items.count ? items[row] as NSURL : nil
+    }
+}
+
 /// Key handling for the file table: Space = Quick Look, ⌘C copy, ⌘V paste,
 /// ⌘↑ go up (Finder muscle memory).
 final class FBTableView: NSTableView {
@@ -1206,11 +1354,11 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
             at: dir,
             includingPropertiesForKeys: [.isDirectoryKey, .isPackageKey, .contentModificationDateKey, .fileSizeKey],
             options: [.skipsHiddenFiles])) ?? []
+        // newest first — screenshots and fresh downloads float to the top
         items.sort { a, b in
-            let ad = (try? a.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
-            let bd = (try? b.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
-            if ad != bd { return ad && !bd }  // folders first
-            return a.lastPathComponent.localizedCaseInsensitiveCompare(b.lastPathComponent) == .orderedAscending
+            let ad = (try? a.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            let bd = (try? b.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            return ad > bd
         }
         pathLabel.stringValue = dir.path
         table.reloadData()
@@ -1557,6 +1705,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var termSplit: NSSplitView?
     private var termViews: [LocalProcessTerminalView] = []
     private var fileBrowser: FileBrowserPane?
+    private var quickFolders: QuickFoldersPane?
+    // in-terminal ⌘-keys (configurable): split / files pane / quick folders
+    private var keySplit = "d", keyFiles = "f", keyFolders = "e"
+    private var panelHotkeyPopupRef: NSPopUpButton?
+    private var splitKeyPopupRef: NSPopUpButton?
+    private var filesKeyPopupRef: NSPopUpButton?
+    private var foldersKeyPopupRef: NSPopUpButton?
     private var termHotkeyPopupRef: NSPopUpButton?
     private var loginCheckRef: NSButton?
     private var pendTermDir = ""
@@ -1675,21 +1830,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return noErr
         }, 1, &keySpec, Unmanaged.passUnretained(self).toOpaque(), nil)
-        let panelKeyID = EventHotKeyID(signature: OSType(0x414E_4348), id: 1)  // 'ANCH'
-        RegisterEventHotKey(UInt32(kVK_ANSI_N), UInt32(controlKey | optionKey), panelKeyID,
-                            GetApplicationEventTarget(), 0, &hotKeyRef)
-        // terminal hotkey is user-configurable (config "term-hotkey") — every
-        // fixed choice collided with something (browsers, ChatGPT, fingers)
+        // every hotkey is user-configurable — fixed choices always end up
+        // colliding with something (browsers, ChatGPT, fingers)
+        registerPanelHotkey()
         registerTermHotkey()
+        readTermKeys()
 
-        // ⌘D splits the notch terminal, ⌘F toggles the file browser pane
+        // in-terminal ⌘-keys: split / files pane / quick folders
         // (local monitor: only our own windows)
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             guard let self, let w = self.termWindow, e.window === w,
                   e.modifierFlags.contains(.command) else { return e }
             switch e.charactersIgnoringModifiers?.lowercased() {
-            case "d": self.addTerminalPane(); return nil
-            case "f": self.toggleFileBrowser(); return nil
+            case self.keySplit: self.addTerminalPane(); return nil
+            case self.keyFiles: self.toggleFileBrowser(); return nil
+            case self.keyFolders: self.toggleQuickFolders(); return nil
             default: return e
             }
         }
@@ -1823,9 +1978,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func animatePanelLayer(open: Bool, completion: (() -> Void)? = nil) {
         guard let layer = notchView.layer else { completion?(); return }
         let b = notchView.bounds
-        layer.anchorPoint = CGPoint(x: 0.5, y: 1)
-        layer.position = CGPoint(x: b.midX, y: b.maxY)
-        let small = CATransform3DMakeScale(0.25, 0.06, 1)
+        let small = topAnchoredScale(0.25, 0.06, b)
         let from = open ? small : CATransform3DIdentity
         let to = open ? CATransform3DIdentity : small
         animating = true
@@ -2146,9 +2299,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func curtain(_ panel: NSWindow, open: Bool, completion: (() -> Void)? = nil) {
         guard let view = panel.contentView, let layer = view.layer else { completion?(); return }
         let b = view.bounds
-        layer.anchorPoint = CGPoint(x: 0.5, y: 1)
-        layer.position = CGPoint(x: b.midX, y: b.maxY)
-        let rolled = CATransform3DMakeScale(1, 0.02, 1)
+        let rolled = topAnchoredScale(1, 0.02, b)
         layer.transform = open ? CATransform3DIdentity : rolled
         CATransaction.begin()
         CATransaction.setCompletionBlock {
@@ -2170,9 +2321,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for t in termViews { t.terminate() }
         termViews.removeAll()
         fileBrowser = nil
+        quickFolders = nil
         termWindow?.orderOut(nil)
         termWindow = nil
         termSplit = nil
+    }
+
+    /// Quick-folders pane (compact single-column browser) on its own ⌘-key.
+    @objc fileprivate func toggleQuickFolders() {
+        guard let split = termSplit else { return }
+        if let qf = quickFolders {
+            qf.removeFromSuperview()
+            quickFolders = nil
+            split.adjustSubviews()
+            return
+        }
+        var startDir = (try? String(contentsOf: configURL("term-dir"), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if startDir.isEmpty || !FileManager.default.fileExists(atPath: startDir) {
+            startDir = FileManager.default.homeDirectoryForCurrentUser.path
+        }
+        let qf = QuickFoldersPane(startDir: URL(fileURLWithPath: startDir))
+        quickFolders = qf
+        split.insertArrangedSubview(qf, at: 0)
+        split.adjustSubviews()
+        DispatchQueue.main.async { [weak split] in
+            split?.setPosition(220, ofDividerAt: 0)
+        }
     }
 
     /// ⌘F: toggle a mini file-browser pane on the left of the split — browse
@@ -2242,6 +2417,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         termHotkeyPopupRef = hotkeyPopup
 
+        let panelPopup = NSPopUpButton()
+        panelPopup.addItems(withTitles: Self.panelHotkeyOptions.map(\.label))
+        if let idx = Self.panelHotkeyOptions.firstIndex(where: { $0.id == currentPanelHotkeyID() }) {
+            panelPopup.selectItem(at: idx)
+        }
+        panelHotkeyPopupRef = panelPopup
+
+        func keyPopup(_ current: String) -> NSPopUpButton {
+            let p = NSPopUpButton()
+            p.addItems(withTitles: Self.termKeyLetters.map { "⌘\($0)" })
+            if let idx = Self.termKeyLetters.firstIndex(where: { $0.lowercased() == current }) {
+                p.selectItem(at: idx)
+            }
+            return p
+        }
+        let splitPop = keyPopup(keySplit)
+        splitKeyPopupRef = splitPop
+        let filesPop = keyPopup(keyFiles)
+        filesKeyPopupRef = filesPop
+        let foldersPop = keyPopup(keyFolders)
+        foldersKeyPopupRef = foldersPop
+
         pendTermDir = (try? String(contentsOf: configURL("term-dir"), encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let termDirLbl = NSTextField(labelWithString: pendTermDir.isEmpty ? "/" : pendTermDir)
@@ -2288,7 +2485,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             row(L("language"), [langPopup]),
             row(L("codex_pet"), [petPopup]),
             row(L("zoom_pct"), [zoomField, zoomPctLabel]),
+            row(L("panel_hotkey"), [panelPopup]),
             row(L("term_hotkey"), [hotkeyPopup]),
+            row(L("term_keys"), [splitPop, smallLabel(L("key_split")), filesPop, smallLabel(L("key_files")),
+                                 foldersPop, smallLabel(L("key_folders"))]),
             row(L("term_dir"), [termDirLbl, button(L("choose_dir"), #selector(chooseTermDir)),
                                 button(L("clear_dir"), #selector(clearTermDir))]),
             row(L("mascots"), [button(L("gif_gallery"), #selector(showGifGallery))]),
@@ -2338,6 +2538,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             writeConfig("term-hotkey", Self.termHotkeyOptions[idx].id)
             registerTermHotkey()
         }
+        if let idx = panelHotkeyPopupRef?.indexOfSelectedItem, idx >= 0, idx < Self.panelHotkeyOptions.count {
+            writeConfig("panel-hotkey", Self.panelHotkeyOptions[idx].id)
+            registerPanelHotkey()
+        }
+        func saveKey(_ popup: NSPopUpButton?, _ name: String) {
+            guard let idx = popup?.indexOfSelectedItem, idx >= 0, idx < Self.termKeyLetters.count else { return }
+            writeConfig(name, Self.termKeyLetters[idx].lowercased())
+        }
+        saveKey(splitKeyPopupRef, "key-split")
+        saveKey(filesKeyPopupRef, "key-files")
+        saveKey(foldersKeyPopupRef, "key-folders")
+        readTermKeys()
         writeConfig("term-dir", pendTermDir)
         if #available(macOS 13.0, *), let check = loginCheckRef, check.isEnabled {
             if check.state == .on {
@@ -2408,7 +2620,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         zoomPct = CGFloat(min(100, max(0, Double(v ?? "") ?? 25)))
     }
 
-    // MARK: - Terminal hotkey (configurable)
+    // MARK: - Hotkeys (all configurable)
+
+    static let panelHotkeyOptions: [(id: String, label: String, key: UInt32, mods: UInt32)] = [
+        ("ctrl_opt_n", "⌃⌥ N", UInt32(kVK_ANSI_N), UInt32(controlKey | optionKey)),
+        ("ctrl_opt_p", "⌃⌥ P", UInt32(kVK_ANSI_P), UInt32(controlKey | optionKey)),
+        ("ctrl_opt_m", "⌃⌥ M", UInt32(kVK_ANSI_M), UInt32(controlKey | optionKey)),
+        ("ctrl_opt_b", "⌃⌥ B", UInt32(kVK_ANSI_B), UInt32(controlKey | optionKey)),
+        ("ctrl_opt_j", "⌃⌥ J", UInt32(kVK_ANSI_J), UInt32(controlKey | optionKey)),
+    ]
+
+    static let termKeyLetters = ["D", "E", "F", "G", "J", "K", "L", "O", "P", "U"]
+
+    private func currentPanelHotkeyID() -> String {
+        (try? String(contentsOf: configURL("panel-hotkey"), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? Self.panelHotkeyOptions[0].id
+    }
+
+    private func registerPanelHotkey() {
+        if let hk = hotKeyRef { UnregisterEventHotKey(hk); hotKeyRef = nil }
+        let id = currentPanelHotkeyID()
+        let opt = Self.panelHotkeyOptions.first { $0.id == id } ?? Self.panelHotkeyOptions[0]
+        let panelKeyID = EventHotKeyID(signature: OSType(0x414E_4348), id: 1)  // 'ANCH'
+        RegisterEventHotKey(opt.key, opt.mods, panelKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
+    }
+
+    private func cfgLetter(_ name: String, _ def: String) -> String {
+        let v = (try? String(contentsOf: configURL(name), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        return v.count == 1 ? v : def
+    }
+
+    private func readTermKeys() {
+        keySplit = cfgLetter("key-split", "d")
+        keyFiles = cfgLetter("key-files", "f")
+        keyFolders = cfgLetter("key-folders", "e")
+    }
 
     static let termHotkeyOptions: [(id: String, label: String, key: UInt32, mods: UInt32)] = [
         ("ctrl_opt_space", "⌃⌥ Espacio / Space", UInt32(kVK_Space), UInt32(controlKey | optionKey)),
