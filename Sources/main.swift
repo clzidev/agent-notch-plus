@@ -1,11 +1,12 @@
 import AppKit
 import ApplicationServices
 import Carbon.HIToolbox
+import Quartz
 import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.2.0"
+let appVersion = "2.3.0"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 // MARK: - Localization
@@ -61,6 +62,10 @@ enum L10n {
         "sound_attention": ["When an agent awaits your input", "Cuando un agente espera tu respuesta"],
         "settings_title": ["Agent Notch Plus — Settings", "Agent Notch Plus — Configuración"],
         "no_results": ["No matches", "Sin coincidencias"],
+        "col_name": ["Name", "Nombre"],
+        "col_modified": ["Modified", "Modificado"],
+        "col_size": ["Size", "Tamaño"],
+        "remove_fav": ["Remove from favorites", "Quitar de favoritos"],
         "subagents": ["subagents", "subagentes"],
         "subagent": ["subagent", "subagente"],
         "you": ["You: ", "Vos: "],
@@ -1031,21 +1036,80 @@ final class MascotBarPreview: NSView {
     }
 }
 
-/// Mini file browser pane for the notch terminal (⌘F): navigate with
-/// double-click / the ▲ button, and DRAG any file or folder straight into a
-/// terminal pane (or any other app). Native AppKit, ~100 lines, no deps.
-final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
+/// Key handling for the file table: Space = Quick Look, ⌘C copy, ⌘V paste,
+/// ⌘↑ go up (Finder muscle memory).
+final class FBTableView: NSTableView {
+    var onSpace: (() -> Void)?
+    var onCopy: (() -> Void)?
+    var onPaste: (() -> Void)?
+    var onUp: (() -> Void)?
+    override func keyDown(with event: NSEvent) {
+        if event.charactersIgnoringModifiers == " " { onSpace?(); return }
+        if event.modifierFlags.contains(.command) {
+            if event.keyCode == 126 { onUp?(); return }  // ⌘↑
+            switch event.charactersIgnoringModifiers?.lowercased() {
+            case "c": onCopy?(); return
+            case "v": onPaste?(); return
+            default: break
+            }
+        }
+        super.keyDown(with: event)
+    }
+}
+
+/// Embedded Finder-style pane (⌘F), fully independent of the terminal panes:
+/// sidebar with the standard macOS locations plus your own favorites (drag a
+/// folder onto the sidebar to pin it, right-click to unpin), a real file
+/// list (name/date/size, multi-select), Quick Look on Space, ⌘C/⌘V,
+/// double-click opens files with their default app, and every row drags out
+/// as a real file — into the notch terminals or anywhere else in macOS.
+/// (Finder's own sidebar favorites have no supported public API, hence the
+/// standard-locations + own-favorites approach.)
+final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
+                             QLPreviewPanelDataSource, QLPreviewPanelDelegate {
     private var dir: URL
     private var items: [URL] = []
-    private let table = NSTableView()
+    private var sidebar: [(title: String, url: URL, custom: Bool)] = []
+    private var previewItems: [URL] = []
+    private let sideTable = NSTableView()
+    private let table = FBTableView()
     private let pathLabel = NSTextField(labelWithString: "")
+
+    private static let dateFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .short
+        f.timeStyle = .short
+        return f
+    }()
 
     init(startDir: URL) {
         dir = startDir
-        super.init(frame: NSRect(x: 0, y: 0, width: 220, height: 300))
+        super.init(frame: NSRect(x: 0, y: 0, width: 380, height: 300))
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
 
+        // sidebar
+        sideTable.addTableColumn(NSTableColumn(identifier: .init("side")))
+        sideTable.headerView = nil
+        sideTable.backgroundColor = NSColor(white: 0.07, alpha: 1)
+        sideTable.rowHeight = 24
+        sideTable.style = .plain
+        sideTable.dataSource = self
+        sideTable.delegate = self
+        sideTable.registerForDraggedTypes([.fileURL])  // drop a folder to pin it
+        let sideMenu = NSMenu()
+        let unpin = NSMenuItem(title: L("remove_fav"), action: #selector(removeFavorite), keyEquivalent: "")
+        unpin.target = self
+        sideMenu.addItem(unpin)
+        sideTable.menu = sideMenu
+        let sideScroll = NSScrollView()
+        sideScroll.documentView = sideTable
+        sideScroll.hasVerticalScroller = true
+        sideScroll.drawsBackground = true
+        sideScroll.backgroundColor = NSColor(white: 0.07, alpha: 1)
+        sideScroll.translatesAutoresizingMaskIntoConstraints = false
+
+        // path bar
         let up = NSButton(title: "▲", target: self, action: #selector(goUp))
         up.isBordered = false
         up.contentTintColor = .systemGreen
@@ -1055,44 +1119,93 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate 
         pathLabel.lineBreakMode = .byTruncatingHead
         pathLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        table.addTableColumn(NSTableColumn(identifier: .init("file")))
-        table.headerView = nil
+        // file list
+        let cName = NSTableColumn(identifier: .init("name"))
+        cName.title = L("col_name")
+        cName.width = 190
+        let cDate = NSTableColumn(identifier: .init("date"))
+        cDate.title = L("col_modified")
+        cDate.width = 110
+        let cSize = NSTableColumn(identifier: .init("size"))
+        cSize.title = L("col_size")
+        cSize.width = 64
+        table.addTableColumn(cName)
+        table.addTableColumn(cDate)
+        table.addTableColumn(cSize)
         table.backgroundColor = .black
         table.rowHeight = 22
+        table.style = .plain
+        table.allowsMultipleSelection = true
         table.dataSource = self
         table.delegate = self
         table.target = self
         table.doubleAction = #selector(openRow)
         table.setDraggingSourceOperationMask(.copy, forLocal: false)
-        table.style = .plain
+        table.onSpace = { [weak self] in self?.toggleQuickLook() }
+        table.onCopy = { [weak self] in self?.copySelection() }
+        table.onPaste = { [weak self] in self?.pasteIntoDir() }
+        table.onUp = { [weak self] in self?.goUp() }
         let scroll = NSScrollView()
         scroll.documentView = table
         scroll.hasVerticalScroller = true
         scroll.drawsBackground = false
         scroll.translatesAutoresizingMaskIntoConstraints = false
 
+        addSubview(sideScroll)
         addSubview(up)
         addSubview(pathLabel)
         addSubview(scroll)
         NSLayoutConstraint.activate([
+            sideScroll.topAnchor.constraint(equalTo: topAnchor),
+            sideScroll.bottomAnchor.constraint(equalTo: bottomAnchor),
+            sideScroll.leadingAnchor.constraint(equalTo: leadingAnchor),
+            sideScroll.widthAnchor.constraint(equalToConstant: 140),
             up.topAnchor.constraint(equalTo: topAnchor, constant: 2),
-            up.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
+            up.leadingAnchor.constraint(equalTo: sideScroll.trailingAnchor, constant: 6),
             up.widthAnchor.constraint(equalToConstant: 20),
             pathLabel.centerYAnchor.constraint(equalTo: up.centerYAnchor),
             pathLabel.leadingAnchor.constraint(equalTo: up.trailingAnchor, constant: 4),
             pathLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
             scroll.topAnchor.constraint(equalTo: up.bottomAnchor, constant: 2),
-            scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
+            scroll.leadingAnchor.constraint(equalTo: sideScroll.trailingAnchor),
             scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
+        rebuildSidebar()
         reload()
     }
     required init?(coder: NSCoder) { nil }
 
+    // MARK: navigation
+
+    private func navigate(to url: URL) {
+        dir = url
+        reload()
+    }
+
+    @objc private func goUp() {
+        let parent = dir.deletingLastPathComponent()
+        guard parent.path != dir.path else { return }
+        navigate(to: parent)
+    }
+
+    @objc private func openRow() {
+        let row = table.clickedRow
+        guard row >= 0, row < items.count else { return }
+        let url = items[row]
+        let vals = try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
+        if vals?.isDirectory == true, vals?.isPackage != true {
+            navigate(to: url)
+        } else {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     private func reload() {
         items = (try? FileManager.default.contentsOfDirectory(
-            at: dir, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
+            at: dir,
+            includingPropertiesForKeys: [.isDirectoryKey, .isPackageKey, .contentModificationDateKey, .fileSizeKey],
+            options: [.skipsHiddenFiles])) ?? []
         items.sort { a, b in
             let ad = (try? a.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
             let bd = (try? b.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
@@ -1103,51 +1216,227 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate 
         table.reloadData()
     }
 
-    @objc private func goUp() {
-        let parent = dir.deletingLastPathComponent()
-        guard parent.path != dir.path else { return }
-        dir = parent
+    // MARK: sidebar / favorites
+
+    private var favoritesURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/agent-notch/favorites")
+    }
+
+    private func rebuildSidebar() {
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser
+        var entries: [(title: String, url: URL, custom: Bool)] = []
+        func add(_ url: URL?, name: String? = nil) {
+            guard let url, fm.fileExists(atPath: url.path) else { return }
+            entries.append((name ?? fm.displayName(atPath: url.path), url, false))
+        }
+        add(home)
+        add(URL(fileURLWithPath: "/Applications"))
+        add(fm.urls(for: .desktopDirectory, in: .userDomainMask).first)
+        add(fm.urls(for: .documentDirectory, in: .userDomainMask).first)
+        add(fm.urls(for: .downloadsDirectory, in: .userDomainMask).first)
+        add(fm.urls(for: .picturesDirectory, in: .userDomainMask).first)
+        add(fm.urls(for: .musicDirectory, in: .userDomainMask).first)
+        add(fm.urls(for: .moviesDirectory, in: .userDomainMask).first)
+        add(home.appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs"), name: "iCloud Drive")
+        let favs: [(title: String, url: URL, custom: Bool)] =
+            ((try? String(contentsOf: favoritesURL, encoding: .utf8)) ?? "")
+                .split(whereSeparator: \.isNewline)
+                .map { URL(fileURLWithPath: String($0)) }
+                .filter { fm.fileExists(atPath: $0.path) }
+                .map { (fm.displayName(atPath: $0.path), $0, true) }
+        sidebar = entries + favs
+        sideTable.reloadData()
+    }
+
+    private func saveFavorites() {
+        let paths = sidebar.filter { $0.custom }.map { $0.url.path }.joined(separator: "\n")
+        try? paths.write(to: favoritesURL, atomically: true, encoding: .utf8)
+    }
+
+    @objc private func removeFavorite() {
+        let row = sideTable.clickedRow
+        guard row >= 0, row < sidebar.count, sidebar[row].custom else { return }
+        sidebar.remove(at: row)
+        saveFavorites()
+        sideTable.reloadData()
+    }
+
+    // MARK: clipboard / Quick Look
+
+    private var selectedURLs: [URL] {
+        table.selectedRowIndexes.compactMap { $0 < items.count ? items[$0] : nil }
+    }
+
+    private func copySelection() {
+        let urls = selectedURLs
+        guard !urls.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.writeObjects(urls as [NSURL])
+    }
+
+    /// ⌘V copies the pasteboard's files INTO the current folder (never
+    /// overwrites — appends " 2", " 3"… like Finder).
+    private func pasteIntoDir() {
+        guard let urls = NSPasteboard.general.readObjects(forClasses: [NSURL.self], options: nil) as? [URL],
+              !urls.isEmpty else { return }
+        let fm = FileManager.default
+        for src in urls {
+            var dest = dir.appendingPathComponent(src.lastPathComponent)
+            var n = 2
+            while fm.fileExists(atPath: dest.path) {
+                let base = src.deletingPathExtension().lastPathComponent
+                let ext = src.pathExtension
+                dest = dir.appendingPathComponent(ext.isEmpty ? "\(base) \(n)" : "\(base) \(n).\(ext)")
+                n += 1
+            }
+            try? fm.copyItem(at: src, to: dest)
+        }
         reload()
     }
 
-    @objc private func openRow() {
-        let row = table.clickedRow
-        guard row >= 0, row < items.count,
-              (try? items[row].resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else { return }
-        dir = items[row]
-        reload()
+    private func toggleQuickLook() {
+        guard let panel = QLPreviewPanel.shared() else { return }
+        if panel.isVisible {
+            panel.orderOut(nil)
+        } else {
+            previewItems = selectedURLs
+            guard !previewItems.isEmpty else { return }
+            NSApp.activate(ignoringOtherApps: true)
+            panel.makeKeyAndOrderFront(nil)
+        }
     }
 
-    func numberOfRows(in tableView: NSTableView) -> Int { items.count }
+    override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool { true }
+    override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        panel.dataSource = self
+        panel.delegate = self
+        // the notch terminal floats at statusBar level — lift Quick Look above it
+        panel.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 2)
+    }
+    override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        panel.dataSource = nil
+        panel.delegate = nil
+    }
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int { previewItems.count }
+    func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
+        previewItems[index] as NSURL
+    }
+
+    // MARK: tables
+
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        tableView === sideTable ? sidebar.count : items.count
+    }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        if tableView === sideTable {
+            guard row < sidebar.count else { return nil }
+            let entry = sidebar[row]
+            return iconCell(icon: NSWorkspace.shared.icon(forFile: entry.url.path),
+                            text: entry.title, color: NSColor(white: 0.85, alpha: 1))
+        }
+        guard row < items.count else { return nil }
         let url = items[row]
+        switch tableColumn?.identifier.rawValue {
+        case "name":
+            return iconCell(icon: NSWorkspace.shared.icon(forFile: url.path),
+                            text: url.lastPathComponent, color: NSColor(white: 0.9, alpha: 1))
+        case "date":
+            let d = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            return textCell(d.map { Self.dateFmt.string(from: $0) } ?? "—")
+        case "size":
+            let vals = try? url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
+            let text = vals?.isDirectory == true ? "—"
+                : ByteCountFormatter.string(fromByteCount: Int64(vals?.fileSize ?? 0), countStyle: .file)
+            return textCell(text)
+        default:
+            return nil
+        }
+    }
+
+    private func iconCell(icon: NSImage, text: String, color: NSColor) -> NSView {
         let cell = NSTableCellView()
-        let icon = NSImageView(image: NSWorkspace.shared.icon(forFile: url.path))
-        icon.translatesAutoresizingMaskIntoConstraints = false
-        let name = NSTextField(labelWithString: url.lastPathComponent)
-        name.textColor = NSColor(white: 0.9, alpha: 1)
+        let iv = NSImageView(image: icon)
+        iv.translatesAutoresizingMaskIntoConstraints = false
+        let name = NSTextField(labelWithString: text)
+        name.textColor = color
         name.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         name.lineBreakMode = .byTruncatingTail
         name.translatesAutoresizingMaskIntoConstraints = false
-        cell.addSubview(icon)
+        cell.addSubview(iv)
         cell.addSubview(name)
         NSLayoutConstraint.activate([
-            icon.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
-            icon.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 16),
-            icon.heightAnchor.constraint(equalToConstant: 16),
-            name.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 5),
+            iv.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+            iv.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            iv.widthAnchor.constraint(equalToConstant: 16),
+            iv.heightAnchor.constraint(equalToConstant: 16),
+            name.leadingAnchor.constraint(equalTo: iv.trailingAnchor, constant: 5),
             name.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
             name.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
         ])
         return cell
     }
 
-    /// Rows are draggable as real file URLs — drop them on a terminal pane
-    /// (types the quoted path) or anywhere else.
+    private func textCell(_ text: String) -> NSView {
+        let cell = NSTableCellView()
+        let l = NSTextField(labelWithString: text)
+        l.textColor = .secondaryLabelColor
+        l.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        l.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(l)
+        NSLayoutConstraint.activate([
+            l.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+            l.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+            l.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+        ])
+        return cell
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        guard let t = notification.object as? NSTableView else { return }
+        if t === sideTable {
+            let row = sideTable.selectedRow
+            guard row >= 0, row < sidebar.count else { return }
+            navigate(to: sidebar[row].url)
+        } else if let panel = QLPreviewPanel.shared(), panel.isVisible {
+            previewItems = selectedURLs
+            panel.reloadData()
+        }
+    }
+
+    /// File rows drag out as real file URLs (multi-selection drags them all).
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
-        items[row] as NSURL
+        guard tableView === table, row < items.count else { return nil }
+        return items[row] as NSURL
+    }
+
+    /// Drop a folder on the sidebar to pin it as a favorite.
+    func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo,
+                   proposedRow row: Int, proposedDropOperation op: NSTableView.DropOperation) -> NSDragOperation {
+        tableView === sideTable ? .copy : []
+    }
+
+    func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo,
+                   row: Int, dropOperation: NSTableView.DropOperation) -> Bool {
+        guard tableView === sideTable,
+              let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL]
+        else { return false }
+        let fm = FileManager.default
+        var added = false
+        for url in urls {
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue,
+                  !sidebar.contains(where: { $0.url.path == url.path }) else { continue }
+            sidebar.append((fm.displayName(atPath: url.path), url, true))
+            added = true
+        }
+        if added {
+            saveFavorites()
+            sideTable.reloadData()
+        }
+        return added
     }
 }
 
@@ -1906,7 +2195,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         split.insertArrangedSubview(fb, at: 0)
         split.adjustSubviews()
         DispatchQueue.main.async { [weak split] in
-            split?.setPosition(230, ofDividerAt: 0)  // browser stays a narrow column
+            split?.setPosition(400, ofDividerAt: 0)  // sidebar + list need real width
         }
     }
 
