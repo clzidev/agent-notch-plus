@@ -246,12 +246,12 @@ final class DitherIconView: NSView {
                         from: src, operation: .sourceOver, fraction: 1)
             return
         }
-        // mini Claude mascot walking
-        let subW: CGFloat = 0.9, subH: CGFloat = 1.8
+        // mini Claude mascot walking, with a visible bob
+        let subW: CGFloat = 1.0, subH: CGFloat = 2.0
         let walk = Int(t * 2.5)
         let frame = IndicatorView.mascotFrames[walk % 2]
         let rows = frame.count * 2
-        let y0 = CGFloat(rows) * subH + 1
+        let y0 = CGFloat(rows) * subH + 1 + (walk % 2 == 0 ? 0 : 1.5)
         for (j, line) in frame.enumerated() {
             for (i, ch) in line.enumerated() {
                 guard let q = IndicatorView.quadrants[ch] else { continue }
@@ -451,9 +451,11 @@ final class SessionListController: NSViewController {
 // MARK: - Notch window content
 
 /// Indicator content: branded pixel animations for whichever agents are running.
+enum AgentGlyphState { case inactive, running, done }
+
 final class IndicatorView: NSView {
-    var claudeRunning = false { didSet { needsDisplay = true } }
-    var codexRunning = false { didSet { needsDisplay = true } }
+    var claudeState: AgentGlyphState = .inactive { didSet { needsDisplay = true } }
+    var codexState: AgentGlyphState = .inactive { didSet { needsDisplay = true } }
     var t: CGFloat = 0 { didSet { needsDisplay = true } }
 
     static let claudeOrange = NSColor(red: 0.85, green: 0.47, blue: 0.34, alpha: 1)  // Anthropic coral
@@ -489,12 +491,18 @@ final class IndicatorView: NSView {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         let cy = bounds.midY
         var x = bounds.maxX - 6  // right-aligned toward the notch
-        if !claudeRunning && !codexRunning {
-            drawGreenBlob(ctx, right: x, cy: cy)
-            return
+        // each agent keeps its own slot: mascot while running, green blob when
+        // freshly done (cleared once you revisit the terminal)
+        switch claudeState {
+        case .running: x = drawCrab(ctx, right: x, cy: cy) - 6
+        case .done: drawGreenBlob(ctx, right: x, cy: cy); x -= 24
+        case .inactive: break
         }
-        if claudeRunning { x = drawCrab(ctx, right: x, cy: cy) - 6 }
-        if codexRunning { _ = drawCodexPet(ctx, right: x, cy: cy) }
+        switch codexState {
+        case .running: _ = drawCodexPet(ctx, right: x, cy: cy)
+        case .done: drawGreenBlob(ctx, right: x, cy: cy)
+        case .inactive: break
+        }
     }
 
     private func drawGreenBlob(_ ctx: CGContext, right: CGFloat, cy: CGFloat) {
@@ -658,8 +666,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let listController = SessionListController()
     private var frame = 0
     private var wasRunning = false
-    private var claudeRunning = false
-    private var codexRunning = false
+    private var claudeState: AgentGlyphState = .inactive
+    private var codexState: AgentGlyphState = .inactive
     private var expanded = false
 
     // Geometry
@@ -759,6 +767,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         window.orderFrontRegardless()
         indicatorWindow.orderFrontRegardless()
+
+        // Revisiting the terminal acknowledges finished agents — green clears
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self,
+                  let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            let terminals = ["com.mitchellh.ghostty", "com.apple.Terminal", "com.googlecode.iterm2",
+                             "net.kovidgoyal.kitty", "dev.warp.Warp-Stable", "io.alacritty"]
+            if terminals.contains(app.bundleIdentifier ?? "") {
+                if self.claudeState == .done { self.claudeState = .inactive }
+                if self.codexState == .done { self.codexState = .inactive }
+                self.render()
+            }
+        }
 
         // SIGUSR1 toggles the panel — lets tests drive it without synthetic clicks
         let sig = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
@@ -867,9 +890,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 IndicatorView.refreshPetChoice()
                 self.listController.sessions = result
-                self.claudeRunning = result.contains { $0.kind == .claude && $0.anyRunning }
-                self.codexRunning = result.contains { $0.kind == .codex && $0.anyRunning }
-                self.wasRunning = self.claudeRunning || self.codexRunning
+                let claudeNow = result.contains { $0.kind == .claude && $0.anyRunning }
+                let codexNow = result.contains { $0.kind == .codex && $0.anyRunning }
+                self.claudeState = claudeNow ? .running : (self.claudeState == .running ? .done : self.claudeState)
+                self.codexState = codexNow ? .running : (self.codexState == .running ? .done : self.codexState)
+                self.wasRunning = claudeNow || codexNow
                 self.render()
             }
         }
@@ -881,8 +906,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func render() {
-        indicatorView.claudeRunning = claudeRunning
-        indicatorView.codexRunning = codexRunning
+        indicatorView.claudeState = claudeState
+        indicatorView.codexState = codexState
         indicatorView.t = CGFloat(frame) * 0.12
     }
 }

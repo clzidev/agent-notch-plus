@@ -2,13 +2,13 @@
 
 Your AI agents, living next to the MacBook notch.
 
-While **Claude Code** or **Codex** is working, its mascot walks beside the notch — the Claude Code banner critter for Claude, the official Codex pet for Codex. When everything's done, they're replaced by a calm green blob. Click to open a panel of your sessions, grouped by prompt, with every subagent tucked under a dropdown.
+While **Claude Code** or **Codex** is working, its mascot walks beside the notch — the Claude Code banner critter for Claude, the official Codex pet for Codex. Each agent has its own slot: the moment one finishes, its mascot becomes a green blob (even while the other keeps working). The green is a "finished since you last looked" notification — focusing your terminal clears it. Click to open a panel of your sessions, grouped by prompt, with every subagent tucked under a dropdown.
 
 <p align="center"><img src="docs/indicator.gif" width="520" alt="Claude Code mascot and Codex pet walking beside the notch" /></p>
 
 ## The panel
 
-One row per session, titled by the tool, led by **your** latest prompt — not the agents' chatter. Subagents (Codex's philosopher swarm, Claude's Task agents) fold under a `▸ N subagents` dropdown. Running rows animate; finished rows get a green pixel checkmark. The tag on the right is the actual model that session runs.
+One row per session, titled by the tool, led by **your** latest prompt — not the agents' chatter. Subagents (Codex's philosopher swarm, Claude's Task agents) fold under a `▸ N subagents` dropdown. Running rows show their mascot walking in place; finished rows get a green pixel checkmark. The tag on the right is the actual model that session runs.
 
 <p align="center"><img src="docs/panel.png" width="600" alt="Session panel with subagent dropdowns" /></p>
 
@@ -19,7 +19,7 @@ No hooks, no APIs, no accounts — it just polls the transcript files both CLIs 
 - Claude Code: `~/.claude/projects/*/*.jsonl` (+ `<session>/subagents/agent-*.jsonl`)
 - Codex: `~/.codex/sessions/**/*.jsonl`, grouped by `parent_thread_id`
 
-A transcript modified in the last 20 s counts as *running*. Sessions idle over 6 h drop off.
+A transcript modified in the last 20 s counts as *running*. Sessions idle over 6 h drop off. Activating a terminal app (Ghostty, Terminal, iTerm2, kitty, Warp, Alacritty) acknowledges finished agents and clears their green indicator.
 
 The collapsed window is transparent and fully click-through except the tiny indicator zone, so it never blocks menu items or apps underneath. In fullscreen spaces the bar spans the whole top edge.
 
