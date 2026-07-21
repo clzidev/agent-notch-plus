@@ -1,6 +1,6 @@
 # Agent Notch Plus
 
-Your AI agents, living next to the MacBook notch. **v2.4.0**
+Your AI agents, living next to the MacBook notch. **v2.5.0**
 
 > Fork of [realfishsam/agent-notch](https://github.com/realfishsam/agent-notch) — all credit for the original concept, design and implementation goes to its author. This fork adds a global keyboard shortcut, hover-to-open, and a settings panel with custom animated-GIF mascots. See [What this fork adds](#what-this-fork-adds).
 
@@ -41,6 +41,9 @@ The collapsed window is transparent and fully click-through except the tiny indi
   - set a **custom animated GIF** per agent that replaces its mascot in the notch and in the panel rows — transparent-background GIFs look best on the black bar
 - **Hover zoom** — while the panel is open, hovering it grows it by a configurable percentage (default 25%); the font size stays the same but snippets wrap into 2-3 real lines filling the extra width, so you read *more* text. It shrinks back when the mouse leaves.
 - **Every shortcut is configurable** — panel hotkey, terminal hotkey, and the in-terminal ⌘-keys for split / files pane / quick-folders pane.
+- **Quick-folders pane syncs with the shell both ways** — navigating the pane `cd`s the terminal, and typing `cd` in the terminal moves the pane (the shell's real cwd is read from the kernel ~1×/s); a ".." row at the top goes up.
+- **Terminal selection editing** — select text with the mouse, then ⌘C/⌘X copy it and ⌘V pastes, no menu bar needed.
+- **Light on resources** — transcript tails are cached by mtime (only changed files are re-read each 3 s poll), and the indicator repaints only while something is actually animating.
 - **Notch terminal** (configurable hotkey, default ⌃⌥Space) — a real terminal ([SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)) that unrolls from the notch like a curtain and rolls back up when hidden, with its shells kept running. It is part of the notch: it cannot be moved, and resizing from any edge grows it symmetrically, always centered under the notch. **⌘D** splits it into up to 3 side-by-side panes. Minimal matrix-style prompt — `project branch ❯` inside a git repo, a bare `❯` anywhere else, with a blinking green block cursor (your `~/.zshrc` is still sourced, colors intact). Drag & drop files onto it to type their quoted paths, and pick its start folder in settings (falls back to `/` if the folder disappears). **⌘F** toggles an embedded Finder-style pane, fully independent of the terminals: sidebar with standard locations plus your own pinned favorites (drag a folder onto it), name/date/size columns, multi-select, **Space for Quick Look**, ⌘C/⌘V, double-click opens files, and everything drags out as real files — into the terminals or anywhere in macOS.
 - **Idle sessions stay visible** — an alive-but-quiet agent shows its mascot dimmed and static instead of vanishing from the notch. Run `claude` or `codex` in one and answer their confirmations right from the notch. `exit` closes a pane, ✕ force-closes everything even if a shell hangs.
 - **Animated emoji mascots — no API, no account** — a scrollable gallery of 60 [Noto Animated Emoji](https://googlefonts.github.io/noto-emoji-animation/) (small transparent-background GIFs served by Google's public CDN). Search by name (EN/ES), click one and it instantly replaces the Claude or Codex mascot; one click restores the original. Fetching these emoji is the app's only network access.

@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.4.0"
+let appVersion = "2.5.0"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 // MARK: - Localization
@@ -99,6 +99,17 @@ func topAnchoredScale(_ sx: CGFloat, _ sy: CGFloat, _ b: NSRect) -> CATransform3
     var m = CATransform3DMakeTranslation(b.midX * (1 - sx), b.maxY * (1 - sy), 0)
     m = CATransform3DScale(m, sx, sy, 1)
     return m
+}
+
+/// Current working directory of a process (the terminal's shell), straight
+/// from the kernel — how the quick-folders pane mirrors `cd` in real time.
+func pidCwd(_ pid: pid_t) -> String? {
+    var info = proc_vnodepathinfo()
+    let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+    guard proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, size) == size else { return nil }
+    return withUnsafePointer(to: info.pvi_cdir.vip_path) { ptr in
+        ptr.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) }
+    }
 }
 
 struct AgentSession {
@@ -279,12 +290,26 @@ final class ProcessDiscovery {
 final class SessionScanner {
     private let fm = FileManager.default
     private let home = FileManager.default.homeDirectoryForCurrentUser
+    // transcript tails are re-read every 3 s poll — cache by mtime so only
+    // files that actually changed get read again (the scan's biggest cost)
+    private var tailCache: [String: (mtime: Date, info: (snippet: String, model: String, prompt: String, activity: Date?))] = [:]
+    // a rollout's first line never changes — cache it forever
+    private var codexMetaCache: [String: (title: String, id: String, parentID: String?, nickname: String?)] = [:]
+
+    private func cachedTailInfo(of f: URL, mtime: Date) -> (snippet: String, model: String, prompt: String, activity: Date?) {
+        if let c = tailCache[f.path], c.mtime == mtime { return c.info }
+        let info = tailInfo(of: f)
+        tailCache[f.path] = (mtime, info)
+        return info
+    }
 
     /// `live` = transcript paths held open by a running agent process;
     /// `claudeCwdCounts` = encoded-project-dir → number of claude processes
     /// with that cwd (the fallback when claude exposes no open transcript).
     /// Together they are the sole source of truth for isRunning.
     func scan(live: Set<String>, claudeCwdCounts: [String: Int]) -> [AgentSession] {
+        if tailCache.count > 600 { tailCache.removeAll() }        // unbounded-growth guard
+        if codexMetaCache.count > 600 { codexMetaCache.removeAll() }
         let recent: (AgentSession) -> Bool = { $0.isLive || Date().timeIntervalSince($0.lastModified) < 6 * 3600 }
         var sessions = scanClaude(live: live, cwdCounts: claudeCwdCounts).filter(recent)
             + groupCodex(scanCodex(live: live).filter(recent))
@@ -340,7 +365,7 @@ final class SessionScanner {
             let liveByCwd = cwdCounts[proj.lastPathComponent] ?? 0
             for (idx, (f, mtime)) in dated.enumerated() {
                 let projName = proj.lastPathComponent.split(separator: "-").last.map(String.init) ?? proj.lastPathComponent
-                let info = tailInfo(of: f)
+                let info = cachedTailInfo(of: f, mtime: mtime)
                 var sess = AgentSession(id: f.path, kind: .claude, title: projName,
                                         snippet: info.snippet, model: info.model, lastModified: mtime)
                 sess.prompt = info.prompt
@@ -361,8 +386,12 @@ final class SessionScanner {
             guard let mtime = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate else { continue }
             // Skip old files early to avoid reading them
             if Date().timeIntervalSince(mtime) > 6 * 3600 { continue }
-            let meta = codexMeta(of: f)
-            let info = tailInfo(of: f)
+            let meta = codexMetaCache[f.path] ?? {
+                let m = codexMeta(of: f)
+                codexMetaCache[f.path] = m
+                return m
+            }()
+            let info = cachedTailInfo(of: f, mtime: mtime)
             var sess = AgentSession(id: f.path, kind: .codex, title: meta.title,
                                     snippet: info.snippet, model: info.model, lastModified: mtime)
             sess.prompt = info.prompt
@@ -383,7 +412,7 @@ final class SessionScanner {
         for c in files where c.pathExtension == "jsonl" {
             guard let mtime = (try? c.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
                   Date().timeIntervalSince(mtime) < 6 * 3600 else { continue }
-            let info = tailInfo(of: c)
+            let info = cachedTailInfo(of: c, mtime: mtime)
             var kid = AgentSession(id: c.path, kind: .claude, title: "subagent",
                                    snippet: info.snippet, model: info.model, lastModified: mtime)
             // no nicknames here — label with the task it was given
@@ -683,7 +712,9 @@ final class SessionListController: NSViewController {
         }
         if animTimer == nil {
             animTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
-                guard let self else { return }
+                // skip while the panel is detached — no point animating rows
+                // nobody can see
+                guard let self, self.view.window != nil else { return }
                 for icon in self.icons { icon.t += 0.12 }
             }
         }
@@ -715,7 +746,7 @@ final class SessionListController: NSViewController {
         var views: [NSView] = [top]
         if !s.snippet.isEmpty {
             let snip = label(s.snippet, size: 11, color: .secondaryLabelColor, bold: false,
-                             lines: zoomFactor > 1 ? 2 : 1)
+                             lines: zoomFactor >= 1.5 ? 3 : zoomFactor > 1 ? 2 : 1)
             snip.widthAnchor.constraint(lessThanOrEqualToConstant: 400 * zoomFactor).isActive = true
             views.append(snip)
         }
@@ -753,7 +784,7 @@ final class SessionListController: NSViewController {
         let line = s.prompt.isEmpty ? s.snippet : L("you") + s.prompt
         if !line.isEmpty {
             let snippet = label(line, size: 11, color: .secondaryLabelColor, bold: false,
-                                lines: zoomFactor > 1 ? 3 : 1)
+                                lines: zoomFactor >= 1.5 ? 4 : zoomFactor > 1 ? 3 : 1)
             snippet.widthAnchor.constraint(lessThanOrEqualToConstant: 440 * zoomFactor).isActive = true
             views.append(snippet)
         }
@@ -1071,6 +1102,20 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
     private var items: [URL] = []
     private let table = NSTableView()
     private let pathLabel = NSTextField(labelWithString: "")
+    /// Fired when the USER navigates here — the app `cd`s the terminal to match.
+    var onNavigate: ((URL) -> Void)?
+    private var hasParent: Bool { dir.path != "/" }
+    private func itemIndex(forRow row: Int) -> Int? {
+        let idx = row - (hasParent ? 1 : 0)
+        return idx >= 0 && idx < items.count ? idx : nil
+    }
+
+    /// External sync (terminal `cd`): update the view without echoing back.
+    func setDirectory(_ url: URL) {
+        guard url.path != dir.path else { return }
+        dir = url
+        reload()
+    }
 
     init(startDir: URL) {
         dir = startDir
@@ -1132,35 +1177,48 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
         table.reloadData()
     }
 
+    private func navigateAndNotify(_ url: URL) {
+        dir = url
+        reload()
+        onNavigate?(url)
+    }
+
     @objc private func goUp() {
         let parent = dir.deletingLastPathComponent()
         guard parent.path != dir.path else { return }
-        dir = parent
-        reload()
+        navigateAndNotify(parent)
     }
 
     @objc private func openRow() {
         let row = table.clickedRow
-        guard row >= 0, row < items.count else { return }
-        let url = items[row]
+        if hasParent, row == 0 { goUp(); return }  // the ".." row
+        guard let idx = itemIndex(forRow: row) else { return }
+        let url = items[idx]
         let vals = try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
         if vals?.isDirectory == true, vals?.isPackage != true {
-            dir = url
-            reload()
+            navigateAndNotify(url)
         } else {
             NSWorkspace.shared.open(url)
         }
     }
 
-    func numberOfRows(in tableView: NSTableView) -> Int { items.count }
+    func numberOfRows(in tableView: NSTableView) -> Int { items.count + (hasParent ? 1 : 0) }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard row < items.count else { return nil }
-        let url = items[row]
+        if hasParent, row == 0 {
+            let parent = dir.deletingLastPathComponent()
+            return quickCell(icon: NSWorkspace.shared.icon(forFile: parent.path), text: "..")
+        }
+        guard let idx = itemIndex(forRow: row) else { return nil }
+        let url = items[idx]
+        return quickCell(icon: NSWorkspace.shared.icon(forFile: url.path), text: url.lastPathComponent)
+    }
+
+    private func quickCell(icon iconImage: NSImage, text: String) -> NSView {
         let cell = NSTableCellView()
-        let icon = NSImageView(image: NSWorkspace.shared.icon(forFile: url.path))
+        let icon = NSImageView(image: iconImage)
         icon.translatesAutoresizingMaskIntoConstraints = false
-        let name = NSTextField(labelWithString: url.lastPathComponent)
+        let name = NSTextField(labelWithString: text)
         name.textColor = NSColor(white: 0.9, alpha: 1)
         name.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         name.lineBreakMode = .byTruncatingTail
@@ -1180,7 +1238,8 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
     }
 
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
-        row < items.count ? items[row] as NSURL : nil
+        guard let idx = itemIndex(forRow: row) else { return nil }  // ".." doesn't drag
+        return items[idx] as NSURL
     }
 }
 
@@ -1841,7 +1900,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             guard let self, let w = self.termWindow, e.window === w,
                   e.modifierFlags.contains(.command) else { return e }
+            // no menu bar in an accessory app, so route the edit keys by
+            // hand: ⌘C/⌘X copy the terminal's mouse selection, ⌘V pastes
+            let term = w.firstResponder as? LocalProcessTerminalView
             switch e.charactersIgnoringModifiers?.lowercased() {
+            case "c" where term?.selectionActive == true,
+                 "x" where term?.selectionActive == true:
+                term?.copy(term)
+                return nil
+            case "v" where term != nil:
+                term?.paste(term)
+                return nil
             case self.keySplit: self.addTerminalPane(); return nil
             case self.keyFiles: self.toggleFileBrowser(); return nil
             case self.keyFolders: self.toggleQuickFolders(); return nil
@@ -2096,7 +2165,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func tick() {
         frame += 1
         checkHover()
-        render()
+        syncQuickFolders()
+        // repaint only while something on screen actually animates — an
+        // idle/empty indicator repainting 8×/s is pure wasted CPU
+        let animating = claudeState == .running || codexState == .running
+            || claudeState == .done || codexState == .done
+        if animating || expanded { render() }
     }
 
     /// Hover peek: resting the cursor on the indicator (~0.35 s) opens the
@@ -2274,6 +2348,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return dir
     }
 
+    /// Focused terminal (or the first one), for pane→terminal syncing.
+    private var focusedTerminal: LocalProcessTerminalView? {
+        termViews.first { $0.window?.firstResponder === $0 } ?? termViews.first
+    }
+
+    /// The quick-folders pane navigated — `cd` the terminal to match.
+    private func cdTerminal(to url: URL) {
+        guard let term = focusedTerminal else { return }
+        let quoted = "'" + url.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        term.send(txt: " cd " + quoted + "\n")
+    }
+
+    /// Terminal → pane: mirror the shell's real cwd (read from the kernel)
+    /// so `cd ..`, `cd /` etc. show up in the quick-folders pane, ~1×/s.
+    private func syncQuickFolders() {
+        guard frame % 8 == 0, let qf = quickFolders,
+              let pid = focusedTerminal?.process?.shellPid, pid > 0,
+              let cwd = pidCwd(pid) else { return }
+        qf.setDirectory(URL(fileURLWithPath: cwd))
+    }
+
     private func showTerminal(_ panel: NSWindow) {
         // always re-anchor under the notch, keeping the user's chosen size
         let s = screen.frame
@@ -2342,6 +2437,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             startDir = FileManager.default.homeDirectoryForCurrentUser.path
         }
         let qf = QuickFoldersPane(startDir: URL(fileURLWithPath: startDir))
+        qf.onNavigate = { [weak self] url in self?.cdTerminal(to: url) }
         quickFolders = qf
         split.insertArrangedSubview(qf, at: 0)
         split.adjustSubviews()
