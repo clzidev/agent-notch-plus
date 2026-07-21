@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.5.1"
+let appVersion = "2.5.2"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 // MARK: - Localization
@@ -752,7 +752,7 @@ final class SessionListController: NSViewController {
                              lines: zoomFactor >= 1.5 ? 3 : zoomFactor > 1 ? 2 : 1)
             let w = contentWidth - 70
             snip.preferredMaxLayoutWidth = w
-            snip.widthAnchor.constraint(lessThanOrEqualToConstant: w).isActive = true
+            snip.widthAnchor.constraint(equalToConstant: w).isActive = true
             views.append(snip)
         }
         let col = NSStackView(views: views)
@@ -792,7 +792,9 @@ final class SessionListController: NSViewController {
                                 lines: zoomFactor >= 1.5 ? 4 : zoomFactor > 1 ? 3 : 1)
             let w = contentWidth - 40
             snippet.preferredMaxLayoutWidth = w
-            snippet.widthAnchor.constraint(lessThanOrEqualToConstant: w).isActive = true
+            // exact width: the text block always spans the panel instead of
+            // drifting as Auto Layout re-solves during the zoom animation
+            snippet.widthAnchor.constraint(equalToConstant: w).isActive = true
             views.append(snippet)
         }
         let col = NSStackView(views: views)
@@ -2346,6 +2348,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         zstyle ':vcs_info:*' enable git
         zstyle ':vcs_info:git:*' formats ' %F{cyan}%b%f'
         setopt PROMPT_SUBST
+        PROMPT_EOL_MARK=''  # hide zsh's inverse-% partial-line marker
         # inside a git repo: "project branch ❯" — anywhere else just "❯".
         # (No ${:+} nesting: %F{...} braces inside it break the expansion.)
         precmd() {
