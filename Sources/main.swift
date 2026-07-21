@@ -964,6 +964,17 @@ final class KeyPanel: NSPanel {
     override var canBecomeKey: Bool { true }
 }
 
+/// Thin grab bar at the top of the notch terminal: drag to move the window.
+final class TermDragStrip: NSView {
+    override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let w: CGFloat = 36
+        ctx.setFillColor(NSColor.white.withAlphaComponent(0.25).cgColor)
+        ctx.fill(CGRect(x: bounds.midX - w / 2, y: bounds.midY - 1.5, width: w, height: 3))
+    }
+}
+
 final class NotchView: NSView {
     var expanded = false { didSet { needsDisplay = true } }
     var barHeight: CGFloat = 32
@@ -1471,7 +1482,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let s = screen.frame
         let tw: CGFloat = 760, th: CGFloat = 460
         let frame = NSRect(x: s.midX - tw / 2, y: s.maxY - barHeight - th, width: tw, height: th)
-        let panel = KeyPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel],
+        let panel = KeyPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel, .resizable],
                              backing: .buffered, defer: false)
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -1479,17 +1490,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.level = .statusBar
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
+        panel.minSize = NSSize(width: 480, height: 280)
         let container = NSView(frame: NSRect(origin: .zero, size: NSSize(width: tw, height: th)))
         container.wantsLayer = true
         container.layer?.backgroundColor = NSColor.black.cgColor
         container.layer?.cornerRadius = 16
         container.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
-        let term = LocalProcessTerminalView(frame: container.bounds.insetBy(dx: 12, dy: 12))
+        let stripH: CGFloat = 22
+        let strip = TermDragStrip(frame: NSRect(x: 0, y: th - stripH, width: tw, height: stripH))
+        strip.autoresizingMask = [.width, .minYMargin]
+        let closeBtn = NSButton(title: "✕", target: self, action: #selector(forceCloseTerminal))
+        closeBtn.isBordered = false
+        closeBtn.font = .systemFont(ofSize: 12, weight: .bold)
+        closeBtn.contentTintColor = NSColor(white: 0.7, alpha: 1)
+        closeBtn.frame = NSRect(x: 8, y: th - stripH, width: 20, height: stripH)
+        closeBtn.autoresizingMask = [.minYMargin]
+        let term = LocalProcessTerminalView(frame: NSRect(x: 12, y: 12, width: tw - 24, height: th - stripH - 16))
         term.autoresizingMask = [.width, .height]
         term.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         term.nativeBackgroundColor = .black
         term.nativeForegroundColor = NSColor(white: 0.92, alpha: 1)
+        term.processDelegate = self
         container.addSubview(term)
+        container.addSubview(strip)
+        container.addSubview(closeBtn)
         panel.contentView = container
         let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
         term.startProcess(executable: shell, args: ["-l"])
@@ -1497,6 +1521,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         termView = term
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Full close: kills the shell if it is still alive (✕ button, hung
+    /// shells) and discards the window so the next ⌃⌥T starts fresh.
+    @objc fileprivate func forceCloseTerminal() {
+        termView?.terminate()
+        termWindow?.orderOut(nil)
+        termWindow = nil
+        termView = nil
     }
 
     // MARK: - Settings panel
@@ -1710,6 +1743,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             codexGifLabel?.stringValue = url.lastPathComponent
             setPreview(codexPreview, path: url.path)
         }
+    }
+}
+
+extension AppDelegate: LocalProcessTerminalViewDelegate {
+    func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
+    func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}
+    func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
+    /// The shell ended (`exit`, crash, kill) — close the notch terminal.
+    func processTerminated(source: TerminalView, exitCode: Int32?) {
+        DispatchQueue.main.async { [weak self] in self?.forceCloseTerminal() }
     }
 }
 

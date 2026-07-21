@@ -40,7 +40,7 @@ The collapsed window is transparent and fully click-through except the tiny indi
   - pick the Codex pet from a dropdown (no more editing config files by hand)
   - set a **custom animated GIF** per agent that replaces its mascot in the notch and in the panel rows — transparent-background GIFs look best on the black bar
 - **Hover zoom** — while the panel is open (via click/hotkey), hovering it grows it by a configurable percentage (default 25%); text scales up too and snippets get extra lines, so you actually read more. It shrinks back when the mouse leaves. Hover-opened panels don't zoom (they already auto-dismiss).
-- **Notch terminal — ⌃⌥T** — a real terminal ([SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)) hanging from the notch: borderless, black, always on top, shell survives hide/show. Run `claude` or `codex` in it and answer their confirmations right from the notch.
+- **Notch terminal — ⌃⌥T** — a real terminal ([SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)) hanging from the notch: borderless, black, always on top, shell survives hide/show. Run `claude` or `codex` in it and answer their confirmations right from the notch. Resizable from its edges, movable by its top grab bar; `exit` closes it, and the ✕ button force-closes it even if the shell hangs.
 - **Sounds** (optional, off by default) — a chime when an agent finishes (Glass) and when it goes quiet awaiting your input (Ping). At most once per activity episode.
 - **Bilingual UI** — English/Spanish, selectable in settings (defaults to the system language).
 - The settings panel shows an **animated preview** of each chosen GIF, and changes only apply when you press **Save**.
