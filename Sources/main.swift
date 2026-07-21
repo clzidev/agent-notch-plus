@@ -25,9 +25,14 @@ enum L10n {
         "settings": ["Settings…", "Configuración…"],
         "quit": ["Quit Agent Notch", "Salir de Agent Notch"],
         "no_sessions": ["No recent agent sessions", "Sin sesiones recientes de agentes"],
-        "shortcut_hint": ["Shortcuts: ⌃⌥N panel · ⌥Space terminal · ⌘D split",
-                          "Atajos: ⌃⌥N panel · ⌥Espacio terminal · ⌘D dividir"],
-        "terminal": ["Notch terminal (⌥Space)", "Terminal del notch (⌥Espacio)"],
+        "shortcut_hint": ["Shortcuts: ⌃⌥N panel · ⌘D split terminal",
+                          "Atajos: ⌃⌥N panel · ⌘D dividir terminal"],
+        "terminal": ["Notch terminal", "Terminal del notch"],
+        "term_hotkey": ["Terminal shortcut:", "Atajo de terminal:"],
+        "gif_gallery": ["Open GIF gallery…", "Abrir galería de GIFs…"],
+        "gallery_title": ["GIF Gallery", "Galería de GIFs"],
+        "gallery_hint": ["Empty search = trending. Click a GIF to use it right away.",
+                         "Búsqueda vacía = tendencias. Clic en un GIF para usarlo al instante."],
         "zoom_pct": ["Hover zoom (%):", "Zoom al pasar el mouse (%):"],
         "gif_search": ["Search GIFs online:", "Buscar GIFs en internet:"],
         "search": ["Search", "Buscar"],
@@ -974,6 +979,11 @@ final class KeyPanel: NSPanel {
     override var canBecomeKey: Bool { true }
 }
 
+/// Scroll-view document container with top-down coordinates (for the GIF gallery).
+final class FlippedView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 /// Header strip of the notch terminal — visual only. The terminal is part of
 /// the notch: it cannot be moved, it only hangs centered under it.
 final class TermDragStrip: NSView {
@@ -1082,6 +1092,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var giphyKeyField: NSTextField?
     private var gifResults: [(id: String, preview: URL, full: URL)] = []
     private var gifResultViews: [NSImageView] = []
+    private var termHotkeyPopupRef: NSPopUpButton?
+    private var galleryWindow: NSWindow?
+    private var gallerySearchField: NSTextField?
+    private var galleryTargetPopup: NSPopUpButton?
+    private var galleryStack: NSStackView?
+    private var galleryResults: [(id: String, preview: URL, full: URL)] = []
 
     // Geometry
     private var screen: NSScreen { NSScreen.screens.first { $0.frame.origin == .zero } ?? NSScreen.main! }
@@ -1193,11 +1209,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let panelKeyID = EventHotKeyID(signature: OSType(0x414E_4348), id: 1)  // 'ANCH'
         RegisterEventHotKey(UInt32(kVK_ANSI_N), UInt32(controlKey | optionKey), panelKeyID,
                             GetApplicationEventTarget(), 0, &hotKeyRef)
-        // ⌥Space — two keys, quake-console style; ⌃⌥T collides with browsers
-        // and ⌃⌥⇧T was too much of a finger twister
-        let termKeyID = EventHotKeyID(signature: OSType(0x414E_4348), id: 2)
-        RegisterEventHotKey(UInt32(kVK_Space), UInt32(optionKey), termKeyID,
-                            GetApplicationEventTarget(), 0, &hotKeyRef2)
+        // terminal hotkey is user-configurable (config "term-hotkey") — every
+        // fixed choice collided with something (browsers, ChatGPT, fingers)
+        registerTermHotkey()
 
         // ⌘D splits the notch terminal (local monitor: only our own windows)
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
@@ -1618,6 +1632,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.setFrame(f, display: true)
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        // force the first layout pass NOW: AppKit resets the layer's
+        // anchorPoint on it, which used to flip the very first curtain
+        // animation upside down (it unrolled bottom-up)
+        panel.contentView?.layoutSubtreeIfNeeded()
+        panel.displayIfNeeded()
         curtain(panel, open: true)
     }
 
@@ -1709,6 +1728,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let zoomPctLabel = NSTextField(labelWithString: "%")
         zoomPctLabel.textColor = .secondaryLabelColor
 
+        let hotkeyPopup = NSPopUpButton()
+        hotkeyPopup.addItems(withTitles: Self.termHotkeyOptions.map(\.label))
+        if let idx = Self.termHotkeyOptions.firstIndex(where: { $0.id == currentTermHotkeyID() }) {
+            hotkeyPopup.selectItem(at: idx)
+        }
+        termHotkeyPopupRef = hotkeyPopup
+
         let gifTitle = NSTextField(labelWithString: L("gif_title"))
         gifTitle.font = .systemFont(ofSize: 12, weight: .semibold)
 
@@ -1772,13 +1798,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             row(L("language"), [langPopup]),
             row(L("codex_pet"), [petPopup]),
             row(L("zoom_pct"), [zoomField, zoomPctLabel]),
+            row(L("term_hotkey"), [hotkeyPopup]),
             gifTitle,
             row("Claude:", [claudeGifLabel!, button(L("choose"), #selector(chooseClaudeGif)),
                             button(L("remove"), #selector(clearClaudeGif)), claudePreview!]),
             row("Codex:", [codexGifLabel!, button(L("choose"), #selector(chooseCodexGif)),
                            button(L("remove"), #selector(clearCodexGif)), codexPreview!]),
             row(L("gif_search"), [searchField, button(L("search"), #selector(searchGifs)),
-                                  NSTextField(labelWithString: L("gif_for")), targetPopup]),
+                                  NSTextField(labelWithString: L("gif_for")), targetPopup,
+                                  button(L("gif_gallery"), #selector(showGifGallery))]),
             row(L("giphy_key"), [keyField]),
             resultsRow,
             row(L("sounds_title"), [soundCol]),
@@ -1786,10 +1814,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 12
-        stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+        stack.spacing = 14
+        stack.edgeInsets = NSEdgeInsets(top: 24, left: 24, bottom: 24, right: 24)
 
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 300),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 320),
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
         w.title = L("settings_title")
         w.isReleasedWhenClosed = false
@@ -1811,6 +1839,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let pct = Int(min(100, max(0, Double(pendZoomField?.stringValue ?? "") ?? 25)))
         writeConfig("zoom", String(pct))
         writeConfig("giphy-key", giphyKeyField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+        if let idx = termHotkeyPopupRef?.indexOfSelectedItem, idx >= 0, idx < Self.termHotkeyOptions.count {
+            writeConfig("term-hotkey", Self.termHotkeyOptions[idx].id)
+            registerTermHotkey()
+        }
         L10n.refresh()
         readSoundPrefs()
         readZoomPref()
@@ -1836,6 +1868,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let v = (try? String(contentsOf: configURL("zoom"), encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         zoomPct = CGFloat(min(100, max(0, Double(v ?? "") ?? 25)))
+    }
+
+    // MARK: - Terminal hotkey (configurable)
+
+    static let termHotkeyOptions: [(id: String, label: String, key: UInt32, mods: UInt32)] = [
+        ("ctrl_opt_space", "⌃⌥ Espacio / Space", UInt32(kVK_Space), UInt32(controlKey | optionKey)),
+        ("opt_space", "⌥ Espacio / Space", UInt32(kVK_Space), UInt32(optionKey)),
+        ("opt_grave", "⌥ ` ", UInt32(kVK_ANSI_Grave), UInt32(optionKey)),
+        ("ctrl_opt_t", "⌃⌥ T", UInt32(kVK_ANSI_T), UInt32(controlKey | optionKey)),
+        ("ctrl_opt_y", "⌃⌥ Y", UInt32(kVK_ANSI_Y), UInt32(controlKey | optionKey)),
+    ]
+
+    private func currentTermHotkeyID() -> String {
+        (try? String(contentsOf: configURL("term-hotkey"), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? Self.termHotkeyOptions[0].id
+    }
+
+    private func registerTermHotkey() {
+        if let hk = hotKeyRef2 { UnregisterEventHotKey(hk); hotKeyRef2 = nil }
+        let id = currentTermHotkeyID()
+        let opt = Self.termHotkeyOptions.first { $0.id == id } ?? Self.termHotkeyOptions[0]
+        let termKeyID = EventHotKeyID(signature: OSType(0x414E_4348), id: 2)
+        RegisterEventHotKey(opt.key, opt.mods, termKeyID, GetApplicationEventTarget(), 0, &hotKeyRef2)
     }
 
     private func pathLabel(_ path: String) -> NSTextField {
@@ -1897,32 +1952,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }.resume()
     }
 
-    /// Click on a result: download it and stage it for the chosen agent.
+    /// Click on a result: download it and stage it for the chosen agent
+    /// (applied on Save, like the rest of the settings).
     @objc private func gifResultClicked(_ g: NSClickGestureRecognizer) {
         guard let iv = g.view as? NSImageView, iv.tag < gifResults.count else { return }
-        let r = gifResults[iv.tag]
-        let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/agent-notch/gifs")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let dest = dir.appendingPathComponent("giphy-\(r.id).gif")
-        URLSession.shared.dataTask(with: r.full) { [weak self] d, _, _ in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                guard let d, (try? d.write(to: dest)) != nil, GifAnimation(path: dest.path) != nil else {
-                    self.alert(L("gif_dl_fail"), "")
-                    return
-                }
-                if self.gifTargetPopup?.indexOfSelectedItem == 1 {
-                    self.pendCodexGif = dest.path
-                    self.codexGifLabel?.stringValue = dest.lastPathComponent
-                    self.setPreview(self.codexPreview, path: dest.path)
-                } else {
-                    self.pendClaudeGif = dest.path
-                    self.claudeGifLabel?.stringValue = dest.lastPathComponent
-                    self.setPreview(self.claudePreview, path: dest.path)
-                }
-            }
-        }.resume()
+        let claude = gifTargetPopup?.indexOfSelectedItem != 1
+        downloadGif(gifResults[iv.tag]) { [weak self] dest in
+            self?.stageGif(dest, forClaude: claude, applyNow: false)
+        }
     }
 
     private func alert(_ msg: String, _ info: String) {
@@ -1930,6 +1967,181 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         a.messageText = msg
         a.informativeText = info
         a.runModal()
+    }
+
+    private static func parseGiphy(_ data: Data?) -> [(id: String, preview: URL, full: URL)] {
+        guard let data,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let items = obj["data"] as? [[String: Any]] else { return [] }
+        return items.compactMap { it in
+            guard let id = it["id"] as? String,
+                  let imgs = it["images"] as? [String: Any],
+                  let pv = ((imgs["fixed_height_small"] as? [String: Any])?["url"] as? String)
+                      .flatMap(URL.init(string:)),
+                  let full = ((imgs["original"] as? [String: Any])?["url"] as? String)
+                      .flatMap(URL.init(string:))
+            else { return nil }
+            return (id, pv, full)
+        }
+    }
+
+    private func giphyKey() -> String {
+        let fromField = giphyKeyField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !fromField.isEmpty { return fromField }
+        return (try? String(contentsOf: configURL("giphy-key"), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private func downloadGif(_ r: (id: String, preview: URL, full: URL), done: @escaping (URL) -> Void) {
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/agent-notch/gifs")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dest = dir.appendingPathComponent("giphy-\(r.id).gif")
+        URLSession.shared.dataTask(with: r.full) { [weak self] d, _, _ in
+            DispatchQueue.main.async {
+                guard let d, (try? d.write(to: dest)) != nil, GifAnimation(path: dest.path) != nil else {
+                    self?.alert(L("gif_dl_fail"), "")
+                    return
+                }
+                done(dest)
+            }
+        }.resume()
+    }
+
+    /// Reflect a chosen GIF in the staged settings and (gallery only) apply it live.
+    private func stageGif(_ dest: URL, forClaude claude: Bool, applyNow: Bool) {
+        if claude {
+            pendClaudeGif = dest.path
+            claudeGifLabel?.stringValue = dest.lastPathComponent
+            setPreview(claudePreview, path: dest.path)
+        } else {
+            pendCodexGif = dest.path
+            codexGifLabel?.stringValue = dest.lastPathComponent
+            setPreview(codexPreview, path: dest.path)
+        }
+        if applyNow {
+            writeConfig(claude ? "claude-gif" : "codex-gif", dest.path)
+            IndicatorView.refreshCustomGifs()
+        }
+    }
+
+    // MARK: - GIF gallery (scrollable feed)
+
+    @objc private func showGifGallery() {
+        NSApp.activate(ignoringOtherApps: true)
+        galleryWindow?.close()
+        let search = NSTextField(string: "")
+        search.placeholderString = "pixel cat…"
+        search.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        gallerySearchField = search
+        let target = NSPopUpButton()
+        target.addItems(withTitles: ["Claude", "Codex"])
+        galleryTargetPopup = target
+        let top = NSStackView(views: [search, button(L("search"), #selector(gallerySearch)),
+                                      NSTextField(labelWithString: L("gif_for")), target])
+        top.orientation = .horizontal
+        top.spacing = 8
+        let hint = NSTextField(labelWithString: L("gallery_hint"))
+        hint.textColor = .secondaryLabelColor
+        hint.font = .systemFont(ofSize: 11)
+
+        let grid = NSStackView()
+        grid.orientation = .vertical
+        grid.alignment = .leading
+        grid.spacing = 8
+        grid.translatesAutoresizingMaskIntoConstraints = false
+        galleryStack = grid
+        let doc = FlippedView()
+        doc.translatesAutoresizingMaskIntoConstraints = false
+        doc.addSubview(grid)
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.documentView = doc
+        NSLayoutConstraint.activate([
+            grid.topAnchor.constraint(equalTo: doc.topAnchor),
+            grid.leadingAnchor.constraint(equalTo: doc.leadingAnchor),
+            grid.trailingAnchor.constraint(equalTo: doc.trailingAnchor),
+            grid.bottomAnchor.constraint(equalTo: doc.bottomAnchor),
+            doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            scroll.widthAnchor.constraint(equalToConstant: 3 * 150 + 2 * 8 + 16),
+            scroll.heightAnchor.constraint(equalToConstant: 430),
+        ])
+
+        let root = NSStackView(views: [top, hint, scroll])
+        root.orientation = .vertical
+        root.alignment = .leading
+        root.spacing = 10
+        root.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 540),
+                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        w.title = L("gallery_title")
+        w.isReleasedWhenClosed = false
+        w.contentView = root
+        w.setContentSize(root.fittingSize)
+        w.center()
+        galleryWindow = w
+        w.makeKeyAndOrderFront(nil)
+        galleryFetch(query: "")
+    }
+
+    @objc private func gallerySearch() { galleryFetch(query: gallerySearchField?.stringValue ?? "") }
+
+    private func galleryFetch(query: String) {
+        let key = giphyKey()
+        guard !key.isEmpty else { alert(L("giphy_missing"), L("giphy_missing_info")); return }
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        var comps = URLComponents(string: q.isEmpty ? "https://api.giphy.com/v1/gifs/trending"
+                                                    : "https://api.giphy.com/v1/gifs/search")!
+        var items = [URLQueryItem(name: "api_key", value: key),
+                     URLQueryItem(name: "limit", value: "24"),
+                     URLQueryItem(name: "rating", value: "g")]
+        if !q.isEmpty { items.append(URLQueryItem(name: "q", value: q)) }
+        comps.queryItems = items
+        URLSession.shared.dataTask(with: comps.url!) { [weak self] data, _, _ in
+            let found = Self.parseGiphy(data)
+            DispatchQueue.main.async {
+                guard let self, let grid = self.galleryStack else { return }
+                guard !found.isEmpty else { self.alert(L("gif_search_fail"), ""); return }
+                self.galleryResults = found
+                grid.arrangedSubviews.forEach { $0.removeFromSuperview() }
+                var i = 0
+                while i < found.count {
+                    let rowStack = NSStackView()
+                    rowStack.orientation = .horizontal
+                    rowStack.spacing = 8
+                    for j in i..<min(i + 3, found.count) {
+                        let iv = NSImageView()
+                        iv.animates = true
+                        iv.imageScaling = .scaleProportionallyUpOrDown
+                        iv.wantsLayer = true
+                        iv.layer?.backgroundColor = NSColor.black.cgColor
+                        iv.layer?.cornerRadius = 6
+                        iv.widthAnchor.constraint(equalToConstant: 150).isActive = true
+                        iv.heightAnchor.constraint(equalToConstant: 110).isActive = true
+                        iv.tag = j
+                        iv.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(self.galleryClicked(_:))))
+                        rowStack.addArrangedSubview(iv)
+                        URLSession.shared.dataTask(with: found[j].preview) { d, _, _ in
+                            guard let d, let img = NSImage(data: d) else { return }
+                            DispatchQueue.main.async { iv.image = img }
+                        }.resume()
+                    }
+                    grid.addArrangedSubview(rowStack)
+                    i += 3
+                }
+            }
+        }.resume()
+    }
+
+    @objc private func galleryClicked(_ g: NSClickGestureRecognizer) {
+        guard let iv = g.view as? NSImageView, iv.tag < galleryResults.count else { return }
+        let claude = galleryTargetPopup?.indexOfSelectedItem != 1
+        downloadGif(galleryResults[iv.tag]) { [weak self] dest in
+            self?.stageGif(dest, forClaude: claude, applyNow: true)
+        }
     }
 
     private func button(_ title: String, _ action: Selector) -> NSButton {
