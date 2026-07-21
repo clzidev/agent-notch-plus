@@ -5,7 +5,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.1.2"
+let appVersion = "2.2.0"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 // MARK: - Localization
@@ -29,8 +29,8 @@ enum L10n {
         "settings": ["Settings…", "Configuración…"],
         "quit": ["Quit Agent Notch", "Salir de Agent Notch"],
         "no_sessions": ["No recent agent sessions", "Sin sesiones recientes de agentes"],
-        "shortcut_hint": ["Shortcuts: ⌃⌥N panel · ⌘D split terminal",
-                          "Atajos: ⌃⌥N panel · ⌘D dividir terminal"],
+        "shortcut_hint": ["Shortcuts: ⌃⌥N panel · ⌘D split terminal · ⌘F files",
+                          "Atajos: ⌃⌥N panel · ⌘D dividir terminal · ⌘F archivos"],
         "terminal": ["Notch terminal", "Terminal del notch"],
         "term_hotkey": ["Terminal shortcut:", "Atajo de terminal:"],
         "term_dir": ["Terminal start folder:", "Carpeta inicial de la terminal:"],
@@ -72,6 +72,14 @@ func L(_ key: String) -> String { L10n.t(key) }
 // MARK: - Model
 
 enum AgentKind: String { case claude = "Claude Code", codex = "Codex" }
+
+/// Claude Code names a session's project dir by replacing EVERY
+/// non-alphanumeric character with "-" (/Users/x/public_html →
+/// -Users-x-public-html). Matching only "/" misses dirs with "_" or "." and
+/// their sessions never read as live.
+func encodeProjectDir(_ path: String) -> String {
+    String(path.map { $0.isLetter || $0.isNumber ? $0 : "-" })
+}
 
 struct AgentSession {
     let id: String
@@ -211,7 +219,7 @@ final class ProcessDiscovery {
         // a claude process can hold several project transcripts open; prefer
         // the one whose encoded project dir matches the process cwd
         if all.count > 1, let cwd {
-            let encoded = cwd.replacingOccurrences(of: "/", with: "-")
+            let encoded = encodeProjectDir(cwd)
             if let preferred = all.first(where: { $0.contains(encoded) }) { return preferred }
         }
         return all.first
@@ -758,7 +766,7 @@ final class SessionListController: NSViewController {
 // MARK: - Notch window content
 
 /// Indicator content: branded pixel animations for whichever agents are running.
-enum AgentGlyphState { case inactive, running, done }
+enum AgentGlyphState { case inactive, running, idle, done }
 
 final class IndicatorView: NSView {
     var claudeState: AgentGlyphState = .inactive { didSet { needsDisplay = true } }
@@ -801,12 +809,14 @@ final class IndicatorView: NSView {
         // each agent keeps its own slot: mascot while running, green blob when
         // freshly done (cleared once you revisit the terminal)
         switch claudeState {
-        case .running: x = drawClaudeRunning(ctx, right: x, cy: cy) - 6
+        case .running: x = drawClaudeRunning(ctx, right: x, cy: cy, dim: false) - 6
+        case .idle: x = drawClaudeRunning(ctx, right: x, cy: cy, dim: true) - 6
         case .done: drawGreenBlob(ctx, right: x, cy: cy); x -= 24
         case .inactive: break
         }
         switch codexState {
-        case .running: _ = drawCodexPet(ctx, right: x, cy: cy)
+        case .running: _ = drawCodexPet(ctx, right: x, cy: cy, dim: false)
+        case .idle: _ = drawCodexPet(ctx, right: x, cy: cy, dim: true)
         case .done: drawGreenBlob(ctx, right: x, cy: cy)
         case .inactive: break
         }
@@ -832,10 +842,10 @@ final class IndicatorView: NSView {
     }
 
     /// Returns the left edge of what was drawn.
-    private func drawCrab(_ ctx: CGContext, right: CGFloat, cy: CGFloat) -> CGFloat {
+    private func drawCrab(_ ctx: CGContext, right: CGFloat, cy: CGFloat, dim: Bool) -> CGFloat {
         // terminal cells are ~2x taller than wide — keep that aspect or he squishes
         let subW: CGFloat = 1.6, subH: CGFloat = 3.2
-        let walk = Int(t * 2.5)
+        let walk = dim ? 0 : Int(t * 2.5)
         let frame = Self.mascotFrames[walk % 2]
         let cols = frame[0].count * 2, rows = frame.count * 2
         let x0 = right - CGFloat(cols) * subW
@@ -851,7 +861,7 @@ final class IndicatorView: NSView {
                     let r = n - n.rounded(.down)
                     // feet stay solid; body shimmers gently
                     let isFeet = j == frame.count - 1
-                    let alpha = isFeet ? 1.0 : 0.8 + 0.2 * r
+                    let alpha = (isFeet ? 1.0 : 0.8 + 0.2 * r) * (dim ? 0.4 : 1.0)
                     ctx.setFillColor(Self.claudeOrange.withAlphaComponent(alpha).cgColor)
                     ctx.fill(CGRect(x: x0 + CGFloat(i * 2 + qx) * subW,
                                     y: y0 - CGFloat(j * 2 + qy + 1) * subH,
@@ -917,39 +927,41 @@ final class IndicatorView: NSView {
         if xp != codexGifPath { codexGifPath = xp; codexGif = xp.isEmpty ? nil : GifAnimation(path: xp) }
     }
 
-    /// Claude slot: custom GIF if configured, else the built-in walking mascot.
-    private func drawClaudeRunning(_ ctx: CGContext, right: CGFloat, cy: CGFloat) -> CGFloat {
+    /// Claude slot: custom GIF if configured, else the built-in walking
+    /// mascot. `dim` = session alive but quiet: static and faded, so the
+    /// indicator never just vanishes mid-session.
+    private func drawClaudeRunning(_ ctx: CGContext, right: CGFloat, cy: CGFloat, dim: Bool) -> CGFloat {
         if let gif = Self.claudeGif {
             let h: CGFloat = 26, w = h * gif.aspect
             let dest = NSRect(x: right - w, y: cy - h / 2, width: w, height: h)
-            gif.draw(in: dest, t: t)
+            gif.draw(in: dest, t: dim ? 0 : t, alpha: dim ? 0.4 : 1)
             return dest.minX
         }
-        return drawCrab(ctx, right: right, cy: cy)
+        return drawCrab(ctx, right: right, cy: cy, dim: dim)
     }
 
-    private func drawCodexPet(_ ctx: CGContext, right: CGFloat, cy: CGFloat) -> CGFloat {
+    private func drawCodexPet(_ ctx: CGContext, right: CGFloat, cy: CGFloat, dim: Bool) -> CGFloat {
         if let gif = Self.codexGif {
             let h: CGFloat = 26, w = h * gif.aspect
             let dest = NSRect(x: right - w, y: cy - h / 2, width: w, height: h)
-            gif.draw(in: dest, t: t)
+            gif.draw(in: dest, t: dim ? 0 : t, alpha: dim ? 0.4 : 1)
             return dest.minX
         }
         guard let sprite = Self.codexSprite else {
-            return drawRing(ctx, right: right, cy: cy, color: Self.codexTeal)
+            return drawRing(ctx, right: right, cy: cy, color: Self.codexTeal, dim: dim)
         }
         let fw: CGFloat = 192, fh: CGFloat = 208
-        let idx = Int(t / 0.12) % 8
+        let idx = dim ? 0 : Int(t / 0.12) % 8
         let src = NSRect(x: CGFloat(idx) * fw, y: 1872 - 2 * fh, width: fw, height: fh)
         let h: CGFloat = 26, w = h * fw / fh
         let dest = NSRect(x: right - w, y: cy - h / 2, width: w, height: h)
         NSGraphicsContext.current?.imageInterpolation = .none  // keep the pixel art crisp
-        sprite.draw(in: dest, from: src, operation: .sourceOver, fraction: 1)
+        sprite.draw(in: dest, from: src, operation: .sourceOver, fraction: dim ? 0.4 : 1)
         return dest.minX
     }
 
     /// Returns the left edge of what was drawn.
-    private func drawRing(_ ctx: CGContext, right: CGFloat, cy: CGFloat, color: NSColor) -> CGFloat {
+    private func drawRing(_ ctx: CGContext, right: CGFloat, cy: CGFloat, color: NSColor, dim: Bool = false) -> CGFloat {
         let cell: CGFloat = 2.5, grid = 9
         let x0 = right - CGFloat(grid) * cell
         let y0 = cy - CGFloat(grid) * cell / 2
@@ -967,7 +979,7 @@ final class IndicatorView: NSView {
                 let intensity = 1 - angle / (2 * .pi)
                 let n = sin(CGFloat(i * 374761 + j * 668265 + step * 982451) * 0.0001) * 43758.5453
                 let r = n - n.rounded(.down)
-                let a = intensity * intensity * (0.55 + 0.45 * r)
+                let a = intensity * intensity * (0.55 + 0.45 * r) * (dim ? 0.4 : 1)
                 guard a > 0.08 else { continue }
                 ctx.setFillColor(color.withAlphaComponent(a).cgColor)
                 ctx.fill(CGRect(x: x0 + CGFloat(i) * cell, y: y0 + CGFloat(j) * cell,
@@ -1016,6 +1028,126 @@ final class MascotBarPreview: NSView {
     required init?(coder: NSCoder) { nil }
     override func viewDidMoveToWindow() {
         if window == nil { timer?.invalidate(); timer = nil }
+    }
+}
+
+/// Mini file browser pane for the notch terminal (⌘F): navigate with
+/// double-click / the ▲ button, and DRAG any file or folder straight into a
+/// terminal pane (or any other app). Native AppKit, ~100 lines, no deps.
+final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
+    private var dir: URL
+    private var items: [URL] = []
+    private let table = NSTableView()
+    private let pathLabel = NSTextField(labelWithString: "")
+
+    init(startDir: URL) {
+        dir = startDir
+        super.init(frame: NSRect(x: 0, y: 0, width: 220, height: 300))
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.black.cgColor
+
+        let up = NSButton(title: "▲", target: self, action: #selector(goUp))
+        up.isBordered = false
+        up.contentTintColor = .systemGreen
+        up.translatesAutoresizingMaskIntoConstraints = false
+        pathLabel.textColor = .secondaryLabelColor
+        pathLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        pathLabel.lineBreakMode = .byTruncatingHead
+        pathLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        table.addTableColumn(NSTableColumn(identifier: .init("file")))
+        table.headerView = nil
+        table.backgroundColor = .black
+        table.rowHeight = 22
+        table.dataSource = self
+        table.delegate = self
+        table.target = self
+        table.doubleAction = #selector(openRow)
+        table.setDraggingSourceOperationMask(.copy, forLocal: false)
+        table.style = .plain
+        let scroll = NSScrollView()
+        scroll.documentView = table
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(up)
+        addSubview(pathLabel)
+        addSubview(scroll)
+        NSLayoutConstraint.activate([
+            up.topAnchor.constraint(equalTo: topAnchor, constant: 2),
+            up.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
+            up.widthAnchor.constraint(equalToConstant: 20),
+            pathLabel.centerYAnchor.constraint(equalTo: up.centerYAnchor),
+            pathLabel.leadingAnchor.constraint(equalTo: up.trailingAnchor, constant: 4),
+            pathLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
+            scroll.topAnchor.constraint(equalTo: up.bottomAnchor, constant: 2),
+            scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+        reload()
+    }
+    required init?(coder: NSCoder) { nil }
+
+    private func reload() {
+        items = (try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
+        items.sort { a, b in
+            let ad = (try? a.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            let bd = (try? b.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            if ad != bd { return ad && !bd }  // folders first
+            return a.lastPathComponent.localizedCaseInsensitiveCompare(b.lastPathComponent) == .orderedAscending
+        }
+        pathLabel.stringValue = dir.path
+        table.reloadData()
+    }
+
+    @objc private func goUp() {
+        let parent = dir.deletingLastPathComponent()
+        guard parent.path != dir.path else { return }
+        dir = parent
+        reload()
+    }
+
+    @objc private func openRow() {
+        let row = table.clickedRow
+        guard row >= 0, row < items.count,
+              (try? items[row].resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else { return }
+        dir = items[row]
+        reload()
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { items.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let url = items[row]
+        let cell = NSTableCellView()
+        let icon = NSImageView(image: NSWorkspace.shared.icon(forFile: url.path))
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        let name = NSTextField(labelWithString: url.lastPathComponent)
+        name.textColor = NSColor(white: 0.9, alpha: 1)
+        name.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        name.lineBreakMode = .byTruncatingTail
+        name.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(icon)
+        cell.addSubview(name)
+        NSLayoutConstraint.activate([
+            icon.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+            icon.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 16),
+            icon.heightAnchor.constraint(equalToConstant: 16),
+            name.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 5),
+            name.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+            name.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+        ])
+        return cell
+    }
+
+    /// Rows are draggable as real file URLs — drop them on a terminal pane
+    /// (types the quoted path) or anywhere else.
+    func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
+        items[row] as NSURL
     }
 }
 
@@ -1135,6 +1267,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var termWindow: NSPanel?
     private var termSplit: NSSplitView?
     private var termViews: [LocalProcessTerminalView] = []
+    private var fileBrowser: FileBrowserPane?
     private var termHotkeyPopupRef: NSPopUpButton?
     private var loginCheckRef: NSButton?
     private var pendTermDir = ""
@@ -1260,13 +1393,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // fixed choice collided with something (browsers, ChatGPT, fingers)
         registerTermHotkey()
 
-        // ⌘D splits the notch terminal (local monitor: only our own windows)
+        // ⌘D splits the notch terminal, ⌘F toggles the file browser pane
+        // (local monitor: only our own windows)
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             guard let self, let w = self.termWindow, e.window === w,
-                  e.modifierFlags.contains(.command),
-                  e.charactersIgnoringModifiers?.lowercased() == "d" else { return e }
-            self.addTerminalPane()
-            return nil
+                  e.modifierFlags.contains(.command) else { return e }
+            switch e.charactersIgnoringModifiers?.lowercased() {
+            case "d": self.addTerminalPane(); return nil
+            case "f": self.toggleFileBrowser(); return nil
+            default: return e
+            }
         }
 
         // Right-click on the indicator → settings menu (the indicator window
@@ -1435,7 +1571,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if let path = snap.transcriptPath {
                     seen.insert(path)
                 } else if snap.kind == .claude, let cwd = snap.cwd {
-                    let encoded = cwd.replacingOccurrences(of: "/", with: "-")
+                    let encoded = encodeProjectDir(cwd)
                     let i = cwdIndex[encoded, default: 0]
                     cwdIndex[encoded] = i + 1
                     seen.insert("cwd#\(encoded)#\(i)")
@@ -1497,12 +1633,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.claudePrevBusy = claudeBusy
                 self.codexPrevBusy = codexBusy
                 // the green "done" blob also requires an armed episode — a
-                // liveness flap without real work no longer conjures it up
+                // liveness flap without real work no longer conjures it up.
+                // alive-but-quiet shows a dimmed static mascot (.idle), so the
+                // indicator never just vanishes mid-session.
                 self.claudeState = claudeBusy ? .running
-                    : claudeLive ? .inactive
+                    : claudeLive ? .idle
                     : (claudeGone && self.claudeDoneArmed ? .done : self.claudeState)
                 self.codexState = codexBusy ? .running
-                    : codexLive ? .inactive
+                    : codexLive ? .idle
                     : (codexGone && self.codexDoneArmed ? .done : self.codexState)
                 if claudeGone { self.claudeDoneArmed = false; self.claudeAttArmed = false }
                 if codexGone { self.codexDoneArmed = false; self.codexAttArmed = false }
@@ -1742,9 +1880,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc fileprivate func forceCloseTerminal() {
         for t in termViews { t.terminate() }
         termViews.removeAll()
+        fileBrowser = nil
         termWindow?.orderOut(nil)
         termWindow = nil
         termSplit = nil
+    }
+
+    /// ⌘F: toggle a mini file-browser pane on the left of the split — browse
+    /// and drag files into any terminal pane.
+    @objc fileprivate func toggleFileBrowser() {
+        guard let split = termSplit else { return }
+        if let fb = fileBrowser {
+            fb.removeFromSuperview()
+            fileBrowser = nil
+            split.adjustSubviews()
+            return
+        }
+        var startDir = (try? String(contentsOf: configURL("term-dir"), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if startDir.isEmpty || !FileManager.default.fileExists(atPath: startDir) {
+            startDir = FileManager.default.homeDirectoryForCurrentUser.path
+        }
+        let fb = FileBrowserPane(startDir: URL(fileURLWithPath: startDir))
+        fileBrowser = fb
+        split.insertArrangedSubview(fb, at: 0)
+        split.adjustSubviews()
+        DispatchQueue.main.async { [weak split] in
+            split?.setPosition(230, ofDividerAt: 0)  // browser stays a narrow column
+        }
     }
 
     // MARK: - Settings panel
@@ -2286,7 +2449,7 @@ if CommandLine.arguments.contains("--scan") {
     var cwdCounts: [String: Int] = [:]
     for s in snaps {
         if let p = s.transcriptPath { live.insert(p) }
-        else if s.kind == .claude, let c = s.cwd { cwdCounts[c.replacingOccurrences(of: "/", with: "-"), default: 0] += 1 }
+        else if s.kind == .claude, let c = s.cwd { cwdCounts[encodeProjectDir(c), default: 0] += 1 }
     }
     print("== sessions ==")
     for s in SessionScanner().scan(live: live, claudeCwdCounts: cwdCounts) {
