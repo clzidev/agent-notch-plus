@@ -41,11 +41,10 @@ The collapsed window is transparent and fully click-through except the tiny indi
   - set a **custom animated GIF** per agent that replaces its mascot in the notch and in the panel rows — transparent-background GIFs look best on the black bar
 - **Hover zoom** — while the panel is open, hovering it grows it by a configurable percentage (default 25%); the font size stays the same but snippets unfold into several lines, so you read *more* text. It shrinks back when the mouse leaves.
 - **Notch terminal** (configurable hotkey, default ⌃⌥Space) — a real terminal ([SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)) that unrolls from the notch like a curtain and rolls back up when hidden, with its shells kept running. It is part of the notch: it cannot be moved, and resizing from any edge grows it symmetrically, always centered under the notch. **⌘D** splits it into up to 3 side-by-side panes. Minimal matrix-style prompt — just `dir branch ❯` with a blinking green block cursor (your `~/.zshrc` is still sourced, colors intact). Run `claude` or `codex` in one and answer their confirmations right from the notch. `exit` closes a pane, ✕ force-closes everything even if a shell hangs.
-- **Online GIF search + gallery** — search GIPHY from the settings panel, or open the scrollable GIF gallery (search or trending feed, 24 results, click to apply instantly). Needs a free API key from [developers.giphy.com](https://developers.giphy.com); this is the app's only network access, used only when you search.
+- **Animated emoji mascots — no API, no account** — a scrollable gallery of 60 [Noto Animated Emoji](https://googlefonts.github.io/noto-emoji-animation/) (small transparent-background GIFs served by Google's public CDN). Search by name (EN/ES), click one and it instantly replaces the Claude or Codex mascot; one click restores the original. Fetching these emoji is the app's only network access.
 - **Sounds** (optional, off by default) — a chime when an agent finishes (Glass) and when it goes quiet awaiting your input (Ping). At most once per activity episode.
 - **Bilingual UI** — English/Spanish, selectable in settings (defaults to the system language).
-- The settings panel shows an **animated preview** of each chosen GIF, and changes only apply when you press **Save**.
-- Config lives in `~/.config/agent-notch/` (`pet`, `claude-gif`, `codex-gif`, `lang`, `zoom`, `sound-done`, `sound-attention`, `giphy-key`; downloaded GIFs land in `gifs/`) and is re-read every 3 s, so changes apply live.
+- Config lives in `~/.config/agent-notch/` (`pet`, `claude-gif`, `codex-gif`, `lang`, `zoom`, `term-hotkey`, `sound-done`, `sound-attention`; downloaded emoji land in `gifs/`) and is re-read every 3 s, so changes apply live.
 - The Codex pet spritesheets are now resolved relative to the binary (with the original hardcoded path as fallback), so the app works from any clone location.
 
 ## Codex pet
@@ -78,4 +77,5 @@ cp .build/release/AgentNotchPlus AgentNotch
 - **[open-vibe-island](https://github.com/Octane0411/open-vibe-island)** — the process-discovery liveness model the original follows.
 - **OpenAI** — the Codex Pets spritesheets in `pets/` (© OpenAI, from their public pets CDN).
 - **[SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)** by Miguel de Icaza — the terminal emulator embedded in the notch terminal (MIT).
+- **Google** — the [Noto Animated Emoji](https://googlefonts.github.io/noto-emoji-animation/) used as optional mascots (Noto Emoji, OFL/Apache licensing by Google Fonts).
 - The walking Claude mascot is drawn from the Claude Code launch-banner block characters.

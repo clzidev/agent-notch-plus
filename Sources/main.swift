@@ -29,37 +29,24 @@ enum L10n {
                           "Atajos: ⌃⌥N panel · ⌘D dividir terminal"],
         "terminal": ["Notch terminal", "Terminal del notch"],
         "term_hotkey": ["Terminal shortcut:", "Atajo de terminal:"],
-        "gif_gallery": ["Open GIF gallery…", "Abrir galería de GIFs…"],
-        "gallery_title": ["GIF Gallery", "Galería de GIFs"],
-        "gallery_hint": ["Empty search = trending. Click a GIF to use it right away.",
-                         "Búsqueda vacía = tendencias. Clic en un GIF para usarlo al instante."],
+        "gif_gallery": ["Open gallery…", "Abrir galería…"],
+        "gallery_title": ["Animated Emoji Gallery", "Galería de emojis animados"],
+        "gallery_hint": ["Google Noto animated emoji — no API or account needed. Search by name; click one to apply it instantly.",
+                         "Emojis animados de Google (Noto) — sin API ni cuenta. Buscá por nombre; clic en uno para aplicarlo al instante."],
         "zoom_pct": ["Hover zoom (%):", "Zoom al pasar el mouse (%):"],
-        "gif_search": ["Search GIFs online:", "Buscar GIFs en internet:"],
         "search": ["Search", "Buscar"],
         "gif_for": ["for", "para"],
-        "giphy_key": ["GIPHY API key:", "API key de GIPHY:"],
-        "giphy_missing": ["GIPHY API key required", "Falta la API key de GIPHY"],
-        "giphy_missing_info": ["Get a free key at developers.giphy.com (create an app, type: API) and paste it in the settings field.",
-                               "Conseguí una key gratis en developers.giphy.com (creá una app, tipo API) y pegala en el campo de configuración."],
-        "gif_search_fail": ["GIF search failed — check the API key and your connection.",
-                            "Falló la búsqueda de GIFs — revisá la API key y tu conexión."],
-        "gif_dl_fail": ["Could not download that GIF", "No se pudo descargar ese GIF"],
+        "gif_dl_fail": ["Could not download that animation", "No se pudo descargar esa animación"],
         "language": ["Language:", "Idioma:"],
         "codex_pet": ["Codex pet:", "Pet de Codex:"],
-        "gif_title": ["Custom animated GIF (replaces the mascot while working):",
-                      "GIF animado personalizado (reemplaza la mascota mientras trabaja):"],
-        "choose": ["Choose…", "Elegir…"],
-        "remove": ["Remove", "Quitar"],
-        "none": ["— none —", "— ninguno —"],
+        "mascots": ["Animated mascots:", "Mascotas animadas:"],
+        "restore_default": ["Restore original mascot", "Restaurar mascota original"],
         "save": ["Save", "Guardar"],
         "sounds_title": ["Sounds:", "Sonidos:"],
         "sound_done": ["When an agent finishes", "Cuando un agente termina"],
         "sound_attention": ["When an agent awaits your input", "Cuando un agente espera tu respuesta"],
         "settings_title": ["Agent Notch Plus — Settings", "Agent Notch Plus — Configuración"],
-        "bad_gif": ["Could not read that GIF", "No se pudo leer ese GIF"],
-        "bad_gif_info": ["The file does not look like a valid animated GIF.",
-                         "El archivo no parece un GIF animado válido."],
-        "choose_gif_msg": ["Choose an animated GIF for the mascot", "Elegí un GIF animado para la mascota"],
+        "no_results": ["No matches", "Sin coincidencias"],
         "subagents": ["subagents", "subagentes"],
         "subagent": ["subagent", "subagente"],
         "you": ["You: ", "Vos: "],
@@ -1067,16 +1054,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var claudePrevBusy = false
     private var codexPrevBusy = false
     private var settingsWindow: NSWindow?
-    private var claudeGifLabel: NSTextField?
-    private var codexGifLabel: NSTextField?
-    private var claudePreview: NSImageView?
-    private var codexPreview: NSImageView?
     private var petPopupRef: NSPopUpButton?
     private var langPopupRef: NSPopUpButton?
     private var soundDoneRef: NSButton?
     private var soundAttRef: NSButton?
-    private var pendClaudeGif = ""   // settings are staged; applied on Save
-    private var pendCodexGif = ""
     private var pendZoomField: NSTextField?
     private var zoomPct: CGFloat = 25   // hover-zoom percentage (config "zoom")
     private var hotKeyRef2: EventHotKeyRef?
@@ -1087,17 +1068,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var termWindow: NSPanel?
     private var termSplit: NSSplitView?
     private var termViews: [LocalProcessTerminalView] = []
-    private var gifSearchField: NSTextField?
-    private var gifTargetPopup: NSPopUpButton?
-    private var giphyKeyField: NSTextField?
-    private var gifResults: [(id: String, preview: URL, full: URL)] = []
-    private var gifResultViews: [NSImageView] = []
     private var termHotkeyPopupRef: NSPopUpButton?
     private var galleryWindow: NSWindow?
     private var gallerySearchField: NSTextField?
     private var galleryTargetPopup: NSPopUpButton?
     private var galleryStack: NSStackView?
-    private var galleryResults: [(id: String, preview: URL, full: URL)] = []
+    private var galleryResults: [(code: String, names: String)] = []
 
     // Geometry
     private var screen: NSScreen { NSScreen.screens.first { $0.frame.origin == .zero } ?? NSScreen.main! }
@@ -1682,13 +1658,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.close()  // rebuild fresh so staged values start from disk
 
-        func cfg(_ name: String) -> String {
-            (try? String(contentsOf: configURL(name), encoding: .utf8))?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        }
-        pendClaudeGif = cfg("claude-gif")
-        pendCodexGif = cfg("codex-gif")
-
         func row(_ title: String, _ views: [NSView]) -> NSStackView {
             let l = NSTextField(labelWithString: title)
             l.font = .systemFont(ofSize: 12, weight: .semibold)
@@ -1697,18 +1666,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             r.spacing = 8
             return r
         }
-        func preview() -> NSImageView {
-            let iv = NSImageView()
-            iv.animates = true  // NSImageView plays animated GIFs on its own
-            iv.imageScaling = .scaleProportionallyUpOrDown
-            iv.wantsLayer = true
-            iv.layer?.backgroundColor = NSColor.black.cgColor
-            iv.layer?.cornerRadius = 6
-            iv.widthAnchor.constraint(equalToConstant: 72).isActive = true
-            iv.heightAnchor.constraint(equalToConstant: 44).isActive = true
-            return iv
-        }
-
         let hint = NSTextField(labelWithString: L("shortcut_hint"))
         hint.textColor = .secondaryLabelColor
 
@@ -1735,47 +1692,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         termHotkeyPopupRef = hotkeyPopup
 
-        let gifTitle = NSTextField(labelWithString: L("gif_title"))
-        gifTitle.font = .systemFont(ofSize: 12, weight: .semibold)
-
-        claudeGifLabel = pathLabel(pendClaudeGif)
-        codexGifLabel = pathLabel(pendCodexGif)
-        claudePreview = preview()
-        codexPreview = preview()
-        setPreview(claudePreview, path: pendClaudeGif)
-        setPreview(codexPreview, path: pendCodexGif)
-
-        let targetPopup = NSPopUpButton()
-        targetPopup.addItems(withTitles: ["Claude", "Codex"])
-        gifTargetPopup = targetPopup
-        let searchField = NSTextField(string: "")
-        searchField.placeholderString = "pixel cat…"
-        searchField.widthAnchor.constraint(equalToConstant: 150).isActive = true
-        gifSearchField = searchField
-        let keyField = NSTextField(string: cfg("giphy-key"))
-        keyField.placeholderString = "developers.giphy.com"
-        keyField.widthAnchor.constraint(equalToConstant: 200).isActive = true
-        giphyKeyField = keyField
-        let resultsRow = NSStackView()
-        resultsRow.orientation = .horizontal
-        resultsRow.spacing = 6
-        gifResults = []
-        gifResultViews = (0..<6).map { i in
-            let iv = NSImageView()
-            iv.animates = true
-            iv.imageScaling = .scaleProportionallyUpOrDown
-            iv.wantsLayer = true
-            iv.layer?.backgroundColor = NSColor.black.cgColor
-            iv.layer?.cornerRadius = 6
-            iv.widthAnchor.constraint(equalToConstant: 76).isActive = true
-            iv.heightAnchor.constraint(equalToConstant: 56).isActive = true
-            iv.tag = i
-            iv.isHidden = true
-            iv.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(gifResultClicked(_:))))
-            resultsRow.addArrangedSubview(iv)
-            return iv
-        }
-
         let soundDoneCheck = NSButton(checkboxWithTitle: L("sound_done"), target: nil, action: nil)
         soundDoneCheck.state = soundDone ? .on : .off
         soundDoneRef = soundDoneCheck
@@ -1799,16 +1715,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             row(L("codex_pet"), [petPopup]),
             row(L("zoom_pct"), [zoomField, zoomPctLabel]),
             row(L("term_hotkey"), [hotkeyPopup]),
-            gifTitle,
-            row("Claude:", [claudeGifLabel!, button(L("choose"), #selector(chooseClaudeGif)),
-                            button(L("remove"), #selector(clearClaudeGif)), claudePreview!]),
-            row("Codex:", [codexGifLabel!, button(L("choose"), #selector(chooseCodexGif)),
-                           button(L("remove"), #selector(clearCodexGif)), codexPreview!]),
-            row(L("gif_search"), [searchField, button(L("search"), #selector(searchGifs)),
-                                  NSTextField(labelWithString: L("gif_for")), targetPopup,
-                                  button(L("gif_gallery"), #selector(showGifGallery))]),
-            row(L("giphy_key"), [keyField]),
-            resultsRow,
+            row(L("mascots"), [button(L("gif_gallery"), #selector(showGifGallery))]),
             row(L("sounds_title"), [soundCol]),
             saveRow,
         ])
@@ -1830,15 +1737,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func saveSettings() {
-        writeConfig("claude-gif", pendClaudeGif)
-        writeConfig("codex-gif", pendCodexGif)
         if let id = petPopupRef?.titleOfSelectedItem { writeConfig("pet", id) }
         writeConfig("lang", langPopupRef?.indexOfSelectedItem == 1 ? "es" : "en")
         writeConfig("sound-done", soundDoneRef?.state == .on ? "1" : "")
         writeConfig("sound-attention", soundAttRef?.state == .on ? "1" : "")
         let pct = Int(min(100, max(0, Double(pendZoomField?.stringValue ?? "") ?? 25)))
         writeConfig("zoom", String(pct))
-        writeConfig("giphy-key", giphyKeyField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
         if let idx = termHotkeyPopupRef?.indexOfSelectedItem, idx >= 0, idx < Self.termHotkeyOptions.count {
             writeConfig("term-hotkey", Self.termHotkeyOptions[idx].id)
             registerTermHotkey()
@@ -1893,74 +1797,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         RegisterEventHotKey(opt.key, opt.mods, termKeyID, GetApplicationEventTarget(), 0, &hotKeyRef2)
     }
 
-    private func pathLabel(_ path: String) -> NSTextField {
-        let l = NSTextField(labelWithString: path.isEmpty ? L("none") : (path as NSString).lastPathComponent)
-        l.textColor = .secondaryLabelColor
-        l.lineBreakMode = .byTruncatingMiddle
-        l.widthAnchor.constraint(lessThanOrEqualToConstant: 160).isActive = true
-        return l
-    }
 
-    private func setPreview(_ iv: NSImageView?, path: String) {
-        iv?.image = path.isEmpty ? nil : NSImage(contentsOfFile: path)
-    }
-
-    // MARK: - Online GIF search (GIPHY)
-    // The ONLY network access in the app, and only when the user hits Search.
-
-    @objc private func searchGifs() {
-        let key = giphyKeyField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !key.isEmpty else { alert(L("giphy_missing"), L("giphy_missing_info")); return }
-        let q = gifSearchField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !q.isEmpty else { return }
-        var comps = URLComponents(string: "https://api.giphy.com/v1/gifs/search")!
-        comps.queryItems = [URLQueryItem(name: "api_key", value: key), URLQueryItem(name: "q", value: q),
-                            URLQueryItem(name: "limit", value: "6"), URLQueryItem(name: "rating", value: "g")]
-        URLSession.shared.dataTask(with: comps.url!) { [weak self] data, _, _ in
-            var found: [(id: String, preview: URL, full: URL)] = []
-            if let data,
-               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let items = obj["data"] as? [[String: Any]] {
-                for it in items {
-                    guard let id = it["id"] as? String,
-                          let imgs = it["images"] as? [String: Any],
-                          let pv = ((imgs["fixed_height_small"] as? [String: Any])?["url"] as? String)
-                              .flatMap(URL.init(string:)),
-                          let full = ((imgs["original"] as? [String: Any])?["url"] as? String)
-                              .flatMap(URL.init(string:))
-                    else { continue }
-                    found.append((id, pv, full))
-                }
-            }
-            DispatchQueue.main.async {
-                guard let self else { return }
-                guard !found.isEmpty else { self.alert(L("gif_search_fail"), ""); return }
-                self.gifResults = found
-                for (i, iv) in self.gifResultViews.enumerated() {
-                    guard i < found.count else { iv.isHidden = true; continue }
-                    iv.isHidden = false
-                    iv.image = nil
-                    URLSession.shared.dataTask(with: found[i].preview) { d, _, _ in
-                        guard let d, let img = NSImage(data: d) else { return }
-                        DispatchQueue.main.async { iv.image = img }
-                    }.resume()
-                }
-                if let w = self.settingsWindow, let content = w.contentView {
-                    w.setContentSize(content.fittingSize)
-                }
-            }
-        }.resume()
-    }
-
-    /// Click on a result: download it and stage it for the chosen agent
-    /// (applied on Save, like the rest of the settings).
-    @objc private func gifResultClicked(_ g: NSClickGestureRecognizer) {
-        guard let iv = g.view as? NSImageView, iv.tag < gifResults.count else { return }
-        let claude = gifTargetPopup?.indexOfSelectedItem != 1
-        downloadGif(gifResults[iv.tag]) { [weak self] dest in
-            self?.stageGif(dest, forClaude: claude, applyNow: false)
-        }
-    }
 
     private func alert(_ msg: String, _ info: String) {
         let a = NSAlert()
@@ -1969,76 +1806,97 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         a.runModal()
     }
 
-    private static func parseGiphy(_ data: Data?) -> [(id: String, preview: URL, full: URL)] {
-        guard let data,
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let items = obj["data"] as? [[String: Any]] else { return [] }
-        return items.compactMap { it in
-            guard let id = it["id"] as? String,
-                  let imgs = it["images"] as? [String: Any],
-                  let pv = ((imgs["fixed_height_small"] as? [String: Any])?["url"] as? String)
-                      .flatMap(URL.init(string:)),
-                  let full = ((imgs["original"] as? [String: Any])?["url"] as? String)
-                      .flatMap(URL.init(string:))
-            else { return nil }
-            return (id, pv, full)
-        }
+    // MARK: - Animated emoji mascots (Noto Animated Emoji — keyless CDN)
+    // Small animated icons with transparent background served by Google at
+    // fonts.gstatic.com — no API key, no account. The ONLY network access in
+    // the app, used only from the gallery. Names mix EN+ES for local search.
+
+    static let emojiCatalog: [(code: String, names: String)] = [
+        ("1f600", "grinning sonrisa feliz happy"),
+        ("1f603", "smiley open mouth sonrisa abierta"),
+        ("1f604", "smile eyes sonrisa ojos"),
+        ("1f601", "beaming grin dientes"),
+        ("1f606", "laughing risa"),
+        ("1f923", "rofl rodando risa piso"),
+        ("1f602", "joy tears lagrimas risa llorar"),
+        ("1f609", "wink guiño"),
+        ("1f60a", "blush sonrojado tierno"),
+        ("1f607", "halo angel santo"),
+        ("1f970", "hearts enamorado corazones amor love"),
+        ("1f60d", "heart eyes ojos corazon amor love"),
+        ("1f929", "star struck estrellas wow"),
+        ("1f618", "kiss beso"),
+        ("1f60b", "yum rico delicioso"),
+        ("1f92a", "zany loco crazy"),
+        ("1f914", "thinking pensando"),
+        ("1f910", "zipper callado boca cerrada"),
+        ("1f634", "sleeping durmiendo zzz"),
+        ("1f637", "mask barbijo mascarilla"),
+        ("1f975", "hot calor sudor"),
+        ("1f976", "cold frio congelado"),
+        ("1f92f", "exploding head cabeza explota mind blown"),
+        ("1f60e", "sunglasses cool lentes anteojos sol"),
+        ("1f913", "nerd geek anteojos"),
+        ("1f622", "cry triste lagrima"),
+        ("1f62d", "crying llorando fuerte"),
+        ("1f620", "angry enojado"),
+        ("1f92c", "cursing furioso insultos"),
+        ("1f480", "skull calavera muerto"),
+        ("1f4a9", "poop caca"),
+        ("1f921", "clown payaso"),
+        ("1f47b", "ghost fantasma"),
+        ("1f47d", "alien extraterrestre ovni"),
+        ("1f916", "robot bot"),
+        ("1f525", "fire fuego llama"),
+        ("1f31f", "glowing star estrella brillante"),
+        ("2728", "sparkles destellos brillos"),
+        ("1f496", "sparkling heart corazon brillante"),
+        ("1f680", "rocket cohete"),
+        ("1f389", "party fiesta confeti"),
+        ("1f973", "partying face fiesta gorro"),
+        ("1f4af", "hundred 100 cien"),
+        ("1f440", "eyes ojos mirando"),
+        ("1f44b", "wave hola saludo mano"),
+        ("1f44d", "thumbs up pulgar like ok"),
+        ("1f44f", "clap aplausos"),
+        ("1f4aa", "muscle musculo fuerza"),
+        ("1f60f", "smirk picaro"),
+        ("1f644", "rolling eyes ojos en blanco"),
+        ("1f643", "upside down dado vuelta"),
+        ("1f911", "money dinero plata"),
+        ("1f61b", "tongue lengua"),
+        ("1f624", "steam resoplando bufando"),
+        ("1f631", "scream grito miedo"),
+        ("1f628", "fearful asustado"),
+        ("1f979", "holding tears aguantando lagrimas"),
+        ("1f60c", "relieved aliviado"),
+        ("1f9d0", "monocle inspeccionando detective"),
+        ("1f615", "confused confundido"),
+    ]
+
+    private static func emojiURL(_ code: String) -> URL {
+        URL(string: "https://fonts.gstatic.com/s/e/notoemoji/latest/\(code)/512.gif")!
     }
 
-    private func giphyKey() -> String {
-        let fromField = giphyKeyField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !fromField.isEmpty { return fromField }
-        return (try? String(contentsOf: configURL("giphy-key"), encoding: .utf8))?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    }
+    private static var emojiPreviewCache: [String: NSImage] = [:]
 
-    private func downloadGif(_ r: (id: String, preview: URL, full: URL), done: @escaping (URL) -> Void) {
-        let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/agent-notch/gifs")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let dest = dir.appendingPathComponent("giphy-\(r.id).gif")
-        URLSession.shared.dataTask(with: r.full) { [weak self] d, _, _ in
-            DispatchQueue.main.async {
-                guard let d, (try? d.write(to: dest)) != nil, GifAnimation(path: dest.path) != nil else {
-                    self?.alert(L("gif_dl_fail"), "")
-                    return
-                }
-                done(dest)
-            }
-        }.resume()
-    }
-
-    /// Reflect a chosen GIF in the staged settings and (gallery only) apply it live.
-    private func stageGif(_ dest: URL, forClaude claude: Bool, applyNow: Bool) {
-        if claude {
-            pendClaudeGif = dest.path
-            claudeGifLabel?.stringValue = dest.lastPathComponent
-            setPreview(claudePreview, path: dest.path)
-        } else {
-            pendCodexGif = dest.path
-            codexGifLabel?.stringValue = dest.lastPathComponent
-            setPreview(codexPreview, path: dest.path)
-        }
-        if applyNow {
-            writeConfig(claude ? "claude-gif" : "codex-gif", dest.path)
-            IndicatorView.refreshCustomGifs()
-        }
-    }
-
-    // MARK: - GIF gallery (scrollable feed)
+    // MARK: - Emoji gallery (scrollable feed)
 
     @objc private func showGifGallery() {
         NSApp.activate(ignoringOtherApps: true)
         galleryWindow?.close()
         let search = NSTextField(string: "")
-        search.placeholderString = "pixel cat…"
-        search.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        search.placeholderString = "fire, robot, corazón…"
+        search.widthAnchor.constraint(equalToConstant: 170).isActive = true
+        search.target = self
+        search.action = #selector(gallerySearch)
         gallerySearchField = search
         let target = NSPopUpButton()
         target.addItems(withTitles: ["Claude", "Codex"])
         galleryTargetPopup = target
         let top = NSStackView(views: [search, button(L("search"), #selector(gallerySearch)),
-                                      NSTextField(labelWithString: L("gif_for")), target])
+                                      NSTextField(labelWithString: L("gif_for")), target,
+                                      button(L("restore_default"), #selector(restoreDefaultMascot))])
         top.orientation = .horizontal
         top.spacing = 8
         let hint = NSTextField(labelWithString: L("gallery_hint"))
@@ -2065,8 +1923,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             grid.trailingAnchor.constraint(equalTo: doc.trailingAnchor),
             grid.bottomAnchor.constraint(equalTo: doc.bottomAnchor),
             doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
-            scroll.widthAnchor.constraint(equalToConstant: 3 * 150 + 2 * 8 + 16),
-            scroll.heightAnchor.constraint(equalToConstant: 430),
+            scroll.widthAnchor.constraint(equalToConstant: 8 * 64 + 7 * 8 + 16),
+            scroll.heightAnchor.constraint(equalToConstant: 380),
         ])
 
         let root = NSStackView(views: [top, hint, scroll])
@@ -2075,7 +1933,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         root.spacing = 10
         root.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
 
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 540),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 500),
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
         w.title = L("gallery_title")
         w.isReleasedWhenClosed = false
@@ -2084,64 +1942,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         w.center()
         galleryWindow = w
         w.makeKeyAndOrderFront(nil)
-        galleryFetch(query: "")
+        populateGallery(filter: "")
     }
 
-    @objc private func gallerySearch() { galleryFetch(query: gallerySearchField?.stringValue ?? "") }
+    @objc private func gallerySearch() { populateGallery(filter: gallerySearchField?.stringValue ?? "") }
 
-    private func galleryFetch(query: String) {
-        let key = giphyKey()
-        guard !key.isEmpty else { alert(L("giphy_missing"), L("giphy_missing_info")); return }
-        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        var comps = URLComponents(string: q.isEmpty ? "https://api.giphy.com/v1/gifs/trending"
-                                                    : "https://api.giphy.com/v1/gifs/search")!
-        var items = [URLQueryItem(name: "api_key", value: key),
-                     URLQueryItem(name: "limit", value: "24"),
-                     URLQueryItem(name: "rating", value: "g")]
-        if !q.isEmpty { items.append(URLQueryItem(name: "q", value: q)) }
-        comps.queryItems = items
-        URLSession.shared.dataTask(with: comps.url!) { [weak self] data, _, _ in
-            let found = Self.parseGiphy(data)
-            DispatchQueue.main.async {
-                guard let self, let grid = self.galleryStack else { return }
-                guard !found.isEmpty else { self.alert(L("gif_search_fail"), ""); return }
-                self.galleryResults = found
-                grid.arrangedSubviews.forEach { $0.removeFromSuperview() }
-                var i = 0
-                while i < found.count {
-                    let rowStack = NSStackView()
-                    rowStack.orientation = .horizontal
-                    rowStack.spacing = 8
-                    for j in i..<min(i + 3, found.count) {
-                        let iv = NSImageView()
-                        iv.animates = true
-                        iv.imageScaling = .scaleProportionallyUpOrDown
-                        iv.wantsLayer = true
-                        iv.layer?.backgroundColor = NSColor.black.cgColor
-                        iv.layer?.cornerRadius = 6
-                        iv.widthAnchor.constraint(equalToConstant: 150).isActive = true
-                        iv.heightAnchor.constraint(equalToConstant: 110).isActive = true
-                        iv.tag = j
-                        iv.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(self.galleryClicked(_:))))
-                        rowStack.addArrangedSubview(iv)
-                        URLSession.shared.dataTask(with: found[j].preview) { d, _, _ in
-                            guard let d, let img = NSImage(data: d) else { return }
-                            DispatchQueue.main.async { iv.image = img }
-                        }.resume()
-                    }
-                    grid.addArrangedSubview(rowStack)
-                    i += 3
+    /// Local filtering over the curated catalog — no API, no network for the
+    /// list itself; only the previews are fetched (and cached) from the CDN.
+    private func populateGallery(filter: String) {
+        guard let grid = galleryStack else { return }
+        let f = filter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let matched = f.isEmpty ? Self.emojiCatalog : Self.emojiCatalog.filter { $0.names.contains(f) }
+        galleryResults = matched
+        grid.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        guard !matched.isEmpty else {
+            grid.addArrangedSubview(NSTextField(labelWithString: L("no_results")))
+            return
+        }
+        let perRow = 8
+        var i = 0
+        while i < matched.count {
+            let rowStack = NSStackView()
+            rowStack.orientation = .horizontal
+            rowStack.spacing = 8
+            for j in i..<min(i + perRow, matched.count) {
+                let iv = NSImageView()
+                iv.animates = true
+                iv.imageScaling = .scaleProportionallyUpOrDown
+                iv.widthAnchor.constraint(equalToConstant: 64).isActive = true
+                iv.heightAnchor.constraint(equalToConstant: 64).isActive = true
+                iv.tag = j
+                iv.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(galleryClicked(_:))))
+                rowStack.addArrangedSubview(iv)
+                let code = matched[j].code
+                if let img = Self.emojiPreviewCache[code] {
+                    iv.image = img
+                } else {
+                    URLSession.shared.dataTask(with: Self.emojiURL(code)) { d, _, _ in
+                        guard let d, let img = NSImage(data: d) else { return }
+                        DispatchQueue.main.async {
+                            Self.emojiPreviewCache[code] = img
+                            iv.image = img
+                        }
+                    }.resume()
                 }
+            }
+            grid.addArrangedSubview(rowStack)
+            i += perRow
+        }
+    }
+
+    /// Click: download the emoji GIF and set it as the mascot right away.
+    @objc private func galleryClicked(_ g: NSClickGestureRecognizer) {
+        guard let iv = g.view as? NSImageView, iv.tag < galleryResults.count else { return }
+        let code = galleryResults[iv.tag].code
+        let claude = galleryTargetPopup?.indexOfSelectedItem != 1
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/agent-notch/gifs")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dest = dir.appendingPathComponent("noto-\(code).gif")
+        URLSession.shared.dataTask(with: Self.emojiURL(code)) { [weak self] d, _, _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard let d, (try? d.write(to: dest)) != nil, GifAnimation(path: dest.path) != nil else {
+                    self.alert(L("gif_dl_fail"), "")
+                    return
+                }
+                self.writeConfig(claude ? "claude-gif" : "codex-gif", dest.path)
+                IndicatorView.refreshCustomGifs()
             }
         }.resume()
     }
 
-    @objc private func galleryClicked(_ g: NSClickGestureRecognizer) {
-        guard let iv = g.view as? NSImageView, iv.tag < galleryResults.count else { return }
+    /// Back to the built-in walking mascot / Codex pet for the chosen agent.
+    @objc private func restoreDefaultMascot() {
         let claude = galleryTargetPopup?.indexOfSelectedItem != 1
-        downloadGif(galleryResults[iv.tag]) { [weak self] dest in
-            self?.stageGif(dest, forClaude: claude, applyNow: true)
-        }
+        writeConfig(claude ? "claude-gif" : "codex-gif", "")
+        IndicatorView.refreshCustomGifs()
     }
 
     private func button(_ title: String, _ action: Selector) -> NSButton {
@@ -2162,43 +2039,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         else { try? value.write(to: configURL(name), atomically: true, encoding: .utf8) }
     }
 
-    @objc private func chooseClaudeGif() { chooseGif(claude: true) }
-    @objc private func chooseCodexGif() { chooseGif(claude: false) }
-    @objc private func clearClaudeGif() {
-        pendClaudeGif = ""
-        claudeGifLabel?.stringValue = L("none")
-        setPreview(claudePreview, path: "")
-    }
-    @objc private func clearCodexGif() {
-        pendCodexGif = ""
-        codexGifLabel?.stringValue = L("none")
-        setPreview(codexPreview, path: "")
-    }
-
-    /// Stages the choice (applied on Save) and shows it in the animated preview.
-    private func chooseGif(claude: Bool) {
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.gif]
-        panel.allowsMultipleSelection = false
-        panel.message = L("choose_gif_msg")
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        guard GifAnimation(path: url.path) != nil else {
-            let a = NSAlert()
-            a.messageText = L("bad_gif")
-            a.informativeText = L("bad_gif_info")
-            a.runModal()
-            return
-        }
-        if claude {
-            pendClaudeGif = url.path
-            claudeGifLabel?.stringValue = url.lastPathComponent
-            setPreview(claudePreview, path: url.path)
-        } else {
-            pendCodexGif = url.path
-            codexGifLabel?.stringValue = url.lastPathComponent
-            setPreview(codexPreview, path: url.path)
-        }
-    }
 }
 
 extension AppDelegate: LocalProcessTerminalViewDelegate {
