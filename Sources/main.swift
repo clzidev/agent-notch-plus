@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.6"
+let appVersion = "2.9.7"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -1871,7 +1871,10 @@ final class NotchView: NSView {
     @objc private func quitTapped() { onQuit?() }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func mouseDown(with event: NSEvent) { }
-    override func mouseUp(with event: NSEvent) { onCollapse?() }
+    // NOTE: don't close the panel on mouseUp — it now holds interactive
+    // controls (reply field, buttons). Click-away dismissal is handled by the
+    // mouse monitors; clicking INSIDE the panel must never close it.
+    override func mouseUp(with event: NSEvent) { }
     @objc private func openSettings() { onSettings?() }
     @objc private func openTerminal() { onTerminal?() }
     override func rightMouseUp(with event: NSEvent) {
@@ -3326,6 +3329,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         a.addButton(withTitle: L("quit"))
         a.addButton(withTitle: L("cancel"))
         a.alertStyle = .warning
+        // the notch/terminal float above statusBar level, so lift the alert
+        // above them or it opens buried and unclickable
+        a.window.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 5)
+        a.window.orderFrontRegardless()
         if a.runModal() == .alertFirstButtonReturn { NSApp.terminate(nil) }
     }
 
@@ -3338,6 +3345,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let host = [settingsWindow, galleryWindow].compactMap({ $0 }).first(where: { $0.isVisible }) {
             a.beginSheetModal(for: host, completionHandler: nil)
         } else {
+            NSApp.activate(ignoringOtherApps: true)
+            a.window.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 5)
+            a.window.orderFrontRegardless()
             a.runModal()
         }
     }
