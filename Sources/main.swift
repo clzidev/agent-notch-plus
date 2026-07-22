@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.7.0"
+let appVersion = "2.8.0"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 // MARK: - Localization
@@ -133,11 +133,14 @@ struct AgentSession {
     var nickname: String?
     var children: [AgentSession] = []
     var isLive: Bool = false  // process alive (from discovery, never mtime)
+    var cpu: Double = 0       // process %cpu — waiting at the prompt sits near 0
     // last user/assistant entry — housekeeping writes (away_summary etc.)
     // bump the file mtime but must not count as activity
     var lastActivity: Date?
-    // hybrid: busy = alive AND conversing; quiet-while-alive is idle, not done
-    var isBusy: Bool { isLive && Date().timeIntervalSince(lastActivity ?? lastModified) < 30 }
+    // busy = alive AND (recently wrote OR the process is visibly crunching:
+    // long thinking writes nothing to the transcript but burns CPU, and a
+    // finished turn stops burning CPU long before the 30 s write window ends)
+    var isBusy: Bool { isLive && (cpu >= 8 || Date().timeIntervalSince(lastActivity ?? lastModified) < 20) }
     var anyLive: Bool { isLive || children.contains { $0.isLive } }
     var anyBusy: Bool { isBusy || children.contains { $0.isBusy } }
     var effectiveLastModified: Date { children.reduce(lastModified) { max($0, $1.lastModified) } }
@@ -155,7 +158,7 @@ final class ProcessDiscovery {
     // open jsonl for it — open-vibe-island falls back to the process cwd (and
     // claims by tty so a terminal maps to one session). Codex holds its
     // rollout file open, so the path route always works there.
-    struct Snapshot { let kind: AgentKind; let transcriptPath: String?; let cwd: String? }
+    struct Snapshot { let kind: AgentKind; let transcriptPath: String?; let cwd: String?; let cpu: Double }
 
     // open-vibe-island uses 0.5s/0.2s here, but Process-spawn overhead under
     // heavy load (a codex swarm compiling) blows through 0.2s and every agent
@@ -164,22 +167,23 @@ final class ProcessDiscovery {
     private static let lsofTimeout: TimeInterval = 2.0
 
     func liveTranscripts() -> [Snapshot] {
-        guard let psOut = run("/bin/ps", ["-Ao", "pid=,ppid=,tty=,command="], timeout: Self.psTimeout) else { return [] }
-        var candidates: [(pid: String, tty: String, kind: AgentKind)] = []
+        guard let psOut = run("/bin/ps", ["-Ao", "pid=,ppid=,tty=,%cpu=,command="], timeout: Self.psTimeout) else { return [] }
+        var candidates: [(pid: String, tty: String, cpu: Double, kind: AgentKind)] = []
         for line in psOut.split(whereSeparator: \.isNewline) {
             let parts = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                .split(maxSplits: 3, whereSeparator: \.isWhitespace)
-            guard parts.count == 4 else { continue }
+                .split(maxSplits: 4, whereSeparator: \.isWhitespace)
+            guard parts.count == 5 else { continue }
             let pid = String(parts[0]), tty = String(parts[2])
-            let command = String(parts[3]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let cpu = Double(String(parts[3]).replacingOccurrences(of: ",", with: ".")) ?? 0
+            let command = String(parts[4]).trimmingCharacters(in: .whitespacesAndNewlines)
             guard tty != "??", !command.isEmpty else { continue }  // agent must be terminal-attached
-            if isClaude(command) { candidates.append((pid, tty, .claude)) }
-            else if isCodex(command) { candidates.append((pid, tty, .codex)) }
+            if isClaude(command) { candidates.append((pid, tty, cpu, .claude)) }
+            else if isCodex(command) { candidates.append((pid, tty, cpu, .codex)) }
         }
         let chunks = lsofChunks(pids: candidates.map(\.pid))
         var out: [Snapshot] = []
         var claimed = Set<String>()
-        for (pid, tty, kind) in candidates {
+        for (pid, tty, cpu, kind) in candidates {
             guard let lsof = chunks[pid] else { continue }
             let cwd = workingDirectory(from: lsof)
             // Claude subagents run in .claude/worktrees/agent-*/ — they are
@@ -191,11 +195,11 @@ final class ProcessDiscovery {
                 guard path != nil || cwd != nil else { continue }
                 // claim key: sessionID ?? tty ?? cwd — one session per terminal
                 guard claimed.insert("claude:\(path ?? tty)").inserted else { continue }
-                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd))
+                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd, cpu: cpu))
             case .codex:
                 guard let path = bestCodexTranscript(in: lsof),
                       claimed.insert("codex:\(path)").inserted else { continue }
-                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd))
+                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd, cpu: cpu))
             }
         }
         return out
@@ -315,12 +319,14 @@ final class SessionScanner {
     /// `claudeCwdCounts` = encoded-project-dir → number of claude processes
     /// with that cwd (the fallback when claude exposes no open transcript).
     /// Together they are the sole source of truth for isRunning.
-    func scan(live: Set<String>, claudeCwdCounts: [String: Int]) -> [AgentSession] {
+    func scan(live: Set<String>, claudeCwdCounts: [String: Int],
+              cpuByPath: [String: Double] = [:], cpuByCwd: [String: Double] = [:]) -> [AgentSession] {
         if tailCache.count > 600 { tailCache.removeAll() }        // unbounded-growth guard
         if codexMetaCache.count > 600 { codexMetaCache.removeAll() }
         let recent: (AgentSession) -> Bool = { $0.isLive || Date().timeIntervalSince($0.lastModified) < 6 * 3600 }
-        var sessions = scanClaude(live: live, cwdCounts: claudeCwdCounts).filter(recent)
-            + groupCodex(scanCodex(live: live).filter(recent))
+        var sessions = scanClaude(live: live, cwdCounts: claudeCwdCounts,
+                                  cpuByPath: cpuByPath, cpuByCwd: cpuByCwd).filter(recent)
+            + groupCodex(scanCodex(live: live, cpuByPath: cpuByPath).filter(recent))
         sessions.sort { $0.effectiveLastModified > $1.effectiveLastModified }
         return sessions
     }
@@ -350,13 +356,17 @@ final class SessionScanner {
                 parent.isLive = true
                 for i in kids.indices { kids[i].isLive = true }
             }
+            let maxCpu = max(parent.cpu, kids.map(\.cpu).max() ?? 0)
+            parent.cpu = maxCpu
+            for i in kids.indices { kids[i].cpu = maxCpu }
             parent.children = kids
             out.append(parent)
         }
         return out
     }
 
-    private func scanClaude(live: Set<String>, cwdCounts: [String: Int]) -> [AgentSession] {
+    private func scanClaude(live: Set<String>, cwdCounts: [String: Int],
+                            cpuByPath: [String: Double], cpuByCwd: [String: Double]) -> [AgentSession] {
         var out: [AgentSession] = []
         let root = home.appendingPathComponent(".claude/projects")
         guard let projects = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { return out }
@@ -379,14 +389,15 @@ final class SessionScanner {
                 sess.prompt = info.prompt
                 sess.lastActivity = info.activity
                 sess.isLive = live.contains(f.path) || idx < liveByCwd
-                sess.children = claudeSubagents(sessionFile: f, parentLive: sess.isLive)
+                sess.cpu = cpuByPath[f.path] ?? (idx < liveByCwd ? (cpuByCwd[proj.lastPathComponent] ?? 0) : 0)
+                sess.children = claudeSubagents(sessionFile: f, parentLive: sess.isLive, parentCpu: sess.cpu)
                 out.append(sess)
             }
         }
         return out
     }
 
-    private func scanCodex(live: Set<String>) -> [AgentSession] {
+    private func scanCodex(live: Set<String>, cpuByPath: [String: Double]) -> [AgentSession] {
         var out: [AgentSession] = []
         let root = home.appendingPathComponent(".codex/sessions")
         guard let en = fm.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) else { return out }
@@ -404,6 +415,7 @@ final class SessionScanner {
                                     snippet: info.snippet, model: info.model, lastModified: mtime)
             sess.prompt = info.prompt
             sess.isLive = live.contains(f.path)
+            sess.cpu = cpuByPath[f.path] ?? 0
             sess.threadID = meta.id
             sess.parentID = meta.parentID
             sess.nickname = meta.nickname
@@ -413,7 +425,7 @@ final class SessionScanner {
     }
 
     /// Claude Code subagent transcripts live in <proj>/<session-uuid>/subagents/agent-*.jsonl
-    private func claudeSubagents(sessionFile f: URL, parentLive: Bool) -> [AgentSession] {
+    private func claudeSubagents(sessionFile f: URL, parentLive: Bool, parentCpu: Double) -> [AgentSession] {
         let dir = f.deletingPathExtension().appendingPathComponent("subagents")
         guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return [] }
         var kids: [AgentSession] = []
@@ -428,6 +440,7 @@ final class SessionScanner {
             // subagents share the parent process (open-vibe-island tracks them
             // as parent metadata) — liveness inherits, busyness from writes
             kid.isLive = parentLive
+            kid.cpu = parentCpu
             kid.lastActivity = info.activity
             kids.append(kid)
         }
@@ -1751,7 +1764,6 @@ final class TermDragStrip: NSView {
 
 final class NotchView: NSView {
     var expanded = false { didSet { needsDisplay = true } }
-    var panelAlpha: CGFloat = 1 { didSet { needsDisplay = true } }
     var barHeight: CGFloat = 32
     var onCollapse: (() -> Void)?
     var onSettings: (() -> Void)?
@@ -1786,7 +1798,7 @@ final class NotchView: NSView {
             path.appendArc(withCenter: NSPoint(x: b.maxX - r, y: b.minY + r), radius: r, startAngle: 270, endAngle: 0, clockwise: false)
             path.line(to: NSPoint(x: b.maxX, y: b.maxY))
             path.close()
-            NSColor.black.withAlphaComponent(panelAlpha).setFill()
+            NSColor.black.setFill()
             path.fill()
             // subtle dark-gray outline so the panel reads against dark walls
             NSColor(white: 0.24, alpha: 1).setStroke()
@@ -1913,7 +1925,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         L10n.refresh()
         readSoundPrefs()
         readZoomPref()
-        notchView.panelAlpha = cfgAlpha("panel-alpha")
 
         // Panel window: full-width, mouse-transparent unless expanded
         window = NSWindow(contentRect: collapsedFrame(), styleMask: .borderless, backing: .buffered, defer: false)
@@ -1928,6 +1939,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.contentView = notchView
         notchView.wantsLayer = true
         notchView.barHeight = barHeight
+        // window-level alpha: the WHOLE panel goes translucent, text included
+        window.alphaValue = cfgAlpha("panel-alpha")
 
         // Indicator window: tiny, always interactive, never steals focus
         indicatorWindow = NSPanel(contentRect: indicatorScreenRect,
@@ -2162,14 +2175,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // transcript paths, or "cwd#<encoded>#<i>" for claude's cwd fallback.
             var seen = Set<String>()
             var cwdIndex: [String: Int] = [:]
+            var cpuByPath: [String: Double] = [:]
+            var cpuByCwd: [String: Double] = [:]
             for snap in self.discovery.liveTranscripts() {
                 if let path = snap.transcriptPath {
                     seen.insert(path)
+                    cpuByPath[path] = max(cpuByPath[path] ?? 0, snap.cpu)
                 } else if snap.kind == .claude, let cwd = snap.cwd {
                     let encoded = encodeProjectDir(cwd)
                     let i = cwdIndex[encoded, default: 0]
                     cwdIndex[encoded] = i + 1
                     seen.insert("cwd#\(encoded)#\(i)")
+                    cpuByCwd[encoded] = max(cpuByCwd[encoded] ?? 0, snap.cpu)
                 }
             }
             for p in seen { self.missCounts[p] = 0 }
@@ -2186,7 +2203,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     live.insert(key)
                 }
             }
-            let result = self.scanner.scan(live: live, claudeCwdCounts: cwdCounts)
+            let result = self.scanner.scan(live: live, claudeCwdCounts: cwdCounts,
+                                           cpuByPath: cpuByPath, cpuByCwd: cpuByCwd)
             DispatchQueue.main.async {
                 // Track fullscreen-space changes: full-width bar when the menu bar is hidden
                 if !self.expanded, !self.animating {
@@ -2340,6 +2358,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.isReleasedWhenClosed = false
         panel.minSize = NSSize(width: 480, height: 280)
         panel.isMovable = false  // the terminal IS part of the notch — it doesn't move
+        panel.alphaValue = cfgAlpha("term-alpha")  // whole-window transparency
         // any resize re-centers under the notch, so dragging a corner grows
         // the window symmetrically around it
         NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification,
@@ -2357,7 +2376,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let container = NSView(frame: NSRect(origin: .zero, size: NSSize(width: tw, height: th)))
         container.wantsLayer = true
-        container.layer?.backgroundColor = NSColor.black.withAlphaComponent(cfgAlpha("term-alpha")).cgColor
+        container.layer?.backgroundColor = NSColor.black.cgColor
         container.layer?.cornerRadius = 16
         container.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
         container.layer?.borderColor = NSColor(white: 0.24, alpha: 1).cgColor
@@ -2390,7 +2409,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let split = termSplit, termViews.count < 3 else { return }
         let term = DropTerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
         term.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        term.nativeBackgroundColor = cfgAlpha("term-alpha") < 1 ? .clear : .black
+        term.nativeBackgroundColor = .black
         term.nativeForegroundColor = NSColor(white: 0.92, alpha: 1)
         term.caretColor = NSColor(red: 0.1, green: 0.95, blue: 0.35, alpha: 1)  // matrix green
         term.processDelegate = self
@@ -2790,7 +2809,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         writeConfig("panel-alpha", String(pa))
         let ta = Int(min(100, max(30, Double(pendTermAlphaField?.stringValue ?? "") ?? 100)))
         writeConfig("term-alpha", String(ta))
-        notchView.panelAlpha = CGFloat(pa) / 100
+        window.alphaValue = CGFloat(pa) / 100
         applyTerminalAlpha(CGFloat(ta) / 100)
         if #available(macOS 13.0, *), let check = loginCheckRef, check.isEnabled {
             if check.state == .on {
@@ -2868,11 +2887,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return CGFloat(min(100, max(30, Double(v ?? "") ?? 100))) / 100
     }
 
+    /// Window-level alpha: everything in the terminal — background, text,
+    /// panes, header — goes translucent together.
     private func applyTerminalAlpha(_ a: CGFloat) {
-        termWindow?.contentView?.layer?.backgroundColor = NSColor.black.withAlphaComponent(a).cgColor
-        // with a translucent container the terminal cells go clear so the
-        // tint isn't applied twice (text area darker than the padding)
-        for t in termViews { t.nativeBackgroundColor = a < 1 ? .clear : .black }
+        termWindow?.alphaValue = a
     }
 
     // MARK: - Hotkeys (all configurable)
@@ -3243,13 +3261,19 @@ if CommandLine.arguments.contains("--scan") {
     for s in snaps { print("\(s.kind.rawValue): path=\(s.transcriptPath ?? "nil") cwd=\(s.cwd ?? "nil")") }
     var live = Set<String>()
     var cwdCounts: [String: Int] = [:]
+    var cpuByPath: [String: Double] = [:]
+    var cpuByCwd: [String: Double] = [:]
     for s in snaps {
-        if let p = s.transcriptPath { live.insert(p) }
-        else if s.kind == .claude, let c = s.cwd { cwdCounts[encodeProjectDir(c), default: 0] += 1 }
+        if let p = s.transcriptPath { live.insert(p); cpuByPath[p] = s.cpu }
+        else if s.kind == .claude, let c = s.cwd {
+            let e = encodeProjectDir(c)
+            cwdCounts[e, default: 0] += 1
+            cpuByCwd[e] = max(cpuByCwd[e] ?? 0, s.cpu)
+        }
     }
     print("== sessions ==")
-    for s in SessionScanner().scan(live: live, claudeCwdCounts: cwdCounts) {
-        print("\(s.kind.rawValue) [\(s.title)] live=\(s.isLive) busy=\(s.isBusy) mtime=\(-s.lastModified.timeIntervalSinceNow)s kids=\(s.children.count)")
+    for s in SessionScanner().scan(live: live, claudeCwdCounts: cwdCounts, cpuByPath: cpuByPath, cpuByCwd: cpuByCwd) {
+        print("\(s.kind.rawValue) [\(s.title)] live=\(s.isLive) busy=\(s.isBusy) cpu=\(s.cpu) mtime=\(-s.lastModified.timeIntervalSinceNow)s kids=\(s.children.count)")
     }
     exit(0)
 }
