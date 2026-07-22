@@ -6,8 +6,18 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.8.1"
+let appVersion = "2.9.0"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
+
+/// A pending question/permission request from an agent, written by the
+/// Claude Code hook into ~/.config/agent-notch/asks/<session>.json.
+struct AgentAsk {
+    let sessionID: String
+    let message: String   // the notification text / permission summary
+    let cwd: String
+    let tty: String       // set by the app from process discovery, for replies
+    let time: Date
+}
 
 // MARK: - Localization
 
@@ -39,6 +49,23 @@ enum L10n {
         "st_working": ["Working…", "Trabajando…"],
         "st_waiting": ["Waiting for you", "Esperando tu respuesta"],
         "st_done": ["Done ✓", "Terminado ✓"],
+        "asking": ["Needs your answer", "Necesita tu respuesta"],
+        "reply_ph": ["Type your reply and press ↩", "Escribí tu respuesta y ↩"],
+        "send": ["Send", "Enviar"],
+        "focus_term": ["Focus terminal", "Ir a la terminal"],
+        "install_hook": ["Enable notch replies (install hook)", "Activar respuestas del notch (instalar hook)"],
+        "uninstall_hook": ["Disable notch replies (remove hook)", "Desactivar respuestas del notch (quitar hook)"],
+        "replies_title": ["Reply from the notch:", "Responder desde el notch:"],
+        "hook_ok": ["Hook installed", "Hook instalado"],
+        "hook_ok_info": ["Claude Code will now notify the notch when an agent asks for input. Restart running Claude sessions to pick it up.",
+                         "Claude Code ahora avisará al notch cuando un agente pida datos. Reiniciá las sesiones de Claude abiertas para que lo tomen."],
+        "hook_off": ["Hook removed", "Hook quitado"],
+        "hook_off_info": ["The notch will no longer be notified of agent questions.",
+                          "El notch ya no será avisado de las preguntas de los agentes."],
+        "ext_inject": ["Reply to external terminals (needs Accessibility)",
+                       "Responder a terminales externas (requiere Accesibilidad)"],
+        "ext_inject_info": ["This reply targets a terminal outside the notch. Enable \"Reply to external terminals\" in settings and grant Accessibility — note keystrokes go to the focused window.",
+                            "Esta respuesta va a una terminal fuera del notch. Activá \"Responder a terminales externas\" en la configuración y otorgá Accesibilidad — ojo que las teclas van a la ventana enfocada."],
         "shortcut_hint": ["Every shortcut below is configurable (⌘-keys work inside the terminal).",
                           "Todos los atajos de abajo son configurables (las teclas ⌘ funcionan dentro de la terminal)."],
         "panel_hotkey": ["Panel shortcut:", "Atajo del panel:"],
@@ -162,7 +189,7 @@ final class ProcessDiscovery {
     // open jsonl for it — open-vibe-island falls back to the process cwd (and
     // claims by tty so a terminal maps to one session). Codex holds its
     // rollout file open, so the path route always works there.
-    struct Snapshot { let kind: AgentKind; let transcriptPath: String?; let cwd: String?; let cpu: Double }
+    struct Snapshot { let kind: AgentKind; let transcriptPath: String?; let cwd: String?; let cpu: Double; let tty: String }
 
     // open-vibe-island uses 0.5s/0.2s here, but Process-spawn overhead under
     // heavy load (a codex swarm compiling) blows through 0.2s and every agent
@@ -199,11 +226,11 @@ final class ProcessDiscovery {
                 guard path != nil || cwd != nil else { continue }
                 // claim key: sessionID ?? tty ?? cwd — one session per terminal
                 guard claimed.insert("claude:\(path ?? tty)").inserted else { continue }
-                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd, cpu: cpu))
+                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd, cpu: cpu, tty: tty))
             case .codex:
                 guard let path = bestCodexTranscript(in: lsof),
                       claimed.insert("codex:\(path)").inserted else { continue }
-                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd, cpu: cpu))
+                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd, cpu: cpu, tty: tty))
             }
         }
         return out
@@ -685,6 +712,9 @@ final class SessionListController: NSViewController {
     var onLayoutChange: (() -> Void)?
     var onSettings: (() -> Void)?
     var onTerminal: (() -> Void)?
+    var asks: [AgentAsk] = [] { didSet { rebuild() } }
+    var onReply: ((AgentAsk, String) -> Void)?
+    var onFocusAsk: ((AgentAsk) -> Void)?
     private let stack = NSStackView()
     private var icons: [DitherIconView] = []
     private var animTimer: Timer?
@@ -711,6 +741,7 @@ final class SessionListController: NSViewController {
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         icons.removeAll()
         stack.addArrangedSubview(headerBar())
+        for ask in asks.prefix(3) { stack.addArrangedSubview(askCard(ask)) }
         if sessions.isEmpty {
             stack.addArrangedSubview(label(L("no_sessions"), size: 12, color: .secondaryLabelColor, bold: false))
             return
@@ -768,6 +799,74 @@ final class SessionListController: NSViewController {
     }
     @objc private func hdrSettings() { onSettings?() }
     @objc private func hdrTerminal() { onTerminal?() }
+
+    /// A highlighted card for an agent waiting on you: the question, a reply
+    /// field (↩ or Send), and a "focus terminal" shortcut.
+    private func askCard(_ ask: AgentAsk) -> NSView {
+        let title = label("🔔 " + L("asking"), size: 11, color: .systemOrange, bold: true)
+        let proj = label(((ask.cwd as NSString).lastPathComponent), size: 10, color: .secondaryLabelColor, bold: false)
+        let head = NSStackView(views: [title, NSView(), proj])
+        head.orientation = .horizontal
+        let msg = label(ask.message, size: 11, color: NSColor(white: 0.85, alpha: 1), bold: false,
+                        lines: 3)
+        msg.preferredMaxLayoutWidth = contentWidth - 28
+
+        let field = NSTextField(string: "")
+        field.placeholderString = L("reply_ph")
+        field.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        field.target = self
+        field.action = #selector(replyFieldSubmit(_:))
+        field.identifier = NSUserInterfaceItemIdentifier(ask.sessionID)
+        replyFields[ask.sessionID] = (field, ask)
+        let send = NSButton(title: L("send"), target: self, action: #selector(replyButton(_:)))
+        send.bezelStyle = .rounded
+        send.identifier = NSUserInterfaceItemIdentifier(ask.sessionID)
+        let focus = NSButton(title: L("focus_term"), target: self, action: #selector(focusAskButton(_:)))
+        focus.bezelStyle = .rounded
+        focus.identifier = NSUserInterfaceItemIdentifier(ask.sessionID)
+        let controls = NSStackView(views: [field, send, focus])
+        controls.orientation = .horizontal
+        controls.spacing = 6
+        field.widthAnchor.constraint(equalToConstant: contentWidth - 190).isActive = true
+
+        let col = NSStackView(views: [head, msg, controls])
+        col.orientation = .vertical
+        col.alignment = .leading
+        col.spacing = 5
+        col.translatesAutoresizingMaskIntoConstraints = false
+        head.widthAnchor.constraint(equalTo: col.widthAnchor).isActive = true
+
+        let card = NSView()
+        card.wantsLayer = true
+        card.layer?.backgroundColor = NSColor(calibratedRed: 0.15, green: 0.1, blue: 0.02, alpha: 1).cgColor
+        card.layer?.cornerRadius = 10
+        card.layer?.borderWidth = 1
+        card.layer?.borderColor = NSColor.systemOrange.withAlphaComponent(0.6).cgColor
+        card.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(col)
+        NSLayoutConstraint.activate([
+            col.topAnchor.constraint(equalTo: card.topAnchor, constant: 8),
+            col.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -8),
+            col.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 10),
+            col.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -10),
+            card.widthAnchor.constraint(equalToConstant: contentWidth),
+        ])
+        return card
+    }
+
+    private var replyFields: [String: (NSTextField, AgentAsk)] = [:]
+    @objc private func replyFieldSubmit(_ f: NSTextField) { sendReply(id: f.identifier?.rawValue) }
+    @objc private func replyButton(_ b: NSButton) { sendReply(id: b.identifier?.rawValue) }
+    private func sendReply(id: String?) {
+        guard let id, let (field, ask) = replyFields[id] else { return }
+        let text = field.stringValue
+        guard !text.isEmpty else { return }
+        onReply?(ask, text)
+    }
+    @objc private func focusAskButton(_ b: NSButton) {
+        guard let id = b.identifier?.rawValue, let (_, ask) = replyFields[id] else { return }
+        onFocusAsk?(ask)
+    }
 
     @objc private func toggleChildren(_ sender: NSButton) {
         guard let id = sender.identifier?.rawValue else { return }
@@ -1860,6 +1959,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // so CPU flapping around the threshold can't re-fire sounds/glyphs
     private var claudeBusyStable = false, codexBusyStable = false
     private var claudeQuietPolls = 0, codexQuietPolls = 0
+    private var asks: [AgentAsk] = []
+    // tty per live session path/cwd, harvested from discovery, so a reply
+    // reaches the right terminal
+    private var ttyByPath: [String: String] = [:]
     private var lastSoundAt = Date.distantPast
     private var termWindow: NSPanel?
     private var termSplit: NSSplitView?
@@ -1879,6 +1982,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendTermSizeField: NSTextField?
     private var pendPanelAlphaField: NSTextField?
     private var pendTermAlphaField: NSTextField?
+    private var extInjectRef: NSButton?
     private var galleryWindow: NSWindow?
     private var gallerySearchField: NSTextField?
     private var galleryTargetPopup: NSPopUpButton?
@@ -1978,6 +2082,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         notchView.onQuit = { [weak self] in self?.confirmQuit() }
         listController.onSettings = { [weak self] in self?.showSettings() }
         listController.onTerminal = { [weak self] in self?.toggleTerminal() }
+        listController.onReply = { [weak self] ask, text in self?.replyToAsk(ask, text: text) }
+        listController.onFocusAsk = { [weak self] ask in self?.focusTerminalFor(ask) }
 
         // Global hotkey ⌃⌥N toggles the panel. Carbon RegisterEventHotKey works
         // without Accessibility/Input-Monitoring permission, unlike key monitors.
@@ -2192,7 +2298,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             var cwdIndex: [String: Int] = [:]
             var cpuByPath: [String: Double] = [:]
             var cpuByCwd: [String: Double] = [:]
+            var ttyMap: [String: String] = [:]  // cwd → tty, for routing replies
             for snap in self.discovery.liveTranscripts() {
+                if let cwd = snap.cwd { ttyMap[cwd] = snap.tty }
                 if let path = snap.transcriptPath {
                     seen.insert(path)
                     cpuByPath[path] = max(cpuByPath[path] ?? 0, snap.cpu)
@@ -2204,6 +2312,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     cpuByCwd[encoded] = max(cpuByCwd[encoded] ?? 0, snap.cpu)
                 }
             }
+            let pendingAsks = self.loadAsks(ttyByCwd: ttyMap)
             for p in seen { self.missCounts[p] = 0 }
             for (p, n) in self.missCounts where !seen.contains(p) {
                 if n + 1 >= 2 { self.missCounts.removeValue(forKey: p) } else { self.missCounts[p] = n + 1 }
@@ -2232,7 +2341,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 IndicatorView.refreshPetChoice()
                 IndicatorView.refreshCustomGifs()
+                // chime once when a NEW ask arrives (not every poll it persists)
+                let newAsk = pendingAsks.contains { a in !self.asks.contains { $0.sessionID == a.sessionID } }
+                self.asks = pendingAsks
+                self.listController.asks = pendingAsks
                 self.listController.sessions = result
+                if newAsk, self.soundAttention { self.playSound("Ping") }
                 // busy → mascot; alive-but-quiet → nothing (idle, not done);
                 // process exited → done blob (cleared on terminal focus)
                 let claudeLive = result.contains { $0.kind == .claude && $0.anyLive }
@@ -2729,6 +2843,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         versionLbl.textColor = .secondaryLabelColor
         versionLbl.font = .systemFont(ofSize: 11)
 
+        let hookBtn = NSButton(title: hookInstalled() ? L("uninstall_hook") : L("install_hook"),
+                               target: self, action: #selector(toggleHook))
+        hookBtn.bezelStyle = .rounded
+        hookButtonRef = hookBtn
+        let extInjectCheck = NSButton(checkboxWithTitle: L("ext_inject"), target: nil, action: nil)
+        extInjectCheck.state = FileManager.default.fileExists(atPath: configURL("ext-inject").path) ? .on : .off
+        extInjectRef = extInjectCheck
+
         let loginCheck = NSButton(checkboxWithTitle: L("login_item"), target: nil, action: nil)
         if #available(macOS 13.0, *) {
             loginCheck.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -2771,6 +2893,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             row(L("mascots"), [button(L("gif_gallery"), #selector(showGifGallery))]),
             row(L("preview"), [smallLabel("Claude"), MascotBarPreview(kind: .claude),
                                smallLabel("Codex"), MascotBarPreview(kind: .codex)]),
+            row(L("replies_title"), [hookBtn]),
+            row("", [extInjectCheck]),
             row(L("startup"), [loginCheck]),
             row(L("sounds_title"), [soundCol]),
             row(L("project"), [linkBtn, versionLbl]),
@@ -2836,6 +2960,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         writeConfig("term-alpha", String(ta))
         window.alphaValue = CGFloat(pa) / 100
         applyTerminalAlpha(CGFloat(ta) / 100)
+        writeConfig("ext-inject", extInjectRef?.state == .on ? "1" : "")
         if #available(macOS 13.0, *), let check = loginCheckRef, check.isEnabled {
             if check.state == .on {
                 if Bundle.main.bundleIdentifier == nil {
@@ -2865,6 +2990,93 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openProjectPage() {
         NSWorkspace.shared.open(URL(string: projectURL)!)
+    }
+
+    // MARK: - Claude Code hook (reply detection)
+
+    private var hookScriptURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/agent-notch/notch-hook.py")
+    }
+    private var claudeSettingsURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/settings.json")
+    }
+    private var hookCommand: String { "/usr/bin/python3 \(hookScriptURL.path)" }
+
+    private func hookInstalled() -> Bool {
+        guard let data = try? Data(contentsOf: claudeSettingsURL),
+              let json = String(data: data, encoding: .utf8) else { return false }
+        return json.contains("notch-hook.py")
+    }
+
+    @objc private func toggleHook() {
+        hookInstalled() ? uninstallHook() : installHook()
+    }
+
+    private func installHook() {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: asksDir, withIntermediateDirectories: true)
+        // hook script: read the hook JSON on stdin, write an ask file keyed by session
+        let py = """
+        import sys, json, os, time
+        try: d = json.load(sys.stdin)
+        except Exception: sys.exit(0)
+        base = os.path.expanduser('~/.config/agent-notch/asks')
+        os.makedirs(base, exist_ok=True)
+        sid = str(d.get('session_id', 'session'))
+        safe = ''.join(c if c.isalnum() else '_' for c in sid)
+        ev = d.get('hook_event_name', '')
+        path = os.path.join(base, safe + '.json')
+        if ev in ('Stop', 'UserPromptSubmit'):
+            try: os.remove(path)
+            except OSError: pass
+            sys.exit(0)
+        out = {'session_id': sid, 'cwd': d.get('cwd', ''),
+               'message': d.get('message', 'Necesita tu respuesta'), 'time': time.time()}
+        with open(path, 'w') as f: json.dump(out, f)
+        """
+        try? py.write(to: hookScriptURL, atomically: true, encoding: .utf8)
+
+        // merge into ~/.claude/settings.json under hooks.{Notification,Stop,UserPromptSubmit}
+        var root: [String: Any] = [:]
+        if let data = try? Data(contentsOf: claudeSettingsURL),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] { root = obj }
+        var hooks = root["hooks"] as? [String: Any] ?? [:]
+        let entry: [String: Any] = ["hooks": [["type": "command", "command": hookCommand]]]
+        for event in ["Notification", "Stop", "UserPromptSubmit"] {
+            var arr = hooks[event] as? [[String: Any]] ?? []
+            let already = arr.contains { ($0["hooks"] as? [[String: Any]])?.contains { ($0["command"] as? String)?.contains("notch-hook.py") == true } == true }
+            if !already { arr.append(entry) }
+            hooks[event] = arr
+        }
+        root["hooks"] = hooks
+        try? fm.createDirectory(at: claudeSettingsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let data = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted]) {
+            try? data.write(to: claudeSettingsURL)
+        }
+        alert(L("hook_ok"), L("hook_ok_info"))
+        refreshHookButton()
+    }
+
+    private func uninstallHook() {
+        guard let data = try? Data(contentsOf: claudeSettingsURL),
+              var root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var hooks = root["hooks"] as? [String: Any] else { return }
+        for event in ["Notification", "Stop", "UserPromptSubmit"] {
+            guard var arr = hooks[event] as? [[String: Any]] else { continue }
+            arr.removeAll { ($0["hooks"] as? [[String: Any]])?.contains { ($0["command"] as? String)?.contains("notch-hook.py") == true } == true }
+            if arr.isEmpty { hooks.removeValue(forKey: event) } else { hooks[event] = arr }
+        }
+        if hooks.isEmpty { root.removeValue(forKey: "hooks") } else { root["hooks"] = hooks }
+        if let d = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted]) {
+            try? d.write(to: claudeSettingsURL)
+        }
+        alert(L("hook_off"), L("hook_off_info"))
+        refreshHookButton()
+    }
+
+    private weak var hookButtonRef: NSButton?
+    private func refreshHookButton() {
+        hookButtonRef?.title = hookInstalled() ? L("uninstall_hook") : L("install_hook")
     }
 
     @objc private func chooseTermDir() {
@@ -2977,6 +3189,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
 
+
+    // MARK: - Agent asks (hook-driven) + replies
+
+    private var asksDir: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/agent-notch/asks")
+    }
+
+    /// Read pending ask files; attach each session's tty (by cwd) for replies.
+    /// Stale asks (>10 min) are swept so a crashed session doesn't linger.
+    private func loadAsks(ttyByCwd: [String: String]) -> [AgentAsk] {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: asksDir, includingPropertiesForKeys: nil) else { return [] }
+        var out: [AgentAsk] = []
+        for f in files where f.pathExtension == "json" {
+            guard let data = try? Data(contentsOf: f),
+                  let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            let cwd = (o["cwd"] as? String) ?? ""
+            let ts = (o["time"] as? Double) ?? 0
+            let when = ts > 0 ? Date(timeIntervalSince1970: ts) : ((try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? Date())
+            if Date().timeIntervalSince(when) > 600 { try? fm.removeItem(at: f); continue }
+            out.append(AgentAsk(sessionID: (o["session_id"] as? String) ?? f.lastPathComponent,
+                                message: (o["message"] as? String) ?? L("asking"),
+                                cwd: cwd, tty: ttyByCwd[cwd] ?? "", time: when))
+        }
+        return out.sorted { $0.time > $1.time }
+    }
+
+    /// Reply to an agent's question. The notch's own terminal is written to
+    /// directly (safe, exact). External terminals fall back to Accessibility
+    /// keystroke injection into the frontmost app (opt-in) — there is no safe
+    /// targeted path since macOS blocks TIOCSTI.
+    private func replyToAsk(_ ask: AgentAsk, text: String) {
+        clearAsk(ask)
+        // 1) notch terminal pane whose shell cwd matches → direct + exact
+        if let term = termViews.first(where: { ($0.process?.shellPid).flatMap(pidCwd) == ask.cwd }) ?? focusedTerminal,
+           termWindow?.isVisible == true, !ask.cwd.isEmpty,
+           termViews.contains(where: { ($0.process?.shellPid).flatMap(pidCwd) == ask.cwd }) {
+            term.send(txt: text + "\r")
+            return
+        }
+        // 2) external terminal → Accessibility keystroke injection (opt-in)
+        guard FileManager.default.fileExists(atPath: configURL("ext-inject").path) else {
+            alert(L("ext_inject"), L("ext_inject_info"))
+            return
+        }
+        injectKeystrokes(text + "\r")
+    }
+
+    private func clearAsk(_ ask: AgentAsk) {
+        asks.removeAll { $0.sessionID == ask.sessionID }
+        listController.asks = asks
+        let safe = ask.sessionID.replacingOccurrences(of: "/", with: "_")
+        try? FileManager.default.removeItem(at: asksDir.appendingPathComponent("\(safe).json"))
+    }
+
+    /// Post a string as keystrokes to the frontmost app (Accessibility).
+    private func injectKeystrokes(_ s: String) {
+        guard let src = CGEventSource(stateID: .combinedSessionState) else { return }
+        for ch in s.unicodeScalars {
+            for down in [true, false] {
+                let e = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: down)
+                var u = UniChar(ch.value <= 0xFFFF ? ch.value : 0x0020)
+                if ch == "\r" || ch == "\n" {
+                    // send Return as the real key so the shell/TUI accepts it
+                    let ret = CGEvent(keyboardEventSource: src, virtualKey: 0x24, keyDown: down)
+                    ret?.post(tap: .cghidEventTap)
+                    continue
+                }
+                e?.keyboardSetUnicodeString(stringLength: 1, unicodeString: &u)
+                e?.post(tap: .cghidEventTap)
+            }
+        }
+    }
+
+    private func focusTerminalFor(_ ask: AgentAsk) {
+        // notch terminal: just show it. external: nothing reliable to focus,
+        // so surface the cwd so the user knows which window to click.
+        if termWindow != nil { toggleTerminal(); return }
+        NSApp.activate(ignoringOtherApps: true)
+    }
 
     @objc private func confirmQuit() {
         NSApp.activate(ignoringOtherApps: true)
