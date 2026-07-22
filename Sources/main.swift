@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.11"
+let appVersion = "2.9.12"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -67,6 +67,10 @@ enum L10n {
                           "El notch ya no será avisado de las preguntas de los agentes."],
         "ext_inject": ["Reply to external terminals (needs Accessibility)",
                        "Responder a terminales externas (requiere Accesibilidad)"],
+        "cant_reply": ["Can't reply to this session", "No se puede responder a esta sesión"],
+        "cant_reply_info": [
+            "This agent runs in an EXTERNAL terminal (Warp, Ghostty, iTerm…). To reply from the notch, either: (1) run `claude` inside the notch terminal (⌃⌥Space) — replies go straight to it; or (2) turn on \"Reply to external terminals\" in Settings and grant Accessibility permission.",
+            "Este agente corre en una terminal EXTERNA (Warp, Ghostty, iTerm…). Para responder desde el notch: (1) corré `claude` dentro de la terminal del notch (⌃⌥Espacio) — la respuesta va directo; o (2) activá \"Responder a terminales externas\" en la Configuración y otorgá permiso de Accesibilidad."],
         "ext_inject_info": ["This reply targets a terminal outside the notch. Enable \"Reply to external terminals\" in settings and grant Accessibility — note keystrokes go to the focused window.",
                             "Esta respuesta va a una terminal fuera del notch. Activá \"Responder a terminales externas\" en la configuración y otorgá Accesibilidad — ojo que las teclas van a la ventana enfocada."],
         "shortcut_hint": ["Every shortcut below is configurable (⌘-keys work inside the terminal).",
@@ -941,7 +945,7 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     }
 
     var contentHeight: CGFloat {
-        stack.fittingSize.height
+        askStack.fittingSize.height + sessionStack.fittingSize.height + 30
     }
 
     /// One session = one card: mascot, agent + project, model + age, the
@@ -2074,6 +2078,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         L10n.refresh()
         readSoundPrefs()
         readZoomPref()
+        refreshHookScriptIfNeeded()  // apply hook-script fixes without re-toggling
 
         // Panel window: full-width, mouse-transparent unless expanded
         window = KeyableWindow(contentRect: collapsedFrame(), styleMask: .borderless, backing: .buffered, defer: false)
@@ -3088,38 +3093,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hookInstalled() ? uninstallHook() : installHook()
     }
 
+    /// The hook script — read the hook JSON on stdin, write/clear an ask file.
+    /// Bump the leading VERSION comment whenever this changes so the app knows
+    /// to rewrite an out-of-date copy on launch.
+    private static let notchHookScript = """
+    # notch-hook v3
+    import sys, json, os, time
+    try: d = json.load(sys.stdin)
+    except Exception: sys.exit(0)
+    base = os.path.expanduser('~/.config/agent-notch/asks')
+    os.makedirs(base, exist_ok=True)
+    sid = str(d.get('session_id', 'session'))
+    safe = ''.join(c if c.isalnum() else '_' for c in sid)
+    ev = d.get('hook_event_name', '')
+    path = os.path.join(base, safe + '.json')
+    # Stop (turn ended) and UserPromptSubmit (user answered) both CLEAR the ask.
+    # We do NOT create an ask on Stop -- that fired on every completion.
+    if ev in ('Stop', 'UserPromptSubmit'):
+        try: os.remove(path)
+        except OSError: pass
+        sys.exit(0)
+    # Only a PERMISSION Notification creates an ask. Claude Code also sends an
+    # idle Notification ("waiting for your input") after 60s idle -- skip it.
+    if ev != 'Notification': sys.exit(0)
+    msg = (d.get('message') or 'Necesita tu respuesta').strip().replace(chr(10), ' ')[:300]
+    low = msg.lower()
+    if 'waiting for your input' in low or 'esperando tu' in low or 'is waiting' in low:
+        sys.exit(0)
+    out = {'session_id': sid, 'cwd': d.get('cwd', ''), 'message': msg, 'time': time.time()}
+    with open(path, 'w') as f: json.dump(out, f)
+    """
+
+    /// Keep the on-disk hook script current. The install button only ran once,
+    /// so script fixes never reached users who'd already installed — now the
+    /// app refreshes it on every launch when the hook is present.
+    private func refreshHookScriptIfNeeded() {
+        guard hookInstalled() else { return }
+        let onDisk = try? String(contentsOf: hookScriptURL, encoding: .utf8)
+        if onDisk?.contains("# notch-hook v3") != true {
+            try? Self.notchHookScript.write(to: hookScriptURL, atomically: true, encoding: .utf8)
+        }
+    }
+
     private func installHook() {
         let fm = FileManager.default
         try? fm.createDirectory(at: asksDir, withIntermediateDirectories: true)
-        // hook script: read the hook JSON on stdin, write an ask file keyed by session
-        let py = """
-        import sys, json, os, time
-        try: d = json.load(sys.stdin)
-        except Exception: sys.exit(0)
-        base = os.path.expanduser('~/.config/agent-notch/asks')
-        os.makedirs(base, exist_ok=True)
-        sid = str(d.get('session_id', 'session'))
-        safe = ''.join(c if c.isalnum() else '_' for c in sid)
-        ev = d.get('hook_event_name', '')
-        path = os.path.join(base, safe + '.json')
-        # Stop (turn ended) and UserPromptSubmit (user answered) both CLEAR the
-        # ask. We do NOT create an ask on Stop -- that fired on every single
-        # completion and showed a card when Claude wasn't actually waiting.
-        if ev in ('Stop', 'UserPromptSubmit'):
-            try: os.remove(path)
-            except OSError: pass
-            sys.exit(0)
-        # Only Notification creates an ask -- and only the PERMISSION kind.
-        # Claude Code also sends an idle Notification ("waiting for your input")
-        # after 60s of an idle prompt; that is NOT a real question, so skip it.
-        if ev != 'Notification': sys.exit(0)
-        msg = (d.get('message') or 'Necesita tu respuesta').strip().replace(chr(10), ' ')[:300]
-        if 'waiting for your input' in msg.lower() or 'esperando' in msg.lower():
-            sys.exit(0)
-        out = {'session_id': sid, 'cwd': d.get('cwd', ''), 'message': msg, 'time': time.time()}
-        with open(path, 'w') as f: json.dump(out, f)
-        """
-        try? py.write(to: hookScriptURL, atomically: true, encoding: .utf8)
+        try? Self.notchHookScript.write(to: hookScriptURL, atomically: true, encoding: .utf8)
 
         // merge into ~/.claude/settings.json under hooks.{Notification,Stop,UserPromptSubmit}
         var root: [String: Any] = [:]
@@ -3306,20 +3325,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// keystroke injection into the frontmost app (opt-in) — there is no safe
     /// targeted path since macOS blocks TIOCSTI.
     private func replyToAsk(_ ask: AgentAsk, text: String) {
-        clearAsk(ask)
-        // 1) notch terminal pane whose shell cwd matches → direct + exact
-        if let term = termViews.first(where: { ($0.process?.shellPid).flatMap(pidCwd) == ask.cwd }) ?? focusedTerminal,
-           termWindow?.isVisible == true, !ask.cwd.isEmpty,
-           termViews.contains(where: { ($0.process?.shellPid).flatMap(pidCwd) == ask.cwd }) {
+        // 1) session running INSIDE a notch terminal pane → write to its shell
+        // directly (exact, no permissions). Only clear on successful delivery.
+        if let term = termViews.first(where: { ($0.process?.shellPid).flatMap(pidCwd) == ask.cwd }),
+           termWindow?.isVisible == true, !ask.cwd.isEmpty {
             term.send(txt: text + "\r")
+            clearAsk(ask)
             return
         }
-        // 2) external terminal → Accessibility keystroke injection (opt-in)
-        guard FileManager.default.fileExists(atPath: configURL("ext-inject").path) else {
-            alert(L("ext_inject"), L("ext_inject_info"))
+        // 2) external terminal (Warp, Ghostty…) → Accessibility keystroke
+        // injection into the FOCUSED window. Only if the user opted in.
+        if FileManager.default.fileExists(atPath: configURL("ext-inject").path) {
+            injectKeystrokes(text + "\r")
+            clearAsk(ask)
             return
         }
-        injectKeystrokes(text + "\r")
+        // can't deliver: tell the user exactly why, and DON'T clear the card
+        alert(L("cant_reply"), L("cant_reply_info"))
     }
 
     private func clearAsk(_ ask: AgentAsk) {
