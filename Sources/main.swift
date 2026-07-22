@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.3"
+let appVersion = "2.9.4"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -56,6 +56,9 @@ enum L10n {
         "install_hook": ["Enable notch replies (install hook)", "Activar respuestas del notch (instalar hook)"],
         "uninstall_hook": ["Disable notch replies (remove hook)", "Desactivar respuestas del notch (quitar hook)"],
         "replies_title": ["Reply from the notch:", "Responder desde el notch:"],
+        "replies_help": [
+            "After enabling, RESTART each Claude/Codex session (close & reopen the terminal) so it loads the hook — already-running sessions won't pick it up. Then, when an agent asks something, a card appears here; click it and type your answer. Replies to sessions run inside the notch terminal (⌥Space) work instantly; external terminals (Warp, Ghostty…) also need the checkbox below + Accessibility permission.",
+            "Después de activarlo, REINICIÁ cada sesión de Claude/Codex (cerrá y volvé a abrir la terminal) para que cargue el hook — las sesiones ya abiertas no lo toman. Después, cuando un agente pregunte algo, aparece una tarjeta acá; hacé clic y escribí tu respuesta. Responder a sesiones abiertas dentro de la terminal del notch (⌥Espacio) funciona al instante; para terminales externas (Warp, Ghostty…) además hace falta la casilla de abajo + permiso de Accesibilidad."],
         "hook_ok": ["Hook installed", "Hook instalado"],
         "hook_ok_info": ["Claude Code will now notify the notch when an agent asks for input. Restart running Claude sessions to pick it up.",
                          "Claude Code ahora avisará al notch cuando un agente pida datos. Reiniciá las sesiones de Claude abiertas para que lo tomen."],
@@ -1236,6 +1239,12 @@ final class IndicatorView: NSView {
     }
 }
 
+/// Borderless window that can still take keyboard focus, so the reply field
+/// in an ask card actually accepts typing (plain borderless windows can't).
+final class KeyableWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+}
+
 /// Borderless panel that can take keyboard focus (for the notch terminal).
 /// Handles its own ⌘-keys via performKeyEquivalent so they work whenever the
 /// panel is key — unlike a local event monitor, which needs the whole app to
@@ -2030,7 +2039,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         readZoomPref()
 
         // Panel window: full-width, mouse-transparent unless expanded
-        window = NSWindow(contentRect: collapsedFrame(), styleMask: .borderless, backing: .buffered, defer: false)
+        window = KeyableWindow(contentRect: collapsedFrame(), styleMask: .borderless, backing: .buffered, defer: false)
         window.isOpaque = false
         window.backgroundColor = .clear
         window.hasShadow = false
@@ -2210,6 +2219,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.setFrame(expandedFrame(), display: true)
             indicatorWindow.orderOut(nil)  // spinner hides while the panel is open
             animatePanelLayer(open: true)
+            // click/hotkey opens take keyboard focus so the reply field is
+            // typeable; hover-opens stay passive (they'd steal focus otherwise)
+            if !hoverOpened {
+                NSApp.activate(ignoringOtherApps: true)
+                window.makeKeyAndOrderFront(nil)
+            }
         } else {
             indicatorWindow.orderFrontRegardless()  // back immediately — never leave a dead zone
             window.ignoresMouseEvents = true
@@ -2831,6 +2846,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let extInjectCheck = NSButton(checkboxWithTitle: L("ext_inject"), target: nil, action: nil)
         extInjectCheck.state = FileManager.default.fileExists(atPath: configURL("ext-inject").path) ? .on : .off
         extInjectRef = extInjectCheck
+        let repliesHelp = NSTextField(wrappingLabelWithString: L("replies_help"))
+        repliesHelp.font = .systemFont(ofSize: 10)
+        repliesHelp.textColor = .secondaryLabelColor
+        repliesHelp.preferredMaxLayoutWidth = 560
+        repliesHelp.maximumNumberOfLines = 6
 
         let loginCheck = NSButton(checkboxWithTitle: L("login_item"), target: nil, action: nil)
         if #available(macOS 13.0, *) {
@@ -2875,6 +2895,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             row(L("preview"), [smallLabel("Claude"), MascotBarPreview(kind: .claude),
                                smallLabel("Codex"), MascotBarPreview(kind: .codex)]),
             row(L("replies_title"), [hookBtn]),
+            repliesHelp,
             row("", [extInjectCheck]),
             row(L("startup"), [loginCheck]),
             row(L("sounds_title"), [soundCol]),
@@ -3007,12 +3028,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         safe = ''.join(c if c.isalnum() else '_' for c in sid)
         ev = d.get('hook_event_name', '')
         path = os.path.join(base, safe + '.json')
-        if ev in ('Stop', 'UserPromptSubmit'):
+        # user answered -> clear the pending ask
+        if ev == 'UserPromptSubmit':
             try: os.remove(path)
             except OSError: pass
             sys.exit(0)
-        out = {'session_id': sid, 'cwd': d.get('cwd', ''),
-               'message': d.get('message', 'Necesita tu respuesta'), 'time': time.time()}
+        msg = d.get('message', '')
+        # Stop = turn ended and Claude is now waiting for you; pull its last
+        # text (often the question/plan) from the transcript as the message
+        if ev == 'Stop':
+            tp = d.get('transcript_path', '')
+            last = ''
+            try:
+                with open(os.path.expanduser(tp)) as f:
+                    for line in f:
+                        try: o = json.loads(line)
+                        except Exception: continue
+                        if o.get('type') != 'assistant': continue
+                        c = o.get('message', {}).get('content')
+                        if isinstance(c, str): last = c
+                        elif isinstance(c, list):
+                            for p in c:
+                                if p.get('type') == 'text' and p.get('text'): last = p['text']
+            except Exception: pass
+            msg = (last or 'Terminó y espera tu respuesta').strip().replace(chr(10), ' ')[:300]
+        if not msg: msg = 'Necesita tu respuesta'
+        out = {'session_id': sid, 'cwd': d.get('cwd', ''), 'message': msg, 'time': time.time()}
         with open(path, 'w') as f: json.dump(out, f)
         """
         try? py.write(to: hookScriptURL, atomically: true, encoding: .utf8)
