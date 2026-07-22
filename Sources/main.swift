@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.2"
+let appVersion = "2.9.3"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -1509,19 +1509,11 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
         pathLabel.lineBreakMode = .byTruncatingHead
         pathLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        // file list
+        // file list: a single icon+name column, no header — a clean list
         let cName = NSTableColumn(identifier: .init("name"))
-        cName.title = L("col_name")
-        cName.width = 190
-        let cDate = NSTableColumn(identifier: .init("date"))
-        cDate.title = L("col_modified")
-        cDate.width = 110
-        let cSize = NSTableColumn(identifier: .init("size"))
-        cSize.title = L("col_size")
-        cSize.width = 64
+        cName.width = 300
         table.addTableColumn(cName)
-        table.addTableColumn(cDate)
-        table.addTableColumn(cSize)
+        table.headerView = nil
         table.backgroundColor = .black
         table.rowHeight = 22
         table.style = .plain
