@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.7"
+let appVersion = "2.9.8"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -814,7 +814,7 @@ final class SessionListController: NSViewController {
                         lines: 3)
         msg.preferredMaxLayoutWidth = contentWidth - 28
 
-        let field = NSTextField(string: "")
+        let field = FirstMouseTextField(string: "")
         field.placeholderString = L("reply_ph")
         field.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         field.target = self
@@ -1243,6 +1243,13 @@ final class IndicatorView: NSView {
 /// in an ask card actually accepts typing (plain borderless windows can't).
 final class KeyableWindow: NSWindow {
     override var canBecomeKey: Bool { true }
+}
+
+/// Text field that places the cursor on the FIRST click even when its window
+/// isn't key yet — without this the first click only activates the window and
+/// you have to click twice to start typing.
+final class FirstMouseTextField: NSTextField {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
 /// Borderless panel that can take keyboard focus (for the notch terminal).
@@ -3329,10 +3336,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         a.addButton(withTitle: L("quit"))
         a.addButton(withTitle: L("cancel"))
         a.alertStyle = .warning
-        // the notch/terminal float above statusBar level, so lift the alert
-        // above them or it opens buried and unclickable
-        a.window.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 5)
-        a.window.orderFrontRegardless()
+        // NSAlert.runModal resets its own window level, so raising the alert
+        // isn't enough — temporarily drop the notch/terminal below it, then
+        // restore. Guarantees the dialog is on top and clickable.
+        let saved: [(NSWindow, NSWindow.Level)] = [window, indicatorWindow, termWindow]
+            .compactMap { $0 }.map { ($0, $0.level) }
+        saved.forEach { $0.0.level = .normal }
+        defer { saved.forEach { $0.0.level = $0.1 } }
         if a.runModal() == .alertFirstButtonReturn { NSApp.terminate(nil) }
     }
 
@@ -3346,9 +3356,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             a.beginSheetModal(for: host, completionHandler: nil)
         } else {
             NSApp.activate(ignoringOtherApps: true)
-            a.window.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 5)
-            a.window.orderFrontRegardless()
+            let saved: [(NSWindow, NSWindow.Level)] = [window, indicatorWindow, termWindow]
+                .compactMap { $0 }.map { ($0, $0.level) }
+            saved.forEach { $0.0.level = .normal }
             a.runModal()
+            saved.forEach { $0.0.level = $0.1 }
         }
     }
 
