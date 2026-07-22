@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.0"
+let appVersion = "2.9.1"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -3285,7 +3285,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let a = NSAlert()
         a.messageText = msg
         a.informativeText = info
-        a.runModal()
+        // the settings/gallery windows float above statusBar level, so a plain
+        // modal alert opens behind them — attach it as a sheet instead
+        if let host = [settingsWindow, galleryWindow].compactMap({ $0 }).first(where: { $0.isVisible }) {
+            a.beginSheetModal(for: host, completionHandler: nil)
+        } else {
+            a.runModal()
+        }
     }
 
     // MARK: - Animated emoji mascots (Noto Animated Emoji — keyless CDN)
