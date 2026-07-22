@@ -1,6 +1,6 @@
 # Agent Notch Plus
 
-Your AI agents, living next to the MacBook notch. **v2.5.4**
+Your AI agents, living next to the MacBook notch. **v2.6.0**
 
 > Fork of [realfishsam/agent-notch](https://github.com/realfishsam/agent-notch) — all credit for the original concept, design and implementation goes to its author. This fork adds a global keyboard shortcut, hover-to-open, and a settings panel with custom animated-GIF mascots. See [What this fork adds](#what-this-fork-adds).
 
@@ -39,6 +39,7 @@ The collapsed window is transparent and fully click-through except the tiny indi
 - **Settings panel** — right-click the indicator (or the open panel) → *Configuración…*:
   - pick the Codex pet from a dropdown (no more editing config files by hand)
   - set a **custom animated GIF** per agent that replaces its mascot in the notch and in the panel rows — transparent-background GIFs look best on the black bar
+- **Card-style control-center panel** — each session is a card with mascot, agent + project, model + age, your prompt and a colored status line (green = working, orange = waiting for you, done ✓); the active card gets an accent border. A header bar adds quick settings/terminal buttons and a sessions summary.
 - **Hover zoom** — while the panel is open, hovering it grows it by a configurable percentage (default 25%); the font size stays the same but snippets wrap into 2-3 real lines filling the extra width, so you read *more* text. It shrinks back when the mouse leaves.
 - **Every shortcut is configurable** — panel hotkey, terminal hotkey, and the in-terminal ⌘-keys for split / files pane / quick-folders pane.
 - **Quick-folders pane syncs with the shell both ways** — navigating the pane `cd`s the terminal, and typing `cd` in the terminal moves the pane (the shell's real cwd is read from the kernel ~1×/s); a ".." row at the top goes up.

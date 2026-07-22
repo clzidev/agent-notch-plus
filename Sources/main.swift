@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.5.4"
+let appVersion = "2.6.0"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 // MARK: - Localization
@@ -30,6 +30,11 @@ enum L10n {
         "settings": ["Settings…", "Configuración…"],
         "quit": ["Quit Agent Notch", "Salir de Agent Notch"],
         "no_sessions": ["No recent agent sessions", "Sin sesiones recientes de agentes"],
+        "sessions": ["sessions", "sesiones"],
+        "active": ["active", "activas"],
+        "st_working": ["Working…", "Trabajando…"],
+        "st_waiting": ["Waiting for you", "Esperando tu respuesta"],
+        "st_done": ["Done ✓", "Terminado ✓"],
         "shortcut_hint": ["Every shortcut below is configurable (⌘-keys work inside the terminal).",
                           "Todos los atajos de abajo son configurables (las teclas ⌘ funcionan dentro de la terminal)."],
         "panel_hotkey": ["Panel shortcut:", "Atajo del panel:"],
@@ -659,6 +664,8 @@ final class SessionListController: NSViewController {
     // leaving dead black space on the right
     var contentWidth: CGFloat = 480 { didSet { if contentWidth != oldValue { rebuild() } } }
     var onLayoutChange: (() -> Void)?
+    var onSettings: (() -> Void)?
+    var onTerminal: (() -> Void)?
     private let stack = NSStackView()
     private var icons: [DitherIconView] = []
     private var animTimer: Timer?
@@ -668,8 +675,8 @@ final class SessionListController: NSViewController {
         let v = NSView()
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 4
-        stack.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
+        stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 12, right: 12)
         stack.translatesAutoresizingMaskIntoConstraints = false
         v.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -684,17 +691,12 @@ final class SessionListController: NSViewController {
     private func rebuild() {
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         icons.removeAll()
+        stack.addArrangedSubview(headerBar())
         if sessions.isEmpty {
             stack.addArrangedSubview(label(L("no_sessions"), size: 12, color: .secondaryLabelColor, bold: false))
             return
         }
-        for (i, s) in sessions.prefix(6).enumerated() {
-            if i > 0 {
-                let sep = DitherSeparator()
-                sep.translatesAutoresizingMaskIntoConstraints = false
-                stack.addArrangedSubview(sep)
-                sep.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -24).isActive = true
-            }
+        for s in sessions.prefix(6) {
             stack.addArrangedSubview(row(for: s))
             if !s.children.isEmpty {
                 let open = expandedIDs.contains(s.id)
@@ -723,6 +725,30 @@ final class SessionListController: NSViewController {
             }
         }
     }
+
+    /// Top bar of the panel: quick actions on the left, session summary on
+    /// the right — the panel is a small control center now, not just a list.
+    private func headerBar() -> NSView {
+        func hbtn(_ title: String, _ action: Selector) -> NSButton {
+            let b = NSButton(title: title, target: self, action: action)
+            b.isBordered = false
+            b.contentTintColor = .secondaryLabelColor
+            b.font = .systemFont(ofSize: 15)
+            return b
+        }
+        let busy = sessions.filter { $0.anyBusy }.count
+        let summary = label("\(sessions.count) \(L("sessions")) · \(busy) \(L("active"))",
+                            size: 10, color: .secondaryLabelColor, bold: false)
+        let bar = NSStackView(views: [hbtn("⚙︎", #selector(hdrSettings)), hbtn("⌨︎", #selector(hdrTerminal)),
+                                      NSView(), summary])
+        bar.orientation = .horizontal
+        bar.spacing = 12
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        bar.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
+        return bar
+    }
+    @objc private func hdrSettings() { onSettings?() }
+    @objc private func hdrTerminal() { onTerminal?() }
 
     @objc private func toggleChildren(_ sender: NSButton) {
         guard let id = sender.identifier?.rawValue else { return }
@@ -770,45 +796,70 @@ final class SessionListController: NSViewController {
         stack.fittingSize.height
     }
 
+    /// One session = one card: mascot, agent + project, model + age, the
+    /// prompt/snippet, and a colored status line. The active session's card
+    /// gets a warm highlighted border, vibe-island style.
     private func row(for s: AgentSession) -> NSView {
         let icon = DitherIconView()
         icon.running = s.anyBusy
         icon.idle = s.anyLive && !s.anyBusy
         icon.kind = s.kind
         icon.translatesAutoresizingMaskIntoConstraints = false
-        icon.widthAnchor.constraint(equalToConstant: 16).isActive = true
+        icon.widthAnchor.constraint(equalToConstant: 18).isActive = true
         icon.heightAnchor.constraint(equalToConstant: 16).isActive = true
         icons.append(icon)
         let title = label(s.kind.rawValue, size: 12, color: .labelColor, bold: true)
-        let tag = label("\(s.model.isEmpty ? s.title : s.model) · \(relative(s.lastModified))", size: 10,
-                        color: (s.anyBusy ? NSColor.systemBlue : s.anyLive ? .secondaryLabelColor : .systemGreen).withAlphaComponent(0.75), bold: false)
+        let proj = label("· \(s.title)", size: 11, color: .secondaryLabelColor, bold: false)
+        let tag = label("\(s.model.isEmpty ? "" : s.model + " · ")\(relative(s.effectiveLastModified))",
+                        size: 10, color: .secondaryLabelColor, bold: false)
         tag.setContentCompressionResistancePriority(.required, for: .horizontal)
-        let top = NSStackView(views: [icon, title, NSView(), tag])
+        let top = NSStackView(views: [icon, title, proj, NSView(), tag])
         top.orientation = .horizontal
+        top.spacing = 5
         top.translatesAutoresizingMaskIntoConstraints = false
 
         var views: [NSView] = [top]
         let line = s.prompt.isEmpty ? s.snippet : L("you") + s.prompt
+        let w = contentWidth - 28
         if !line.isEmpty {
-            let snippet = label(line, size: 11, color: .secondaryLabelColor, bold: false,
+            let snippet = label(line, size: 11, color: NSColor(white: 0.8, alpha: 1), bold: false,
                                 lines: zoomFactor >= 1.5 ? 4 : zoomFactor > 1 ? 3 : 1)
-            let w = contentWidth - 8
             snippet.preferredMaxLayoutWidth = w
-            // exact width: the text block always spans the panel instead of
+            // exact width: the text block always spans the card instead of
             // drifting as Auto Layout re-solves during the zoom animation
             snippet.widthAnchor.constraint(equalToConstant: w).isActive = true
             views.append(snippet)
         }
+        let status: (String, NSColor) = s.anyBusy ? (L("st_working"), .systemGreen)
+            : s.anyLive ? (L("st_waiting"), .systemOrange)
+            : (L("st_done"), NSColor.systemGreen.withAlphaComponent(0.75))
+        views.append(label(status.0, size: 10, color: status.1, bold: true))
+
         let col = NSStackView(views: views)
         col.orientation = .vertical
         col.alignment = .leading
-        col.spacing = 1
-        col.edgeInsets = NSEdgeInsets(top: 4, left: 4, bottom: 4, right: 4)
-        // fixed row width: the right-side tag stays glued to the edge instead
-        // of jumping when snippets appear or the width changes
-        col.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
-        top.widthAnchor.constraint(equalTo: col.widthAnchor, constant: -8).isActive = true
-        return col
+        col.spacing = 3
+        col.translatesAutoresizingMaskIntoConstraints = false
+        top.widthAnchor.constraint(equalTo: col.widthAnchor).isActive = true
+
+        let card = NSView()
+        card.wantsLayer = true
+        card.layer?.backgroundColor = NSColor(white: 0.09, alpha: 1).cgColor
+        card.layer?.cornerRadius = 10
+        card.layer?.borderWidth = 1
+        let accent = s.kind == .claude ? IndicatorView.claudeOrange : IndicatorView.codexTeal
+        card.layer?.borderColor = (s.anyBusy ? accent.withAlphaComponent(0.55)
+                                             : NSColor(white: 0.2, alpha: 1)).cgColor
+        card.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(col)
+        NSLayoutConstraint.activate([
+            col.topAnchor.constraint(equalTo: card.topAnchor, constant: 8),
+            col.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -8),
+            col.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 10),
+            col.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -10),
+            card.widthAnchor.constraint(equalToConstant: contentWidth),
+        ])
+        return card
     }
 
     private func label(_ text: String, size: CGFloat, color: NSColor, bold: Bool, lines: Int = 1) -> NSTextField {
@@ -1816,7 +1867,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return 30
     }
     private let sidePad: CGFloat = 120  // indicator strip beside the notch
-    private let expandedSize = NSSize(width: 480, height: 240)
+    private let expandedSize = NSSize(width: 560, height: 260)
 
     // In a fullscreen space the menu bar is hidden, so the bar can own the whole top edge
     private var isFullscreenSpace: Bool {
@@ -1888,6 +1939,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         notchView.onSettings = { [weak self] in self?.showSettings() }
         notchView.onTerminal = { [weak self] in self?.toggleTerminal() }
+        listController.onSettings = { [weak self] in self?.showSettings() }
+        listController.onTerminal = { [weak self] in self?.toggleTerminal() }
 
         // Global hotkey ⌃⌥N toggles the panel. Carbon RegisterEventHotKey works
         // without Accessibility/Input-Monitoring permission, unlike key monitors.
