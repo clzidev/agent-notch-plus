@@ -1,6 +1,6 @@
 # Agent Notch Plus
 
-Your AI agents, living next to the MacBook notch. **v2.9.4**
+Your AI agents, living next to the MacBook notch. **v2.9.5**
 
 > Fork of [realfishsam/agent-notch](https://github.com/realfishsam/agent-notch) — all credit for the original concept, design and implementation goes to its author. This fork adds a global keyboard shortcut, hover-to-open, and a settings panel with custom animated-GIF mascots. See [What this fork adds](#what-this-fork-adds).
 

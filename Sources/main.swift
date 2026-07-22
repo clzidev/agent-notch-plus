@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.4"
+let appVersion = "2.9.5"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -2409,7 +2409,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             } else { hoverTicks = 0 }
         } else if hoverOpened {
-            if !window.frame.insetBy(dx: -24, dy: -24).contains(loc) {
+            // a pending question pins the panel open (and gives it keyboard
+            // focus) so you can click the reply field and type without it
+            // vanishing from under the cursor
+            if !asks.isEmpty {
+                hoverOpened = false
+                if !window.isKeyWindow {
+                    NSApp.activate(ignoringOtherApps: true)
+                    window.makeKeyAndOrderFront(nil)
+                }
+            } else if !window.frame.insetBy(dx: -24, dy: -24).contains(loc) {
                 hoverOpened = false
                 setExpanded(false)
             } else {
@@ -2418,6 +2427,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             // sticky opens (click/hotkey): hovering grows the panel
             setZoomed(window.frame.contains(loc))
+            if !asks.isEmpty, !window.isKeyWindow {
+                NSApp.activate(ignoringOtherApps: true)
+                window.makeKeyAndOrderFront(nil)
+            }
         }
     }
 
