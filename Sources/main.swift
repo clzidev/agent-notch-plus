@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.5"
+let appVersion = "2.9.6"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -2145,11 +2145,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // global monitors don't see clicks in our own windows — this local
         // monitor closes the panel when a click lands on the terminal,
-        // settings or gallery windows
+        // settings or gallery windows. Use GEOMETRY, not window identity: a
+        // first click on the not-yet-key notch window arrives with e.window
+        // == nil, which used to read as "outside" and dismiss the panel just
+        // as the user reached for the reply field.
         NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] e in
-            if let self, self.expanded, e.window !== self.window {
-                self.setExpanded(false)
+            guard let self, self.expanded else { return e }
+            if e.window === self.window { return e }
+            let loc = NSEvent.mouseLocation
+            if self.window.frame.contains(loc) {
+                // click is inside the panel though the window wasn't key yet —
+                // take focus so the reply field is typeable, and keep it open
+                if !self.window.isKeyWindow {
+                    NSApp.activate(ignoringOtherApps: true)
+                    self.window.makeKeyAndOrderFront(nil)
+                }
+                return e
             }
+            self.setExpanded(false)
             return e
         }
         window.orderFrontRegardless()
