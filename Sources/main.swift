@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.10"
+let appVersion = "2.9.11"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -705,31 +705,39 @@ final class DitherSeparator: NSView {
 // MARK: - Session list popover
 
 final class SessionListController: NSViewController, NSTextFieldDelegate {
-    var sessions: [AgentSession] = [] { didSet { rebuild() } }
+    var sessions: [AgentSession] = [] { didSet { rebuildSessions() } }
     // hover zoom: snippets get extra lines (same font size), so the bigger
     // panel shows MORE text, not bigger text
-    var zoomFactor: CGFloat = 1 { didSet { if zoomFactor != oldValue { rebuild() } } }
+    var zoomFactor: CGFloat = 1 { didSet { if zoomFactor != oldValue { rebuildAll() } } }
     // actual panel content width — text stretches to fill it instead of
     // leaving dead black space on the right
-    var contentWidth: CGFloat = 480 { didSet { if contentWidth != oldValue { rebuild() } } }
+    var contentWidth: CGFloat = 480 { didSet { if contentWidth != oldValue { rebuildAll() } } }
     var onLayoutChange: (() -> Void)?
     var onSettings: (() -> Void)?
     var onTerminal: (() -> Void)?
-    var asks: [AgentAsk] = [] { didSet { rebuild() } }
+    var asks: [AgentAsk] = [] { didSet { rebuildAsks() } }
     var onReply: ((AgentAsk, String) -> Void)?
     var onFocusAsk: ((AgentAsk) -> Void)?
-    private let stack = NSStackView()
+    // ask cards live in their OWN stack, rebuilt only when the ask set changes;
+    // the session rows refresh every poll WITHOUT touching the reply field, so
+    // typing is never interrupted
+    private let askStack = NSStackView()
+    private let sessionStack = NSStackView()
     private var icons: [DitherIconView] = []
     private var animTimer: Timer?
     private var expandedIDs = Set<String>()
+    private var lastAskSignature = ""
 
     override func loadView() {
         let v = NSView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 8
+        let stack = NSStackView(views: [askStack, sessionStack])
+        for s in [stack, askStack, sessionStack] {
+            s.orientation = .vertical
+            s.alignment = .leading
+            s.spacing = 8
+            s.translatesAutoresizingMaskIntoConstraints = false
+        }
         stack.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 12, right: 12)
-        stack.translatesAutoresizingMaskIntoConstraints = false
         v.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: v.topAnchor),
@@ -741,22 +749,29 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     }
 
     private var isEditingReply = false
-    private var rebuildPending = false
-    private func rebuild() {
-        // never tear the panel down while the user is typing a reply — the
-        // 3 s poll would otherwise destroy the field mid-message, dropping the
-        // text and the focus (Enter then landed on a dead field)
-        if isEditingReply { rebuildPending = true; return }
-        stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+    private func rebuildAll() { rebuildAsks(force: true); rebuildSessions() }
+
+    /// Ask cards (with the reply field). Rebuilt only when the ask set really
+    /// changes, and never while you're typing — so the field is stable.
+    private func rebuildAsks(force: Bool = false) {
+        let sig = asks.map { "\($0.sessionID)|\($0.message)" }.joined(separator: "~")
+        if !force, sig == lastAskSignature { return }
+        if isEditingReply { return }  // defer; controlTextDidEndEditing re-runs
+        lastAskSignature = sig
+        askStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        for ask in asks.prefix(3) { askStack.addArrangedSubview(askCard(ask)) }
+    }
+
+    private func rebuildSessions() {
+        sessionStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         icons.removeAll()
-        stack.addArrangedSubview(headerBar())
-        for ask in asks.prefix(3) { stack.addArrangedSubview(askCard(ask)) }
+        sessionStack.addArrangedSubview(headerBar())
         if sessions.isEmpty {
-            stack.addArrangedSubview(label(L("no_sessions"), size: 12, color: .secondaryLabelColor, bold: false))
+            sessionStack.addArrangedSubview(label(L("no_sessions"), size: 12, color: .secondaryLabelColor, bold: false))
             return
         }
         for s in sessions.prefix(6) {
-            stack.addArrangedSubview(row(for: s))
+            sessionStack.addArrangedSubview(row(for: s))
             if !s.children.isEmpty {
                 let open = expandedIDs.contains(s.id)
                 let btn = NSButton(title: "\(open ? "▾" : "▸") \(s.children.count) \(s.children.count == 1 ? L("subagent") : L("subagents"))",
@@ -767,10 +782,10 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
                 btn.identifier = NSUserInterfaceItemIdentifier(s.id)
                 let wrap = NSStackView(views: [btn])
                 wrap.edgeInsets = NSEdgeInsets(top: 0, left: 24, bottom: 0, right: 0)
-                stack.addArrangedSubview(wrap)
+                sessionStack.addArrangedSubview(wrap)
                 if open {
                     for child in s.children.prefix(8) {
-                        stack.addArrangedSubview(childRow(for: child))
+                        sessionStack.addArrangedSubview(childRow(for: child))
                     }
                 }
             }
@@ -868,7 +883,7 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     func controlTextDidBeginEditing(_ obj: Notification) { isEditingReply = true }
     func controlTextDidEndEditing(_ obj: Notification) {
         isEditingReply = false
-        if rebuildPending { rebuildPending = false; rebuild() }
+        rebuildAsks()  // apply any ask change that was deferred while typing
     }
     @objc private func replyFieldSubmit(_ f: NSTextField) { sendReply(id: f.identifier?.rawValue) }
     @objc private func replyButton(_ b: NSButton) { sendReply(id: b.identifier?.rawValue) }
@@ -886,7 +901,7 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     @objc private func toggleChildren(_ sender: NSButton) {
         guard let id = sender.identifier?.rawValue else { return }
         if expandedIDs.contains(id) { expandedIDs.remove(id) } else { expandedIDs.insert(id) }
-        rebuild()
+        rebuildSessions()
         onLayoutChange?()
     }
 
@@ -3094,11 +3109,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try: os.remove(path)
             except OSError: pass
             sys.exit(0)
-        # Only Notification creates an ask: it fires exactly when Claude Code
-        # genuinely needs you -- a permission/tool request, plan approval, or a
-        # 60s-idle wait. That is the real "waiting for your answer".
+        # Only Notification creates an ask -- and only the PERMISSION kind.
+        # Claude Code also sends an idle Notification ("waiting for your input")
+        # after 60s of an idle prompt; that is NOT a real question, so skip it.
         if ev != 'Notification': sys.exit(0)
         msg = (d.get('message') or 'Necesita tu respuesta').strip().replace(chr(10), ' ')[:300]
+        if 'waiting for your input' in msg.lower() or 'esperando' in msg.lower():
+            sys.exit(0)
         out = {'session_id': sid, 'cwd': d.get('cwd', ''), 'message': msg, 'time': time.time()}
         with open(path, 'w') as f: json.dump(out, f)
         """
