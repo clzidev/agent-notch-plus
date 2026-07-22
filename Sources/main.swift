@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.6.0"
+let appVersion = "2.6.1"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 // MARK: - Localization
@@ -1187,6 +1187,8 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
         super.init(frame: NSRect(x: 0, y: 0, width: 220, height: 300))
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
+        // hard minimum: the split view must never crush the pane into a sliver
+        widthAnchor.constraint(greaterThanOrEqualToConstant: 200).isActive = true
         let up = NSButton(title: "▲", target: self, action: #selector(goUp))
         up.isBordered = false
         up.contentTintColor = .systemGreen
@@ -1359,6 +1361,9 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
         super.init(frame: NSRect(x: 0, y: 0, width: 380, height: 300))
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
+        // hard minimum: sidebar (140) + a usable file list — without this the
+        // split can squeeze the pane until only the sidebar remains visible
+        widthAnchor.constraint(greaterThanOrEqualToConstant: 400).isActive = true
 
         // sidebar
         sideTable.addTableColumn(NSTableColumn(identifier: .init("side")))
@@ -2541,9 +2546,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         qf.onNavigate = { [weak self] url in self?.cdTerminal(to: url) }
         quickFolders = qf
         split.insertArrangedSubview(qf, at: 0)
+        split.setHoldingPriority(NSLayoutConstraint.Priority(260), forSubviewAt: 0)
         split.adjustSubviews()
         DispatchQueue.main.async { [weak split] in
-            split?.setPosition(220, ofDividerAt: 0)
+            split?.setPosition(230, ofDividerAt: 0)
         }
     }
 
@@ -2565,9 +2571,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let fb = FileBrowserPane(startDir: URL(fileURLWithPath: startDir))
         fileBrowser = fb
         split.insertArrangedSubview(fb, at: 0)
+        split.setHoldingPriority(NSLayoutConstraint.Priority(260), forSubviewAt: 0)  // keep width; terminals flex
         split.adjustSubviews()
         DispatchQueue.main.async { [weak split] in
-            split?.setPosition(400, ofDividerAt: 0)  // sidebar + list need real width
+            split?.setPosition(420, ofDividerAt: 0)  // sidebar + list need real width
         }
     }
 
