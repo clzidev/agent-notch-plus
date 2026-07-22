@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.1"
+let appVersion = "2.9.2"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -1237,8 +1237,20 @@ final class IndicatorView: NSView {
 }
 
 /// Borderless panel that can take keyboard focus (for the notch terminal).
+/// Handles its own ⌘-keys via performKeyEquivalent so they work whenever the
+/// panel is key — unlike a local event monitor, which needs the whole app to
+/// be active (a nonactivating panel often isn't after being re-shown).
 final class KeyPanel: NSPanel {
     override var canBecomeKey: Bool { true }
+    var onCommandKey: ((String) -> Bool)?
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.contains(.command),
+           let ch = event.charactersIgnoringModifiers?.lowercased(),
+           onCommandKey?(ch) == true {
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
 }
 
 /// Scroll-view document container with top-down coordinates (for the GIF gallery).
@@ -1284,7 +1296,6 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
     private var dir: URL
     private var items: [URL] = []
     private let table = NSTableView()
-    private let pathLabel = NSTextField(labelWithString: "")
     /// Fired when the USER navigates here — the app `cd`s the terminal to match.
     var onNavigate: ((URL) -> Void)?
     private var hasParent: Bool { dir.path != "/" }
@@ -1307,14 +1318,7 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
         layer?.backgroundColor = NSColor.black.cgColor
         // hard minimum: the split view must never crush the pane into a sliver
         widthAnchor.constraint(greaterThanOrEqualToConstant: 200).isActive = true
-        let up = NSButton(title: "▲", target: self, action: #selector(goUp))
-        up.isBordered = false
-        up.contentTintColor = .systemGreen
-        up.translatesAutoresizingMaskIntoConstraints = false
-        pathLabel.textColor = .secondaryLabelColor
-        pathLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
-        pathLabel.lineBreakMode = .byTruncatingHead
-        pathLabel.translatesAutoresizingMaskIntoConstraints = false
+        // no path bar / ▲ button — the ".." row handles going up
         table.addTableColumn(NSTableColumn(identifier: .init("file")))
         table.headerView = nil
         table.backgroundColor = .black
@@ -1330,17 +1334,9 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
         scroll.hasVerticalScroller = true
         scroll.drawsBackground = false
         scroll.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(up)
-        addSubview(pathLabel)
         addSubview(scroll)
         NSLayoutConstraint.activate([
-            up.topAnchor.constraint(equalTo: topAnchor, constant: 2),
-            up.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
-            up.widthAnchor.constraint(equalToConstant: 20),
-            pathLabel.centerYAnchor.constraint(equalTo: up.centerYAnchor),
-            pathLabel.leadingAnchor.constraint(equalTo: up.trailingAnchor, constant: 4),
-            pathLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
-            scroll.topAnchor.constraint(equalTo: up.bottomAnchor, constant: 2),
+            scroll.topAnchor.constraint(equalTo: topAnchor),
             scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
@@ -1358,7 +1354,6 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
             if ad != bd { return ad && !bd }  // folders first, for hopping around
             return a.lastPathComponent.localizedCaseInsensitiveCompare(b.lastPathComponent) == .orderedAscending
         }
-        pathLabel.stringValue = dir.path
         table.reloadData()
     }
 
@@ -2110,28 +2105,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         registerTermHotkey()
         readTermKeys()
 
-        // in-terminal ⌘-keys: split / files pane / quick folders
-        // (local monitor: only our own windows)
-        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
-            guard let self, let w = self.termWindow, e.window === w,
-                  e.modifierFlags.contains(.command) else { return e }
-            // no menu bar in an accessory app, so route the edit keys by
-            // hand: ⌘C/⌘X copy the terminal's mouse selection, ⌘V pastes
-            let term = w.firstResponder as? LocalProcessTerminalView
-            switch e.charactersIgnoringModifiers?.lowercased() {
-            case "c" where term?.selectionActive == true,
-                 "x" where term?.selectionActive == true:
-                term?.copy(term)
-                return nil
-            case "v" where term != nil:
-                term?.paste(term)
-                return nil
-            case self.keySplit: self.addTerminalPane(); return nil
-            case self.keyFiles: self.toggleFileBrowser(); return nil
-            case self.keyFolders: self.toggleQuickFolders(); return nil
-            default: return e
-            }
-        }
 
         // Right-click on the indicator → settings menu (the indicator window
         // ignores mouse events, so this rides the same global-monitor route)
@@ -2498,6 +2471,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.minSize = NSSize(width: 480, height: 280)
         panel.isMovable = false  // the terminal IS part of the notch — it doesn't move
         panel.alphaValue = cfgAlpha("term-alpha")  // whole-window transparency
+        panel.onCommandKey = { [weak self] ch in
+            guard let self else { return false }
+            let term = panel.firstResponder as? LocalProcessTerminalView
+            switch ch {
+            case "c" where term?.selectionActive == true,
+                 "x" where term?.selectionActive == true: term?.copy(term); return true
+            case "v" where term != nil: term?.paste(term); return true
+            case self.keySplit: self.addTerminalPane(); return true
+            case self.keyFiles: self.toggleFileBrowser(); return true
+            case self.keyFolders: self.toggleQuickFolders(); return true
+            default: return false
+            }
+        }
         // any resize re-centers under the notch, so dragging a corner grows
         // the window symmetrically around it
         NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification,
@@ -2648,6 +2634,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.setFrame(f, display: true)
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        // give a terminal pane focus so typing and ⌘-keys work right after a
+        // re-show (without this the re-shown panel had no first responder)
+        if let t = termViews.first { panel.makeFirstResponder(t) }
         // force the first layout pass NOW: AppKit resets the layer's
         // anchorPoint on it, which used to flip the very first curtain
         // animation upside down (it unrolled bottom-up)
