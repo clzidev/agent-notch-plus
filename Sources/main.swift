@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.5.2"
+let appVersion = "2.5.3"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 // MARK: - Localization
@@ -750,7 +750,7 @@ final class SessionListController: NSViewController {
         if !s.snippet.isEmpty {
             let snip = label(s.snippet, size: 11, color: .secondaryLabelColor, bold: false,
                              lines: zoomFactor >= 1.5 ? 3 : zoomFactor > 1 ? 2 : 1)
-            let w = contentWidth - 70
+            let w = contentWidth - 36
             snip.preferredMaxLayoutWidth = w
             snip.widthAnchor.constraint(equalToConstant: w).isActive = true
             views.append(snip)
@@ -760,6 +760,7 @@ final class SessionListController: NSViewController {
         col.alignment = .leading
         col.spacing = 1
         col.edgeInsets = NSEdgeInsets(top: 2, left: 28, bottom: 2, right: 4)
+        col.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
         top.widthAnchor.constraint(equalTo: col.widthAnchor, constant: -32).isActive = true
         return col
     }
@@ -790,7 +791,7 @@ final class SessionListController: NSViewController {
         if !line.isEmpty {
             let snippet = label(line, size: 11, color: .secondaryLabelColor, bold: false,
                                 lines: zoomFactor >= 1.5 ? 4 : zoomFactor > 1 ? 3 : 1)
-            let w = contentWidth - 40
+            let w = contentWidth - 8
             snippet.preferredMaxLayoutWidth = w
             // exact width: the text block always spans the panel instead of
             // drifting as Auto Layout re-solves during the zoom animation
@@ -802,6 +803,9 @@ final class SessionListController: NSViewController {
         col.alignment = .leading
         col.spacing = 1
         col.edgeInsets = NSEdgeInsets(top: 4, left: 4, bottom: 4, right: 4)
+        // fixed row width: the right-side tag stays glued to the edge instead
+        // of jumping when snippets appear or the width changes
+        col.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
         top.widthAnchor.constraint(equalTo: col.widthAnchor, constant: -8).isActive = true
         return col
     }
@@ -1724,6 +1728,10 @@ final class NotchView: NSView {
             path.close()
             NSColor.black.setFill()
             path.fill()
+            // subtle dark-gray outline so the panel reads against dark walls
+            NSColor(white: 0.24, alpha: 1).setStroke()
+            path.lineWidth = 1
+            path.stroke()
             return  // no spinner while the panel is open
         }
     }
@@ -2282,6 +2290,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         container.layer?.backgroundColor = NSColor.black.cgColor
         container.layer?.cornerRadius = 16
         container.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        container.layer?.borderColor = NSColor(white: 0.24, alpha: 1).cgColor
+        container.layer?.borderWidth = 1
         let stripH: CGFloat = 22
         let strip = TermDragStrip(frame: NSRect(x: 0, y: th - stripH, width: tw, height: stripH))
         strip.autoresizingMask = [.width, .minYMargin]
@@ -2351,15 +2361,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         PROMPT_EOL_MARK=''  # hide zsh's inverse-% partial-line marker
         # inside a git repo: "project branch ❯" — anywhere else just "❯".
         # (No ${:+} nesting: %F{...} braces inside it break the expansion.)
-        precmd() {
+        _notch_prompt() {
           vcs_info
           if [[ -n "$vcs_info_msg_0_" ]]; then
             PROMPT="%F{green}%1~%f$vcs_info_msg_0_ %F{green}❯%f "
           else
             PROMPT="%F{green}❯%f "
           fi
-          print -Pn '\\e[1 q'
         }
+        precmd() { _notch_prompt; print -Pn '\\e[1 q' }
+        # Silent cd driven by the quick-folders pane: the app writes the
+        # target to cd-target and sends ESC[24;5~ (a sequence no keyboard
+        # produces) — the widget changes directory without typing anything.
+        _agent_notch_cd() {
+          local t
+          t="$(command cat "$HOME/.config/agent-notch/cd-target" 2>/dev/null)"
+          [[ -n "$t" && -d "$t" ]] && cd "$t"
+          _notch_prompt
+          zle reset-prompt
+        }
+        zle -N _agent_notch_cd
+        bindkey '\\e[24;5~' _agent_notch_cd
         RPROMPT=''
         """
         try? rc.write(to: dir.appendingPathComponent(".zshrc"), atomically: true, encoding: .utf8)
@@ -2371,13 +2393,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         termViews.first { $0.window?.firstResponder === $0 } ?? termViews.first
     }
 
-    /// The quick-folders pane navigated — `cd` the terminal to match.
-    /// ^U first clears anything half-typed on the input line, and \r is the
-    /// real Enter — a raw \n mid-redraw used to leave broken fragments behind.
+    /// The quick-folders pane navigated — `cd` the terminal to match,
+    /// invisibly: write the target and fire the zle widget's trigger
+    /// sequence. Nothing is typed, echoed or left in history.
     private func cdTerminal(to url: URL) {
         guard let term = focusedTerminal else { return }
-        let quoted = "'" + url.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
-        term.send(txt: "\u{15} cd " + quoted + "\r")
+        writeConfig("cd-target", url.path)
+        term.send(txt: "\u{1B}[24;5~")
     }
 
     /// Terminal → pane: mirror the shell's real cwd (read from the kernel)
