@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.8.0"
+let appVersion = "2.8.1"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 // MARK: - Localization
@@ -29,6 +29,10 @@ enum L10n {
     private static let table: [String: [String]] = [
         "settings": ["Settings…", "Configuración…"],
         "quit": ["Quit Agent Notch", "Salir de Agent Notch"],
+        "cancel": ["Cancel", "Cancelar"],
+        "quit_confirm": ["Quit Agent Notch Plus?", "¿Salir de Agent Notch Plus?"],
+        "quit_confirm_info": ["The notch, indicator and any open terminal will close.",
+                              "Se cerrarán el notch, el indicador y cualquier terminal abierta."],
         "no_sessions": ["No recent agent sessions", "Sin sesiones recientes de agentes"],
         "sessions": ["sessions", "sesiones"],
         "active": ["active", "activas"],
@@ -1768,6 +1772,8 @@ final class NotchView: NSView {
     var onCollapse: (() -> Void)?
     var onSettings: (() -> Void)?
     var onTerminal: (() -> Void)?
+    var onQuit: (() -> Void)?
+    @objc private func quitTapped() { onQuit?() }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func mouseDown(with event: NSEvent) { }
     override func mouseUp(with event: NSEvent) { onCollapse?() }
@@ -1781,7 +1787,9 @@ final class NotchView: NSView {
         let cfg = NSMenuItem(title: L("settings"), action: #selector(openSettings), keyEquivalent: "")
         cfg.target = self
         menu.addItem(cfg)
-        menu.addItem(NSMenuItem(title: L("quit"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        let quit = NSMenuItem(title: L("quit"), action: #selector(quitTapped), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 
@@ -1848,6 +1856,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // one sound per episode: armed while busy, disarmed once played
     private var claudeDoneArmed = false, claudeAttArmed = false
     private var codexDoneArmed = false, codexAttArmed = false
+    // debounce: busy must be quiet several polls before it counts as settled,
+    // so CPU flapping around the threshold can't re-fire sounds/glyphs
+    private var claudeBusyStable = false, codexBusyStable = false
+    private var claudeQuietPolls = 0, codexQuietPolls = 0
     private var lastSoundAt = Date.distantPast
     private var termWindow: NSPanel?
     private var termSplit: NSSplitView?
@@ -1963,6 +1975,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         notchView.onSettings = { [weak self] in self?.showSettings() }
         notchView.onTerminal = { [weak self] in self?.toggleTerminal() }
+        notchView.onQuit = { [weak self] in self?.confirmQuit() }
         listController.onSettings = { [weak self] in self?.showSettings() }
         listController.onTerminal = { [weak self] in self?.toggleTerminal() }
 
@@ -2027,7 +2040,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let cfg = NSMenuItem(title: L("settings"), action: #selector(self.showSettings), keyEquivalent: "")
             cfg.target = self
             menu.addItem(cfg)
-            menu.addItem(NSMenuItem(title: L("quit"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+            let quit = NSMenuItem(title: L("quit"), action: #selector(self.confirmQuit), keyEquivalent: "q")
+            quit.target = self
+            menu.addItem(quit)
             menu.popUp(positioning: nil, at: loc, in: nil)
         }
         // The indicator window never takes mouse input (routing to tiny borderless
@@ -2221,9 +2236,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // busy → mascot; alive-but-quiet → nothing (idle, not done);
                 // process exited → done blob (cleared on terminal focus)
                 let claudeLive = result.contains { $0.kind == .claude && $0.anyLive }
-                let claudeBusy = result.contains { $0.kind == .claude && $0.anyBusy }
                 let codexLive = result.contains { $0.kind == .codex && $0.anyLive }
-                let codexBusy = result.contains { $0.kind == .codex && $0.anyBusy }
+                let claudeBusyRaw = result.contains { $0.kind == .claude && $0.anyBusy }
+                let codexBusyRaw = result.contains { $0.kind == .codex && $0.anyBusy }
+                // debounce raw busy: on immediately, off only after 3 quiet
+                // polls (~9 s) — one dip in CPU no longer flips the state
+                if claudeBusyRaw { self.claudeBusyStable = true; self.claudeQuietPolls = 0 }
+                else if self.claudeBusyStable { self.claudeQuietPolls += 1
+                    if self.claudeQuietPolls >= 3 { self.claudeBusyStable = false } }
+                if codexBusyRaw { self.codexBusyStable = true; self.codexQuietPolls = 0 }
+                else if self.codexBusyStable { self.codexQuietPolls += 1
+                    if self.codexQuietPolls >= 3 { self.codexBusyStable = false } }
+                let claudeBusy = self.claudeBusyStable
+                let codexBusy = self.codexBusyStable
                 // sounds (settings): once per episode. An agent "arms" its
                 // sounds while busy and each fires at most once until it gets
                 // busy again — liveness flaps under load can't re-trigger them.
@@ -2952,6 +2977,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
 
+
+    @objc private func confirmQuit() {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = L("quit_confirm")
+        a.informativeText = L("quit_confirm_info")
+        a.addButton(withTitle: L("quit"))
+        a.addButton(withTitle: L("cancel"))
+        a.alertStyle = .warning
+        if a.runModal() == .alertFirstButtonReturn { NSApp.terminate(nil) }
+    }
 
     private func alert(_ msg: String, _ info: String) {
         let a = NSAlert()
