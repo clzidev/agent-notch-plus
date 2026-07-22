@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.12"
+let appVersion = "2.9.13"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -57,8 +57,8 @@ enum L10n {
         "uninstall_hook": ["Disable notch replies (remove hook)", "Desactivar respuestas del notch (quitar hook)"],
         "replies_title": ["Reply from the notch:", "Responder desde el notch:"],
         "replies_help": [
-            "After enabling, RESTART each Claude/Codex session (close & reopen the terminal) so it loads the hook — already-running sessions won't pick it up. Then, when an agent asks something, a card appears here; click it and type your answer. Replies to sessions run inside the notch terminal (⌥Space) work instantly; external terminals (Warp, Ghostty…) also need the checkbox below + Accessibility permission.",
-            "Después de activarlo, REINICIÁ cada sesión de Claude/Codex (cerrá y volvé a abrir la terminal) para que cargue el hook — las sesiones ya abiertas no lo toman. Después, cuando un agente pregunte algo, aparece una tarjeta acá; hacé clic y escribí tu respuesta. Responder a sesiones abiertas dentro de la terminal del notch (⌥Espacio) funciona al instante; para terminales externas (Warp, Ghostty…) además hace falta la casilla de abajo + permiso de Accesibilidad."],
+            "For agents you run INSIDE the notch terminal (⌃⌥Space): when one asks something, a card appears here — click it and type your answer, it goes straight to that session. Enable the hook once, then RESTART any Claude session so it loads it. Agents in external terminals (Warp, iTerm…) don't show a reply card (macOS can't deliver a reply to them reliably).",
+            "Para los agentes que corras DENTRO de la terminal del notch (⌃⌥Espacio): cuando uno pregunte algo, aparece una tarjeta acá — hacé clic y escribí tu respuesta, va directo a esa sesión. Activá el hook una vez y REINICIÁ las sesiones de Claude para que lo tomen. Los agentes en terminales externas (Warp, iTerm…) no muestran tarjeta de respuesta (macOS no puede entregarles la respuesta de forma confiable)."],
         "hook_ok": ["Hook installed", "Hook instalado"],
         "hook_ok_info": ["Claude Code will now notify the notch when an agent asks for input. Restart running Claude sessions to pick it up.",
                          "Claude Code ahora avisará al notch cuando un agente pida datos. Reiniciá las sesiones de Claude abiertas para que lo tomen."],
@@ -2019,7 +2019,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendTermSizeField: NSTextField?
     private var pendPanelAlphaField: NSTextField?
     private var pendTermAlphaField: NSTextField?
-    private var extInjectRef: NSButton?
     private var galleryWindow: NSWindow?
     private var gallerySearchField: NSTextField?
     private var galleryTargetPopup: NSPopUpButton?
@@ -2387,10 +2386,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 IndicatorView.refreshPetChoice()
                 IndicatorView.refreshCustomGifs()
+                // Only show ask cards for sessions we can actually reply to:
+                // those running INSIDE a notch terminal pane (matched by cwd).
+                // External terminals (Warp, Ghostty…) can't receive a reply, so
+                // no card is shown for them — no false or dead-end prompts.
+                let notchCwds = Set(self.termViews.compactMap { ($0.process?.shellPid).flatMap(pidCwd) })
+                let shownAsks = pendingAsks.filter { self.termWindow?.isVisible == true && notchCwds.contains($0.cwd) }
                 // chime once when a NEW ask arrives (not every poll it persists)
-                let newAsk = pendingAsks.contains { a in !self.asks.contains { $0.sessionID == a.sessionID } }
-                self.asks = pendingAsks
-                self.listController.asks = pendingAsks
+                let newAsk = shownAsks.contains { a in !self.asks.contains { $0.sessionID == a.sessionID } }
+                self.asks = shownAsks
+                self.listController.asks = shownAsks
                 self.listController.sessions = result
                 if newAsk, self.soundAttention { self.playSound("Ping") }
                 // busy → mascot; alive-but-quiet → nothing (idle, not done);
@@ -2922,9 +2927,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                target: self, action: #selector(toggleHook))
         hookBtn.bezelStyle = .rounded
         hookButtonRef = hookBtn
-        let extInjectCheck = NSButton(checkboxWithTitle: L("ext_inject"), target: nil, action: nil)
-        extInjectCheck.state = FileManager.default.fileExists(atPath: configURL("ext-inject").path) ? .on : .off
-        extInjectRef = extInjectCheck
         let repliesHelp = NSTextField(wrappingLabelWithString: L("replies_help"))
         repliesHelp.font = .systemFont(ofSize: 10)
         repliesHelp.textColor = .secondaryLabelColor
@@ -2975,7 +2977,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                smallLabel("Codex"), MascotBarPreview(kind: .codex)]),
             row(L("replies_title"), [hookBtn]),
             repliesHelp,
-            row("", [extInjectCheck]),
             row(L("startup"), [loginCheck]),
             row(L("sounds_title"), [soundCol]),
             row(L("project"), [linkBtn, versionLbl]),
@@ -3041,7 +3042,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         writeConfig("term-alpha", String(ta))
         window.alphaValue = CGFloat(pa) / 100
         applyTerminalAlpha(CGFloat(ta) / 100)
-        writeConfig("ext-inject", extInjectRef?.state == .on ? "1" : "")
         if #available(macOS 13.0, *), let check = loginCheckRef, check.isEnabled {
             if check.state == .on {
                 if Bundle.main.bundleIdentifier == nil {
