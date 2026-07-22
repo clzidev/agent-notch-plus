@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.5.3"
+let appVersion = "2.5.4"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 // MARK: - Localization
@@ -40,6 +40,7 @@ enum L10n {
         "terminal": ["Notch terminal", "Terminal del notch"],
         "term_hotkey": ["Terminal shortcut:", "Atajo de terminal:"],
         "term_dir": ["Terminal start folder:", "Carpeta inicial de la terminal:"],
+        "term_size": ["Terminal size (% of screen):", "Tamaño de la terminal (% de pantalla):"],
         "choose_dir": ["Choose…", "Elegir…"],
         "clear_dir": ["Reset", "Quitar"],
         "project": ["Project:", "Proyecto:"],
@@ -1792,6 +1793,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var loginCheckRef: NSButton?
     private var pendTermDir = ""
     private var termDirLabel: NSTextField?
+    private var pendTermSizeField: NSTextField?
     private var galleryWindow: NSWindow?
     private var gallerySearchField: NSTextField?
     private var galleryTargetPopup: NSPopUpButton?
@@ -2258,7 +2260,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         let s = screen.frame
-        let tw: CGFloat = 760, th: CGFloat = 460
+        // default size = configurable percentage of the screen (config "term-size")
+        let sizePct = CGFloat(min(95, max(20, Double((try? String(contentsOf: configURL("term-size"), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? 50)))
+        let tw = max(480, s.width * sizePct / 100)
+        let th = max(280, (s.height - barHeight) * sizePct / 100)
         let frame = NSRect(x: s.midX - tw / 2, y: s.maxY - barHeight - th, width: tw, height: th)
         let panel = KeyPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel, .resizable],
                              backing: .buffered, defer: false)
@@ -2579,6 +2585,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         pendTermDir = (try? String(contentsOf: configURL("term-dir"), encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let curTermSize = (try? String(contentsOf: configURL("term-size"), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "50"
+        let termSizeField = NSTextField(string: curTermSize)
+        termSizeField.widthAnchor.constraint(equalToConstant: 48).isActive = true
+        pendTermSizeField = termSizeField
+        let termSizePctLabel = NSTextField(labelWithString: "%")
+        termSizePctLabel.textColor = .secondaryLabelColor
         let termDirLbl = NSTextField(labelWithString: pendTermDir.isEmpty ? "/" : pendTermDir)
         termDirLbl.textColor = .secondaryLabelColor
         termDirLbl.lineBreakMode = .byTruncatingMiddle
@@ -2629,6 +2642,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                  foldersPop, smallLabel(L("key_folders"))]),
             row(L("term_dir"), [termDirLbl, button(L("choose_dir"), #selector(chooseTermDir)),
                                 button(L("clear_dir"), #selector(clearTermDir))]),
+            row(L("term_size"), [termSizeField, termSizePctLabel]),
             row(L("mascots"), [button(L("gif_gallery"), #selector(showGifGallery))]),
             row(L("preview"), [smallLabel("Claude"), MascotBarPreview(kind: .claude),
                                smallLabel("Codex"), MascotBarPreview(kind: .codex)]),
@@ -2689,6 +2703,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         saveKey(foldersKeyPopupRef, "key-folders")
         readTermKeys()
         writeConfig("term-dir", pendTermDir)
+        let tsz = Int(min(95, max(20, Double(pendTermSizeField?.stringValue ?? "") ?? 50)))
+        writeConfig("term-size", String(tsz))
         if #available(macOS 13.0, *), let check = loginCheckRef, check.isEnabled {
             if check.state == .on {
                 if Bundle.main.bundleIdentifier == nil {
@@ -3109,7 +3125,12 @@ extension AppDelegate: LocalProcessTerminalViewDelegate {
                 t.removeFromSuperview()
                 self.termSplit?.adjustSubviews()
             }
-            if self.termViews.isEmpty { self.forceCloseTerminal() }
+            if self.termViews.isEmpty {
+                self.forceCloseTerminal()
+            } else {
+                // keep typing without clicking: focus the next surviving pane
+                self.termWindow?.makeFirstResponder(self.termViews.first)
+            }
         }
     }
 }
