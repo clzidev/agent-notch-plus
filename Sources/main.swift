@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.9"
+let appVersion = "2.9.10"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -704,7 +704,7 @@ final class DitherSeparator: NSView {
 
 // MARK: - Session list popover
 
-final class SessionListController: NSViewController {
+final class SessionListController: NSViewController, NSTextFieldDelegate {
     var sessions: [AgentSession] = [] { didSet { rebuild() } }
     // hover zoom: snippets get extra lines (same font size), so the bigger
     // panel shows MORE text, not bigger text
@@ -740,7 +740,13 @@ final class SessionListController: NSViewController {
         view = v
     }
 
+    private var isEditingReply = false
+    private var rebuildPending = false
     private func rebuild() {
+        // never tear the panel down while the user is typing a reply — the
+        // 3 s poll would otherwise destroy the field mid-message, dropping the
+        // text and the focus (Enter then landed on a dead field)
+        if isEditingReply { rebuildPending = true; return }
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         icons.removeAll()
         stack.addArrangedSubview(headerBar())
@@ -819,6 +825,7 @@ final class SessionListController: NSViewController {
         field.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         field.target = self
         field.action = #selector(replyFieldSubmit(_:))
+        field.delegate = self
         field.identifier = NSUserInterfaceItemIdentifier(ask.sessionID)
         replyFields[ask.sessionID] = (field, ask)
         let send = NSButton(title: L("send"), target: self, action: #selector(replyButton(_:)))
@@ -858,6 +865,11 @@ final class SessionListController: NSViewController {
     }
 
     private var replyFields: [String: (NSTextField, AgentAsk)] = [:]
+    func controlTextDidBeginEditing(_ obj: Notification) { isEditingReply = true }
+    func controlTextDidEndEditing(_ obj: Notification) {
+        isEditingReply = false
+        if rebuildPending { rebuildPending = false; rebuild() }
+    }
     @objc private func replyFieldSubmit(_ f: NSTextField) { sendReply(id: f.identifier?.rawValue) }
     @objc private func replyButton(_ b: NSButton) { sendReply(id: b.identifier?.rawValue) }
     private func sendReply(id: String?) {
@@ -3075,31 +3087,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         safe = ''.join(c if c.isalnum() else '_' for c in sid)
         ev = d.get('hook_event_name', '')
         path = os.path.join(base, safe + '.json')
-        # user answered -> clear the pending ask
-        if ev == 'UserPromptSubmit':
+        # Stop (turn ended) and UserPromptSubmit (user answered) both CLEAR the
+        # ask. We do NOT create an ask on Stop -- that fired on every single
+        # completion and showed a card when Claude wasn't actually waiting.
+        if ev in ('Stop', 'UserPromptSubmit'):
             try: os.remove(path)
             except OSError: pass
             sys.exit(0)
-        msg = d.get('message', '')
-        # Stop = turn ended and Claude is now waiting for you; pull its last
-        # text (often the question/plan) from the transcript as the message
-        if ev == 'Stop':
-            tp = d.get('transcript_path', '')
-            last = ''
-            try:
-                with open(os.path.expanduser(tp)) as f:
-                    for line in f:
-                        try: o = json.loads(line)
-                        except Exception: continue
-                        if o.get('type') != 'assistant': continue
-                        c = o.get('message', {}).get('content')
-                        if isinstance(c, str): last = c
-                        elif isinstance(c, list):
-                            for p in c:
-                                if p.get('type') == 'text' and p.get('text'): last = p['text']
-            except Exception: pass
-            msg = (last or 'Terminó y espera tu respuesta').strip().replace(chr(10), ' ')[:300]
-        if not msg: msg = 'Necesita tu respuesta'
+        # Only Notification creates an ask: it fires exactly when Claude Code
+        # genuinely needs you -- a permission/tool request, plan approval, or a
+        # 60s-idle wait. That is the real "waiting for your answer".
+        if ev != 'Notification': sys.exit(0)
+        msg = (d.get('message') or 'Necesita tu respuesta').strip().replace(chr(10), ' ')[:300]
         out = {'session_id': sid, 'cwd': d.get('cwd', ''), 'message': msg, 'time': time.time()}
         with open(path, 'w') as f: json.dump(out, f)
         """
