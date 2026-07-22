@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.8"
+let appVersion = "2.9.9"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -2178,6 +2178,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.orderFrontRegardless()
         indicatorWindow.orderFrontRegardless()
 
+        // After sleep/wake (or an external display turning off/on) the window
+        // server can leave these statusBar-level windows unresponsive or
+        // off-screen — you couldn't quit or focus the terminal. Re-establish
+        // them on wake and on any screen-geometry change.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.reestablishWindows() }
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.reestablishWindows() }
+
         // Revisiting the terminal acknowledges finished agents — green clears
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
@@ -3326,6 +3337,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // so surface the cwd so the user knows which window to click.
         if termWindow != nil { toggleTerminal(); return }
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Recover from sleep/wake or screen changes: re-anchor and re-float every
+    /// window so the indicator stays clickable, the panel/terminal stay on
+    /// their notch screen, and hotkeys keep working.
+    private func reestablishWindows() {
+        // small delay: the window server settles a beat after wake
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self else { return }
+            if !self.expanded {
+                self.window.setFrame(self.collapsedFrame(), display: true)
+            }
+            self.window.orderFrontRegardless()
+            self.indicatorWindow.setFrame(self.indicatorScreenRect, display: true)
+            if !self.expanded { self.indicatorWindow.orderFrontRegardless() }
+            if let term = self.termWindow, term.isVisible {
+                let s = self.screen.frame
+                var f = term.frame
+                f.origin.x = s.midX - f.width / 2
+                f.origin.y = s.maxY - self.barHeight - f.height
+                term.setFrame(f, display: true)
+                term.orderFrontRegardless()
+                if let t = self.termViews.first { term.makeFirstResponder(t) }
+            }
+            // re-register the global hotkeys in case they were dropped
+            self.registerPanelHotkey()
+            self.registerTermHotkey()
+        }
     }
 
     @objc private func confirmQuit() {
