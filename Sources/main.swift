@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.6.1"
+let appVersion = "2.7.0"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 // MARK: - Localization
@@ -46,6 +46,8 @@ enum L10n {
         "term_hotkey": ["Terminal shortcut:", "Atajo de terminal:"],
         "term_dir": ["Terminal start folder:", "Carpeta inicial de la terminal:"],
         "term_size": ["Terminal size (% of screen):", "Tamaño de la terminal (% de pantalla):"],
+        "panel_alpha": ["Panel opacity (%):", "Opacidad del panel (%):"],
+        "term_alpha": ["Terminal opacity (%):", "Opacidad de la terminal (%):"],
         "choose_dir": ["Choose…", "Elegir…"],
         "clear_dir": ["Reset", "Quitar"],
         "project": ["Project:", "Proyecto:"],
@@ -1749,6 +1751,7 @@ final class TermDragStrip: NSView {
 
 final class NotchView: NSView {
     var expanded = false { didSet { needsDisplay = true } }
+    var panelAlpha: CGFloat = 1 { didSet { needsDisplay = true } }
     var barHeight: CGFloat = 32
     var onCollapse: (() -> Void)?
     var onSettings: (() -> Void)?
@@ -1783,7 +1786,7 @@ final class NotchView: NSView {
             path.appendArc(withCenter: NSPoint(x: b.maxX - r, y: b.minY + r), radius: r, startAngle: 270, endAngle: 0, clockwise: false)
             path.line(to: NSPoint(x: b.maxX, y: b.maxY))
             path.close()
-            NSColor.black.setFill()
+            NSColor.black.withAlphaComponent(panelAlpha).setFill()
             path.fill()
             // subtle dark-gray outline so the panel reads against dark walls
             NSColor(white: 0.24, alpha: 1).setStroke()
@@ -1850,6 +1853,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendTermDir = ""
     private var termDirLabel: NSTextField?
     private var pendTermSizeField: NSTextField?
+    private var pendPanelAlphaField: NSTextField?
+    private var pendTermAlphaField: NSTextField?
     private var galleryWindow: NSWindow?
     private var gallerySearchField: NSTextField?
     private var galleryTargetPopup: NSPopUpButton?
@@ -1908,6 +1913,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         L10n.refresh()
         readSoundPrefs()
         readZoomPref()
+        notchView.panelAlpha = cfgAlpha("panel-alpha")
 
         // Panel window: full-width, mouse-transparent unless expanded
         window = NSWindow(contentRect: collapsedFrame(), styleMask: .borderless, backing: .buffered, defer: false)
@@ -2351,7 +2357,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let container = NSView(frame: NSRect(origin: .zero, size: NSSize(width: tw, height: th)))
         container.wantsLayer = true
-        container.layer?.backgroundColor = NSColor.black.cgColor
+        container.layer?.backgroundColor = NSColor.black.withAlphaComponent(cfgAlpha("term-alpha")).cgColor
         container.layer?.cornerRadius = 16
         container.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
         container.layer?.borderColor = NSColor(white: 0.24, alpha: 1).cgColor
@@ -2384,7 +2390,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let split = termSplit, termViews.count < 3 else { return }
         let term = DropTerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
         term.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        term.nativeBackgroundColor = .black
+        term.nativeBackgroundColor = cfgAlpha("term-alpha") < 1 ? .clear : .black
         term.nativeForegroundColor = NSColor(white: 0.92, alpha: 1)
         term.caretColor = NSColor(red: 0.1, green: 0.95, blue: 0.35, alpha: 1)  // matrix green
         term.processDelegate = self
@@ -2652,6 +2658,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pendTermSizeField = termSizeField
         let termSizePctLabel = NSTextField(labelWithString: "%")
         termSizePctLabel.textColor = .secondaryLabelColor
+        func pctField(_ name: String) -> NSTextField {
+            let f = NSTextField(string: String(Int(cfgAlpha(name) * 100)))
+            f.widthAnchor.constraint(equalToConstant: 48).isActive = true
+            return f
+        }
+        let panelAlphaField = pctField("panel-alpha")
+        pendPanelAlphaField = panelAlphaField
+        let termAlphaField = pctField("term-alpha")
+        pendTermAlphaField = termAlphaField
+        let paPct = NSTextField(labelWithString: "%")
+        paPct.textColor = .secondaryLabelColor
+        let taPct = NSTextField(labelWithString: "%")
+        taPct.textColor = .secondaryLabelColor
         let termDirLbl = NSTextField(labelWithString: pendTermDir.isEmpty ? "/" : pendTermDir)
         termDirLbl.textColor = .secondaryLabelColor
         termDirLbl.lineBreakMode = .byTruncatingMiddle
@@ -2703,6 +2722,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             row(L("term_dir"), [termDirLbl, button(L("choose_dir"), #selector(chooseTermDir)),
                                 button(L("clear_dir"), #selector(clearTermDir))]),
             row(L("term_size"), [termSizeField, termSizePctLabel]),
+            row(L("panel_alpha"), [panelAlphaField, paPct]),
+            row(L("term_alpha"), [termAlphaField, taPct]),
             row(L("mascots"), [button(L("gif_gallery"), #selector(showGifGallery))]),
             row(L("preview"), [smallLabel("Claude"), MascotBarPreview(kind: .claude),
                                smallLabel("Codex"), MascotBarPreview(kind: .codex)]),
@@ -2765,6 +2786,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         writeConfig("term-dir", pendTermDir)
         let tsz = Int(min(95, max(20, Double(pendTermSizeField?.stringValue ?? "") ?? 50)))
         writeConfig("term-size", String(tsz))
+        let pa = Int(min(100, max(30, Double(pendPanelAlphaField?.stringValue ?? "") ?? 100)))
+        writeConfig("panel-alpha", String(pa))
+        let ta = Int(min(100, max(30, Double(pendTermAlphaField?.stringValue ?? "") ?? 100)))
+        writeConfig("term-alpha", String(ta))
+        notchView.panelAlpha = CGFloat(pa) / 100
+        applyTerminalAlpha(CGFloat(ta) / 100)
         if #available(macOS 13.0, *), let check = loginCheckRef, check.isEnabled {
             if check.state == .on {
                 if Bundle.main.bundleIdentifier == nil {
@@ -2830,8 +2857,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func readZoomPref() {
         let v = (try? String(contentsOf: configURL("zoom"), encoding: .utf8))?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: .newlines).trimmingCharacters(in: .whitespaces)
         zoomPct = CGFloat(min(100, max(0, Double(v ?? "") ?? 25)))
+    }
+
+    /// Opacity config (30–100%), returned as 0.3–1.0.
+    private func cfgAlpha(_ name: String) -> CGFloat {
+        let v = (try? String(contentsOf: configURL(name), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return CGFloat(min(100, max(30, Double(v ?? "") ?? 100))) / 100
+    }
+
+    private func applyTerminalAlpha(_ a: CGFloat) {
+        termWindow?.contentView?.layer?.backgroundColor = NSColor.black.withAlphaComponent(a).cgColor
+        // with a translucent container the terminal cells go clear so the
+        // tint isn't applied twice (text area darker than the padding)
+        for t in termViews { t.nativeBackgroundColor = a < 1 ? .clear : .black }
     }
 
     // MARK: - Hotkeys (all configurable)
