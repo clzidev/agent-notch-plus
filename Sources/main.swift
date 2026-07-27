@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.27"
+let appVersion = "2.9.28"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -25,6 +25,7 @@ struct AgentAsk {
     var toolUseID: String = ""
     var canReply: Bool = false   // info cards: session runs inside a notch pane
     var branch: String = ""      // git branch of the ask's cwd
+    var appName: String = ""     // external terminal app hosting the session (Warp, iTerm…)
 }
 
 /// The hook writes ask files named after the session id with every
@@ -83,6 +84,7 @@ enum L10n {
         "tip_st_subagents": [
             "The turn is still open — the agent is waiting on its subagents/tools, not on you.",
             "El turno sigue abierto — el agente espera a sus subagentes/herramientas, no a vos."],
+        "go_to": ["Go to", "Ir a"],
         "g_cores": ["cores", "núcleos"],
         "g_free": ["free", "libre"],
         "g_disk": ["disk", "disco"],
@@ -305,7 +307,7 @@ final class ProcessDiscovery {
     // open jsonl for it — open-vibe-island falls back to the process cwd (and
     // claims by tty so a terminal maps to one session). Codex holds its
     // rollout file open, so the path route always works there.
-    struct Snapshot { let kind: AgentKind; let transcriptPath: String?; let cwd: String?; let cpu: Double; let tty: String }
+    struct Snapshot { let kind: AgentKind; let transcriptPath: String?; let cwd: String?; let cpu: Double; let tty: String; let pid: Int32 }
 
     // open-vibe-island uses 0.5s/0.2s here, but Process-spawn overhead under
     // heavy load (a codex swarm compiling) blows through 0.2s and every agent
@@ -379,11 +381,11 @@ final class ProcessDiscovery {
                 guard path != nil || cwd != nil else { continue }
                 // claim key: sessionID ?? tty ?? cwd — one session per terminal
                 guard claimed.insert("claude:\(path ?? tty)").inserted else { continue }
-                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd, cpu: cpu, tty: tty))
+                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd, cpu: cpu, tty: tty, pid: Int32(pid) ?? 0))
             case .codex:
                 guard let path = bestCodexTranscript(in: lsof),
                       claimed.insert("codex:\(path)").inserted else { continue }
-                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd, cpu: cpu, tty: tty))
+                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd, cpu: cpu, tty: tty, pid: Int32(pid) ?? 0))
             }
         }
         return out
@@ -1242,7 +1244,7 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     /// Ask cards (with the reply field). Rebuilt only when the ask set really
     /// changes, and never while you're typing — so the field is stable.
     private func rebuildAsks(force: Bool = false) {
-        let sig = asks.map { "\($0.sessionID)|\($0.kind)|\($0.message)|\($0.toolDetail)|\($0.canReply)" }
+        let sig = asks.map { "\($0.sessionID)|\($0.kind)|\($0.message)|\($0.toolDetail)|\($0.canReply)|\($0.appName)" }
             .joined(separator: "~")
         if !force, sig == lastAskSignature { return }
         if isEditingReply { return }  // defer; controlTextDidEndEditing re-runs
@@ -1673,7 +1675,11 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
                         lines: 3)
         msg.preferredMaxLayoutWidth = contentWidth - 28
 
-        let focus = NSButton(title: L("focus_term"), target: self, action: #selector(focusAskButton(_:)))
+        // external sessions: name the real host ("Ir a Warp") instead of
+        // pointing at our own (possibly empty) notch terminal
+        let focusTitle = ask.canReply || ask.appName.isEmpty
+            ? L("focus_term") : "\(L("go_to")) \(ask.appName)"
+        let focus = NSButton(title: focusTitle, target: self, action: #selector(focusAskButton(_:)))
         focus.bezelStyle = .rounded
         focus.identifier = NSUserInterfaceItemIdentifier(ask.sessionID)
         var views: [NSView] = []
@@ -3902,8 +3908,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             var cpuByCwd: [String: Double] = [:]
             var ttyMap: [String: String] = [:]  // cwd → tty, for routing replies
             var cwdByPath: [String: String] = [:]  // transcript → cwd, for ⎇ branch
+            var pidMap: [String: Int32] = [:]  // cwd → agent pid, to find its host terminal app
             for snap in self.discovery.liveTranscripts() {
-                if let cwd = snap.cwd { ttyMap[cwd] = snap.tty }
+                if let cwd = snap.cwd {
+                    ttyMap[cwd] = snap.tty
+                    pidMap[cwd] = snap.pid
+                }
                 if let path = snap.transcriptPath {
                     seen.insert(path)
                     if let cwd = snap.cwd { cwdByPath[path] = cwd }
@@ -3962,6 +3972,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let sys = self.sysMon.sample()
             DispatchQueue.main.async {
                 self.scanInFlight = false
+                self.pidByCwd = pidMap
                 self.listController.gaugeData = (t5: g5, t7d: g7d, peak5h: peak)
                 self.listController.sysStats = sys
                 // Track fullscreen-space changes: full-width bar when the menu bar is hidden
@@ -4043,6 +4054,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for i in shown.indices {
             shown[i].canReply = notchCwds.contains(shown[i].cwd)
             shown[i].branch = gitBranch(cwd: shown[i].cwd)
+            if !shown[i].canReply {
+                shown[i].appName = hostApp(forCwd: shown[i].cwd)?.localizedName ?? ""
+            }
         }
         // signal once when a NEW ask arrives (not every poll it persists)
         let newAsk = shown.contains { a in !asks.contains { $0.sessionID == a.sessionID } }
@@ -5503,11 +5517,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // cwd → agent pid, refreshed each rescan (main thread)
+    private var pidByCwd: [String: Int32] = [:]
+
+    private func parentPid(_ pid: Int32) -> Int32 {
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return 0 }
+        return Int32(info.pbi_ppid)
+    }
+
+    /// The GUI app hosting a session: walk the agent process's ancestors until
+    /// one is a regular app (Warp, iTerm, Terminal…).
+    private func hostApp(forCwd cwd: String) -> NSRunningApplication? {
+        var pid = pidByCwd[cwd] ?? 0
+        var hops = 0
+        while pid > 1, hops < 12 {
+            if let app = NSRunningApplication(processIdentifier: pid),
+               app.activationPolicy == .regular {
+                return app
+            }
+            pid = parentPid(pid)
+            hops += 1
+        }
+        return nil
+    }
+
     private func focusTerminalFor(_ ask: AgentAsk) {
-        // notch terminal: just show it. external: nothing reliable to focus,
-        // so surface the cwd so the user knows which window to click.
-        if termWindow != nil { toggleTerminal(); return }
-        NSApp.activate(ignoringOtherApps: true)
+        // session inside the notch terminal → SHOW it (never toggle-hide)
+        if ask.canReply {
+            if let w = termWindow {
+                if !w.isVisible { showTerminal(w) }
+                NSApp.activate(ignoringOtherApps: true)
+                w.makeKeyAndOrderFront(nil)
+            } else {
+                toggleTerminal()
+            }
+            return
+        }
+        // external session (Warp, iTerm…): activate the app that actually
+        // hosts it — opening our empty notch terminal helped nobody
+        if let app = hostApp(forCwd: ask.cwd) {
+            app.activate(options: [.activateIgnoringOtherApps])
+            return
+        }
+        // agent process gone or unknown: fall back to any running terminal app
+        let known = ["dev.warp.Warp-Stable", "com.googlecode.iterm2", "com.apple.Terminal",
+                     "com.mitchellh.ghostty", "net.kovidgoyal.kitty", "io.alacritty"]
+        for bid in known {
+            if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bid).first {
+                app.activate(options: [.activateIgnoringOtherApps])
+                return
+            }
+        }
     }
 
     /// The instant a wake/unlock/display change happens, hide the floating
