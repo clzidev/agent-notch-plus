@@ -82,6 +82,8 @@ enum L10n {
         "cant_reply_info": [
             "This agent runs in an EXTERNAL terminal (Warp, Ghostty, iTerm…). To reply from the notch, run `claude` inside the notch terminal (⌃⌥Space) — replies go straight to it.",
             "Este agente corre en una terminal EXTERNA (Warp, Ghostty, iTerm…). Para responder desde el notch, corré `claude` dentro de la terminal del notch (⌃⌥Espacio) — la respuesta va directo."],
+        "actions_title": ["Saved actions:", "Acciones guardadas:"],
+        "actions_edit": ["Edit…", "Editar…"],
         "ollama_model": ["Ollama model (/ia):", "Modelo de Ollama (/ia):"],
         "ollama_off": ["Ollama not detected", "Ollama no detectado"],
         "ollama_no_model": ["Pick a model in Settings to use /ia",
@@ -1011,6 +1013,9 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     var onTerminal: (() -> Void)?
     var asks: [AgentAsk] = [] { didSet { rebuildAsks() } }
     var usageSummary = ""  // "5h: 1.2M↑ 45k↓ · $3.20", shown in the header bar
+    // saved shell actions (~/.config/agent-notch/actions) shown as buttons
+    var actions: [(name: String, cmd: String)] = []
+    var onAction: ((String) -> Void)?
     var onReply: ((AgentAsk, String) -> Void)?
     var onFocusAsk: ((AgentAsk) -> Void)?
     var onPermission: ((AgentAsk, String) -> Void)?  // decision: allow/deny/always
@@ -1071,6 +1076,7 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         sessionStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         icons.removeAll()
         sessionStack.addArrangedSubview(headerBar())
+        if !actions.isEmpty { sessionStack.addArrangedSubview(actionsBar()) }
         if sessions.isEmpty {
             sessionStack.addArrangedSubview(label(L("no_sessions"), size: 12, color: .secondaryLabelColor, bold: false))
             return
@@ -1130,6 +1136,31 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     }
     @objc private func hdrSettings() { onSettings?() }
     @objc private func hdrTerminal() { onTerminal?() }
+
+    /// One small button per saved action — click runs it in the notch terminal.
+    private func actionsBar() -> NSView {
+        var btns: [NSView] = []
+        for (i, a) in actions.prefix(8).enumerated() {
+            let b = FirstMouseButton(title: "▸ \(a.name)", target: self, action: #selector(actionTapped(_:)))
+            b.bezelStyle = .rounded
+            b.controlSize = .small
+            b.font = .systemFont(ofSize: 10, weight: .medium)
+            b.tag = i
+            b.toolTip = a.cmd
+            btns.append(b)
+        }
+        let bar = NSStackView(views: btns + [NSView()])
+        bar.orientation = .horizontal
+        bar.spacing = 6
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        bar.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
+        return bar
+    }
+
+    @objc private func actionTapped(_ b: NSButton) {
+        guard b.tag >= 0, b.tag < actions.count else { return }
+        onAction?(actions[b.tag].cmd)
+    }
 
     private func askCard(_ ask: AgentAsk) -> NSView {
         cardAsks[ask.sessionID] = ask
@@ -2673,6 +2704,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         listController.onReply = { [weak self] ask, text in self?.replyToAsk(ask, text: text) }
         listController.onFocusAsk = { [weak self] ask in self?.focusTerminalFor(ask) }
         listController.onPermission = { [weak self] ask, decision in self?.answerAsk(ask, decision: decision) }
+        listController.onAction = { [weak self] cmd in self?.runSavedAction(cmd) }
 
         // Global hotkey ⌃⌥N toggles the panel. Carbon RegisterEventHotKey works
         // without Accessibility/Input-Monitoring permission, unlike key monitors.
@@ -2704,6 +2736,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // the external-terminal keystroke-injection path was removed in 2.9.15;
         // clear the leftover opt-in flag so nothing ever reads it again
         try? FileManager.default.removeItem(at: configURL("ext-inject"))
+        readSavedActions()
         // fixed chord ⌃⌥⇧⌘K, not user-configurable, registered once and never
         // torn down (see EmergencyKill)
         let killKeyID = EventHotKeyID(signature: OSType(0x414E_4348), id: 3)
@@ -2825,6 +2858,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard expanded != on else { return }
         expanded = on
         zoomed = false
+        if on { readSavedActions() }  // pick up external edits to the actions file
         listController.zoomFactor = 1
         listController.contentWidth = panelContentWidth()
         // Attach the list only while expanded — its Auto Layout content would
@@ -3786,6 +3820,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             row(L("term_dir"), [termDirLbl, button(L("choose_dir"), #selector(chooseTermDir)),
                                 button(L("clear_dir"), #selector(clearTermDir))]),
             row(L("ollama_model"), [ollamaPopup]),
+            row(L("actions_title"), [button(L("actions_edit"), #selector(editActions))]),
             row(L("term_size"), [termSizeField, termSizePctLabel]),
             row(L("panel_alpha"), [panelAlphaField, paPct]),
             row(L("term_alpha"), [termAlphaField, taPct]),
@@ -4357,6 +4392,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         listController.asks = asks
         let safe = sanitizedSessionID(ask.sessionID)
         try? FileManager.default.removeItem(at: asksDir.appendingPathComponent("\(safe).json"))
+    }
+
+    // MARK: - Saved actions (frequent shell commands, run from the notch)
+
+    private var actionsURL: URL { configURL("actions") }
+
+    /// Parse ~/.config/agent-notch/actions — one per line, "name :: command".
+    private func readSavedActions() {
+        let txt = (try? String(contentsOf: actionsURL, encoding: .utf8)) ?? ""
+        listController.actions = txt.split(whereSeparator: \.isNewline).compactMap { line in
+            let s = line.trimmingCharacters(in: .whitespaces)
+            guard !s.isEmpty, !s.hasPrefix("#"), let r = s.range(of: "::") else { return nil }
+            let name = String(s[..<r.lowerBound]).trimmingCharacters(in: .whitespaces)
+            let cmd = String(s[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+            return name.isEmpty || cmd.isEmpty ? nil : (name: name, cmd: cmd)
+        }
+    }
+
+    @objc private func editActions() {
+        if !FileManager.default.fileExists(atPath: actionsURL.path) {
+            let template = """
+            # Saved actions — one per line:  name :: command
+            # Acciones guardadas — una por línea:  nombre :: comando
+            # build :: swift build
+            # status :: git status
+            """
+            try? template.write(to: actionsURL, atomically: true, encoding: .utf8)
+        }
+        NSWorkspace.shared.open(actionsURL)
+    }
+
+    private func runSavedAction(_ cmd: String) {
+        if termWindow?.isVisible == true, let term = focusedTerminal {
+            term.send(txt: cmd + "\r")
+            return
+        }
+        toggleTerminal()  // create/show the notch terminal first
+        // give the fresh shell a beat to reach its prompt before typing
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            self?.focusedTerminal?.send(txt: cmd + "\r")
+        }
     }
 
     private func focusTerminalFor(_ ask: AgentAsk) {
