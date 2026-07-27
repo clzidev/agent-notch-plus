@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.29"
+let appVersion = "2.9.30"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -89,6 +89,8 @@ enum L10n {
             "The turn is still open — the agent is waiting on its subagents/tools, not on you.",
             "El turno sigue abierto — el agente espera a sus subagentes/herramientas, no a vos."],
         "go_to": ["Go to", "Ir a"],
+        "side_places": ["PLACES", "LUGARES"],
+        "side_favs": ["FAVORITES", "FAVORITOS"],
         "g_cores": ["cores", "núcleos"],
         "g_free": ["free", "libre"],
         "g_disk": ["disk", "disco"],
@@ -2476,7 +2478,7 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
         table.addTableColumn(NSTableColumn(identifier: .init("file")))
         table.headerView = nil
         table.backgroundColor = .black
-        table.rowHeight = 22
+        table.rowHeight = 26
         table.style = .plain
         table.dataSource = self
         table.delegate = self
@@ -2490,7 +2492,7 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
         scroll.translatesAutoresizingMaskIntoConstraints = false
         addSubview(scroll)
         NSLayoutConstraint.activate([
-            headerLabel.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+            headerLabel.topAnchor.constraint(equalTo: topAnchor, constant: 6),
             headerLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
             headerLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
             headerRule.topAnchor.constraint(equalTo: headerLabel.bottomAnchor, constant: 4),
@@ -2524,7 +2526,17 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
             if ad != bd { return ad && !bd }  // folders first, for hopping around
             return a.lastPathComponent.localizedCaseInsensitiveCompare(b.lastPathComponent) == .orderedAscending
         }
-        headerLabel.stringValue = dir.path == "/" ? "/" : dir.lastPathComponent
+        // "carpeta · 12" — current folder in mint, item count dim
+        let crumb = NSMutableAttributedString()
+        crumb.append(NSAttributedString(
+            string: dir.path == "/" ? "/" : dir.lastPathComponent,
+            attributes: [.foregroundColor: neonMint,
+                         .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold)]))
+        crumb.append(NSAttributedString(
+            string: "  ·  \(items.count)",
+            attributes: [.foregroundColor: NSColor(white: 0.4, alpha: 1),
+                         .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)]))
+        headerLabel.attributedStringValue = crumb
         table.reloadData()
     }
 
@@ -2574,22 +2586,25 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
 
     private func quickCell(icon iconImage: NSImage, text: String) -> NSView {
         let cell = NSTableCellView()
+        let isUp = text == ".."
         let icon = NSImageView(image: iconImage)
         icon.translatesAutoresizingMaskIntoConstraints = false
-        let name = NSTextField(labelWithString: text)
-        name.textColor = NSColor(white: 0.9, alpha: 1)
-        name.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        let name = NSTextField(labelWithString: isUp ? "‹ .." : text)
+        name.textColor = isUp ? NSColor(white: 0.5, alpha: 1) : NSColor(white: 0.92, alpha: 1)
+        name.font = .monospacedSystemFont(ofSize: 11.5, weight: isUp ? .regular : .medium)
         name.lineBreakMode = .byTruncatingTail
         name.translatesAutoresizingMaskIntoConstraints = false
+        if isUp { icon.isHidden = true }
         cell.addSubview(icon)
         cell.addSubview(name)
         NSLayoutConstraint.activate([
-            icon.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+            icon.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
             icon.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 16),
-            icon.heightAnchor.constraint(equalToConstant: 16),
-            name.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 5),
-            name.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+            icon.widthAnchor.constraint(equalToConstant: 18),
+            icon.heightAnchor.constraint(equalToConstant: 18),
+            name.leadingAnchor.constraint(equalTo: isUp ? cell.leadingAnchor : icon.trailingAnchor,
+                                          constant: isUp ? 10 : 7),
+            name.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
             name.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
         ])
         return cell
@@ -2637,6 +2652,9 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
     private var dir: URL
     private var items: [URL] = []
     private var sidebar: [(title: String, url: URL, custom: Bool)] = []
+    // rendered sidebar rows: section headers interleaved with entries
+    private enum SideRow { case header(String), entry(Int) }
+    private var sideRows: [SideRow] = []
     private var previewItems: [URL] = []
     private let sideTable = NSTableView()
     private let table = FBTableView()
@@ -2679,10 +2697,20 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
         sideScroll.backgroundColor = NSColor(white: 0.07, alpha: 1)
         sideScroll.translatesAutoresizingMaskIntoConstraints = false
 
-        // path bar
-        let up = NSButton(title: "▲", target: self, action: #selector(goUp))
+        // path bar strip: subtle raised header with a hairline underneath
+        let headerBG = NSView()
+        headerBG.wantsLayer = true
+        headerBG.layer?.backgroundColor = NSColor(white: 1, alpha: 0.035).cgColor
+        headerBG.translatesAutoresizingMaskIntoConstraints = false
+        let headerRule = NSView()
+        headerRule.wantsLayer = true
+        headerRule.layer?.backgroundColor = NSColor(white: 1, alpha: 0.07).cgColor
+        headerRule.translatesAutoresizingMaskIntoConstraints = false
+        let up = NSButton(title: "↑", target: self, action: #selector(goUp))
         up.isBordered = false
+        up.font = .monospacedSystemFont(ofSize: 12, weight: .bold)
         up.contentTintColor = neonMint
+        up.toolTip = "⌘↑"
         up.translatesAutoresizingMaskIntoConstraints = false
         pathLabel.textColor = .secondaryLabelColor
         pathLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
@@ -2715,6 +2743,8 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
         scroll.translatesAutoresizingMaskIntoConstraints = false
 
         addSubview(sideScroll)
+        addSubview(headerBG)
+        addSubview(headerRule)
         addSubview(up)
         addSubview(pathLabel)
         addSubview(scroll)
@@ -2722,14 +2752,22 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
             sideScroll.topAnchor.constraint(equalTo: topAnchor),
             sideScroll.bottomAnchor.constraint(equalTo: bottomAnchor),
             sideScroll.leadingAnchor.constraint(equalTo: leadingAnchor),
-            sideScroll.widthAnchor.constraint(equalToConstant: 140),
-            up.topAnchor.constraint(equalTo: topAnchor, constant: 2),
-            up.leadingAnchor.constraint(equalTo: sideScroll.trailingAnchor, constant: 6),
+            sideScroll.widthAnchor.constraint(equalToConstant: 148),
+            headerBG.topAnchor.constraint(equalTo: topAnchor),
+            headerBG.leadingAnchor.constraint(equalTo: sideScroll.trailingAnchor),
+            headerBG.trailingAnchor.constraint(equalTo: trailingAnchor),
+            headerBG.heightAnchor.constraint(equalToConstant: 30),
+            headerRule.topAnchor.constraint(equalTo: headerBG.bottomAnchor),
+            headerRule.leadingAnchor.constraint(equalTo: headerBG.leadingAnchor),
+            headerRule.trailingAnchor.constraint(equalTo: trailingAnchor),
+            headerRule.heightAnchor.constraint(equalToConstant: 1),
+            up.centerYAnchor.constraint(equalTo: headerBG.centerYAnchor),
+            up.leadingAnchor.constraint(equalTo: headerBG.leadingAnchor, constant: 10),
             up.widthAnchor.constraint(equalToConstant: 20),
-            pathLabel.centerYAnchor.constraint(equalTo: up.centerYAnchor),
-            pathLabel.leadingAnchor.constraint(equalTo: up.trailingAnchor, constant: 4),
-            pathLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
-            scroll.topAnchor.constraint(equalTo: up.bottomAnchor, constant: 2),
+            pathLabel.centerYAnchor.constraint(equalTo: headerBG.centerYAnchor),
+            pathLabel.leadingAnchor.constraint(equalTo: up.trailingAnchor, constant: 6),
+            pathLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            scroll.topAnchor.constraint(equalTo: headerRule.bottomAnchor, constant: 3),
             scroll.leadingAnchor.constraint(equalTo: sideScroll.trailingAnchor),
             scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
@@ -2781,9 +2819,12 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
     /// the sidebar, the first file selected, and keyboard focus on the list so
     /// the arrow keys work without a click.
     func focusInitial() {
-        if let i = sidebar.firstIndex(where: { $0.url.path == dir.path }) {
-            sideTable.selectRowIndexes(IndexSet(integer: i), byExtendingSelection: false)
-            sideTable.scrollRowToVisible(i)
+        if let r = sideRows.firstIndex(where: { row in
+            if case .entry(let i) = row { return sidebar[i].url.path == dir.path }
+            return false
+        }) {
+            sideTable.selectRowIndexes(IndexSet(integer: r), byExtendingSelection: false)
+            sideTable.scrollRowToVisible(r)
         }
         if !items.isEmpty {
             table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
@@ -2853,7 +2894,28 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
                 .filter { fm.fileExists(atPath: $0.path) }
                 .map { (fm.displayName(atPath: $0.path), $0, true) }
         sidebar = entries + favs
+        rebuildSideRows()
+    }
+
+    /// Interleave section headers ("PLACES" / "FAVORITES") with the entries.
+    private func rebuildSideRows() {
+        sideRows = []
+        let places = sidebar.indices.filter { !sidebar[$0].custom }
+        let favs = sidebar.indices.filter { sidebar[$0].custom }
+        if !places.isEmpty {
+            sideRows.append(.header(L("side_places")))
+            sideRows += places.map { .entry($0) }
+        }
+        if !favs.isEmpty {
+            sideRows.append(.header(L("side_favs")))
+            sideRows += favs.map { .entry($0) }
+        }
         sideTable.reloadData()
+    }
+
+    private func sideEntryIndex(atRow row: Int) -> Int? {
+        guard sideRows.indices.contains(row), case .entry(let i) = sideRows[row] else { return nil }
+        return i
     }
 
     private func saveFavorites() {
@@ -2862,11 +2924,10 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
     }
 
     @objc private func removeFavorite() {
-        let row = sideTable.clickedRow
-        guard row >= 0, row < sidebar.count, sidebar[row].custom else { return }
-        sidebar.remove(at: row)
+        guard let i = sideEntryIndex(atRow: sideTable.clickedRow), sidebar[i].custom else { return }
+        sidebar.remove(at: i)
         saveFavorites()
-        sideTable.reloadData()
+        rebuildSideRows()
     }
 
     // MARK: clipboard / Quick Look
@@ -2944,33 +3005,84 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
     // MARK: tables
 
     func numberOfRows(in tableView: NSTableView) -> Int {
-        tableView === sideTable ? sidebar.count : items.count
+        tableView === sideTable ? sideRows.count : items.count
+    }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        if tableView === sideTable, case .header = sideRows[row] { return 24 }
+        return 26
+    }
+
+    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
+        tableView === sideTable ? sideEntryIndex(atRow: row) != nil : true
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         if tableView === sideTable {
-            guard row < sidebar.count else { return nil }
-            let entry = sidebar[row]
-            return iconCell(icon: NSWorkspace.shared.icon(forFile: entry.url.path),
-                            text: entry.title, color: NSColor(white: 0.85, alpha: 1))
+            guard sideRows.indices.contains(row) else { return nil }
+            switch sideRows[row] {
+            case .header(let title):
+                return sideHeaderCell(title)
+            case .entry(let i):
+                return iconCell(icon: NSWorkspace.shared.icon(forFile: sidebar[i].url.path),
+                                text: sidebar[i].title, color: NSColor(white: 0.87, alpha: 1))
+            }
         }
         guard row < items.count else { return nil }
-        let url = items[row]
-        switch tableColumn?.identifier.rawValue {
-        case "name":
-            return iconCell(icon: NSWorkspace.shared.icon(forFile: url.path),
-                            text: url.lastPathComponent, color: NSColor(white: 0.9, alpha: 1))
-        case "date":
-            let d = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-            return textCell(d.map { Self.dateFmt.string(from: $0) } ?? "—")
-        case "size":
-            let vals = try? url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
-            let text = vals?.isDirectory == true ? "—"
-                : ByteCountFormatter.string(fromByteCount: Int64(vals?.fileSize ?? 0), countStyle: .file)
-            return textCell(text)
-        default:
-            return nil
-        }
+        return fileCell(items[row])
+    }
+
+    /// Tiny mint caps section title, bottom-aligned like Finder's sidebar.
+    private func sideHeaderCell(_ text: String) -> NSView {
+        let cell = NSTableCellView()
+        let l = NSTextField(labelWithString: text)
+        l.font = .monospacedSystemFont(ofSize: 9, weight: .bold)
+        l.textColor = neonMint.withAlphaComponent(0.65)
+        l.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(l)
+        NSLayoutConstraint.activate([
+            l.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 10),
+            l.bottomAnchor.constraint(equalTo: cell.bottomAnchor, constant: -3),
+        ])
+        return cell
+    }
+
+    /// Icon + name (folders semibold/brighter) + right-aligned dim size for
+    /// files — one clean row, Finder-quality.
+    private func fileCell(_ url: URL) -> NSView {
+        let vals = try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey, .fileSizeKey])
+        let isFolder = vals?.isDirectory == true && vals?.isPackage != true
+        let cell = NSTableCellView()
+        let iv = NSImageView(image: NSWorkspace.shared.icon(forFile: url.path))
+        iv.translatesAutoresizingMaskIntoConstraints = false
+        let name = NSTextField(labelWithString: url.lastPathComponent)
+        name.textColor = isFolder ? NSColor(white: 0.95, alpha: 1) : NSColor(white: 0.85, alpha: 1)
+        name.font = .monospacedSystemFont(ofSize: 11.5, weight: isFolder ? .semibold : .regular)
+        name.lineBreakMode = .byTruncatingTail
+        name.translatesAutoresizingMaskIntoConstraints = false
+        name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let detailText = isFolder ? "▸"
+            : ByteCountFormatter.string(fromByteCount: Int64(vals?.fileSize ?? 0), countStyle: .file)
+        let detail = NSTextField(labelWithString: detailText)
+        detail.textColor = NSColor(white: 0.42, alpha: 1)
+        detail.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        detail.translatesAutoresizingMaskIntoConstraints = false
+        detail.setContentHuggingPriority(.required, for: .horizontal)
+        cell.addSubview(iv)
+        cell.addSubview(name)
+        cell.addSubview(detail)
+        NSLayoutConstraint.activate([
+            iv.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
+            iv.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            iv.widthAnchor.constraint(equalToConstant: 18),
+            iv.heightAnchor.constraint(equalToConstant: 18),
+            name.leadingAnchor.constraint(equalTo: iv.trailingAnchor, constant: 7),
+            name.trailingAnchor.constraint(lessThanOrEqualTo: detail.leadingAnchor, constant: -8),
+            name.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            detail.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -10),
+            detail.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+        ])
+        return cell
     }
 
     private func iconCell(icon: NSImage, text: String, color: NSColor) -> NSView {
@@ -2979,18 +3091,18 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
         iv.translatesAutoresizingMaskIntoConstraints = false
         let name = NSTextField(labelWithString: text)
         name.textColor = color
-        name.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        name.font = .monospacedSystemFont(ofSize: 11.5, weight: .regular)
         name.lineBreakMode = .byTruncatingTail
         name.translatesAutoresizingMaskIntoConstraints = false
         cell.addSubview(iv)
         cell.addSubview(name)
         NSLayoutConstraint.activate([
-            iv.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+            iv.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
             iv.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-            iv.widthAnchor.constraint(equalToConstant: 16),
-            iv.heightAnchor.constraint(equalToConstant: 16),
-            name.leadingAnchor.constraint(equalTo: iv.trailingAnchor, constant: 5),
-            name.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+            iv.widthAnchor.constraint(equalToConstant: 18),
+            iv.heightAnchor.constraint(equalToConstant: 18),
+            name.leadingAnchor.constraint(equalTo: iv.trailingAnchor, constant: 7),
+            name.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
             name.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
         ])
         return cell
@@ -3020,13 +3132,12 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard let t = notification.object as? NSTableView else { return }
         if t === sideTable {
-            let row = sideTable.selectedRow
-            guard row >= 0, row < sidebar.count else { return }
+            guard let i = sideEntryIndex(atRow: sideTable.selectedRow) else { return }
             // programmatic selection (focusInitial) also lands here — don't
             // re-navigate into the current dir, it would wipe the file
             // selection that was just placed
-            guard sidebar[row].url.path != dir.path else { return }
-            navigate(to: sidebar[row].url)
+            guard sidebar[i].url.path != dir.path else { return }
+            navigate(to: sidebar[i].url)
         } else if let panel = QLPreviewPanel.shared(), panel.isVisible {
             previewItems = selectedURLs
             if previewItems.isEmpty {
@@ -3065,7 +3176,7 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
         }
         if added {
             saveFavorites()
-            sideTable.reloadData()
+            rebuildSideRows()
         }
         return added
     }
@@ -3457,9 +3568,28 @@ final class BackdropView: NSView {
 }
 
 /// Modern rounded selection for the browser tables (Finder-sidebar style)
-/// instead of the stock edge-to-edge blue bar.
+/// instead of the stock edge-to-edge blue bar — with a soft hover highlight.
 final class RoundedRowView: NSTableRowView {
-    var accent: NSColor = .systemGreen
+    var accent: NSColor = neonMint
+    private var hovered = false
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero,
+                                       options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+    override func mouseEntered(with event: NSEvent) { hovered = true; needsDisplay = true }
+    override func mouseExited(with event: NSEvent) { hovered = false; needsDisplay = true }
+
+    override func drawBackground(in dirtyRect: NSRect) {
+        super.drawBackground(in: dirtyRect)
+        if hovered, !isSelected {
+            NSColor(white: 1, alpha: 0.05).setFill()
+            NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 1), xRadius: 6, yRadius: 6).fill()
+        }
+    }
     override func drawSelection(in dirtyRect: NSRect) {
         guard selectionHighlightStyle != .none else { return }
         let r = bounds.insetBy(dx: 4, dy: 1)
