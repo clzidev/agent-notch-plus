@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.19"
+let appVersion = "2.9.20"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -85,6 +85,7 @@ enum L10n {
         "menubar_mode": ["Menu bar mode:", "Modo barra de menú:"],
         "menubar_check": ["Live in the menu bar instead of the notch (requires restart)",
                           "Vivir en la barra de menú en vez del notch (requiere reiniciar)"],
+        "srv_title": ["DEV SERVERS", "DEV SERVERS"],
         "srv_open": ["Open", "Abrir"],
         "srv_copy": ["Copy", "Copiar"],
         "srv_kill": ["Kill", "Matar"],
@@ -548,6 +549,10 @@ final class UsageTracker {
     private func updateOne(_ path: String) -> Bool {
         guard let fh = FileHandle(forReadingAtPath: path) else { return false }
         defer { try? fh.close() }
+        // first sight of a transcript = historical backfill: count it into the
+        // per-session totals but NOT into the rolling window — old work must
+        // not show up as "spent in the last 5 hours"
+        let isBackfill = files[path] == nil
         let size = (try? fh.seekToEnd()) ?? 0
         var st = files[path] ?? FileState()
         if st.offset > size { st = FileState() }  // truncated/rewritten: start over
@@ -571,7 +576,9 @@ final class UsageTracker {
             let cRead = (usage["cache_read_input_tokens"] as? Int) ?? 0
             let cWrite = (usage["cache_creation_input_tokens"] as? Int) ?? 0
             let p = Self.price((msg["model"] as? String) ?? "")
-            inc.input += inp + cRead + cWrite
+            // ↑ shows FRESH input only (typed + cache writes) — counting the
+            // cache reads of every turn inflated it into absurd figures
+            inc.input += inp + cWrite
             inc.output += out
             // cache reads ≈0.1× and cache writes ≈1.25× the input price
             inc.cost += (Double(inp) * p.inp + Double(out) * p.out
@@ -581,7 +588,7 @@ final class UsageTracker {
         guard inc.input > 0 || inc.output > 0 else { return true }  // offset moved: persist
         st.totals.add(inc)
         files[path] = st
-        events.append((Date(), inc.input, inc.output, inc.cost))
+        if !isBackfill { events.append((Date(), inc.input, inc.output, inc.cost)) }
         return true
     }
 
@@ -595,7 +602,7 @@ final class UsageTracker {
         }
         let evs = events.suffix(2000).map { [$0.when.timeIntervalSince1970, Double($0.input),
                                              Double($0.output), $0.cost] }
-        let root: [String: Any] = ["files": filesObj, "events": evs]
+        let root: [String: Any] = ["v": 2, "files": filesObj, "events": evs]
         if let d = try? JSONSerialization.data(withJSONObject: root) {
             try? d.write(to: saveURL, options: .atomic)
         }
@@ -603,7 +610,10 @@ final class UsageTracker {
 
     private func load() {
         guard let d = try? Data(contentsOf: saveURL),
-              let root = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return }
+              let root = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              // v1 counted cache reads as input and backfilled history into the
+              // 5h window — that data is garbage, start fresh
+              (root["v"] as? Int) == 2 else { return }
         let fm = FileManager.default
         for (p, v) in (root["files"] as? [String: [String: Any]]) ?? [:] {
             guard fm.fileExists(atPath: p) else { continue }  // gone: drop the entry
@@ -1089,7 +1099,12 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         icons.removeAll()
         sessionStack.addArrangedSubview(headerBar())
         if !actions.isEmpty { sessionStack.addArrangedSubview(actionsBar()) }
-        for i in devServers.indices.prefix(5) { sessionStack.addArrangedSubview(serverRow(i)) }
+        if !devServers.isEmpty {
+            // labelled, so the rows don't look like they appeared out of nowhere
+            sessionStack.addArrangedSubview(label(L("srv_title"), size: 9,
+                                                  color: .tertiaryLabelColor, bold: true))
+            for i in devServers.indices.prefix(5) { sessionStack.addArrangedSubview(serverRow(i)) }
+        }
         if sessions.isEmpty {
             sessionStack.addArrangedSubview(label(L("no_sessions"), size: 12, color: .secondaryLabelColor, bold: false))
             return
@@ -4514,13 +4529,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Local dev servers
 
-    // command names worth showing — everything else on a LISTEN port is
-    // system/app noise (rapportd, Spotify, …)
-    private static let devServerNames = ["node", "python", "ruby", "php", "deno", "bun",
-                                         "java", "go", "beam", "rails", "flask", "vite",
-                                         "next", "npm", "pnpm", "yarn", "cargo", "dotnet",
-                                         "swift", "gradle", "webpack", "ollama", "docker",
-                                         "puma", "uvicorn", "gunicorn", "caddy", "hugo"]
+    // process names worth showing — everything else on a LISTEN port is
+    // system/app noise (Docker Desktop's backend, Google Drive, Spotify, …)
+    private static let devServerNames: Set<String> = ["node", "python", "ruby", "php", "deno",
+                                                      "bun", "java", "beam", "rails", "flask",
+                                                      "vite", "next", "npm", "pnpm", "yarn",
+                                                      "cargo", "dotnet", "gradle", "webpack",
+                                                      "ollama", "puma", "uvicorn", "gunicorn",
+                                                      "caddy", "hugo", "php-fpm", "rackup"]
+
+    /// Exact process-name match, allowing only a version/variant suffix
+    /// ("python3.12", "beam.smp", "next-server"). A substring match was far
+    /// too broad — "go" used to match Google Drive.
+    private static func isDevServerName(_ cmd: String) -> Bool {
+        let name = cmd.lowercased()
+        return devServerNames.contains(where: { entry in
+            guard name.hasPrefix(entry) else { return false }
+            guard name.count > entry.count else { return true }  // exact
+            let next = name[name.index(name.startIndex, offsetBy: entry.count)]
+            return "0123456789.-_".contains(next)
+        })
+    }
 
     /// One `lsof` sweep of the user's listening TCP ports (called on scanQueue,
     /// only while the panel is expanded).
@@ -4550,9 +4579,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case "n":
                 // "*:5173", "127.0.0.1:8000", "[::1]:3000"
                 guard let portStr = val.split(separator: ":").last, let port = Int(portStr),
-                      port > 1023, !seenPorts.contains(port) else { continue }
-                let lowered = curCmd.lowercased()
-                guard Self.devServerNames.contains(where: { lowered.contains($0) }) else { continue }
+                      port > 1023, !seenPorts.contains(port),
+                      Self.isDevServerName(curCmd) else { continue }
                 seenPorts.insert(port)
                 servers.append((port, curPid, curCmd))
             default: break
