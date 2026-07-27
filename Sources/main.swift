@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.20"
+let appVersion = "2.9.21"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -85,11 +85,6 @@ enum L10n {
         "menubar_mode": ["Menu bar mode:", "Modo barra de menú:"],
         "menubar_check": ["Live in the menu bar instead of the notch (requires restart)",
                           "Vivir en la barra de menú en vez del notch (requiere reiniciar)"],
-        "srv_title": ["DEV SERVERS", "DEV SERVERS"],
-        "srv_open": ["Open", "Abrir"],
-        "srv_copy": ["Copy", "Copiar"],
-        "srv_kill": ["Kill", "Matar"],
-        "srv_kill_title": ["Stop this dev server?", "¿Frenar este dev server?"],
         "actions_title": ["Saved actions:", "Acciones guardadas:"],
         "actions_edit": ["Edit…", "Editar…"],
         "ollama_model": ["Ollama model (/ia):", "Modelo de Ollama (/ia):"],
@@ -1033,11 +1028,6 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     // saved shell actions (~/.config/agent-notch/actions) shown as buttons
     var actions: [(name: String, cmd: String)] = []
     var onAction: ((String) -> Void)?
-    // local dev servers detected while the panel is open
-    var devServers: [(port: Int, pid: Int32, name: String)] = []
-    var onServerOpen: ((Int) -> Void)?
-    var onServerCopy: ((Int) -> Void)?
-    var onServerKill: ((Int32, String) -> Void)?
     var onReply: ((AgentAsk, String) -> Void)?
     var onFocusAsk: ((AgentAsk) -> Void)?
     var onPermission: ((AgentAsk, String) -> Void)?  // decision: allow/deny/always
@@ -1099,12 +1089,6 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         icons.removeAll()
         sessionStack.addArrangedSubview(headerBar())
         if !actions.isEmpty { sessionStack.addArrangedSubview(actionsBar()) }
-        if !devServers.isEmpty {
-            // labelled, so the rows don't look like they appeared out of nowhere
-            sessionStack.addArrangedSubview(label(L("srv_title"), size: 9,
-                                                  color: .tertiaryLabelColor, bold: true))
-            for i in devServers.indices.prefix(5) { sessionStack.addArrangedSubview(serverRow(i)) }
-        }
         if sessions.isEmpty {
             sessionStack.addArrangedSubview(label(L("no_sessions"), size: 12, color: .secondaryLabelColor, bold: false))
             return
@@ -1190,41 +1174,6 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         onAction?(actions[b.tag].cmd)
     }
 
-    /// ":5173 node · Open · Copy · Kill" — one compact row per dev server.
-    private func serverRow(_ i: Int) -> NSView {
-        let s = devServers[i]
-        let name = label(":\(s.port)  \(s.name)", size: 10, color: .systemTeal, bold: true)
-        name.font = .monospacedSystemFont(ofSize: 10, weight: .semibold)
-        func sbtn(_ title: String, _ sel: Selector) -> NSButton {
-            let b = FirstMouseButton(title: title, target: self, action: sel)
-            b.bezelStyle = .rounded
-            b.controlSize = .mini
-            b.tag = i
-            return b
-        }
-        let bar = NSStackView(views: [name, NSView(),
-                                      sbtn(L("srv_open"), #selector(serverOpen(_:))),
-                                      sbtn(L("srv_copy"), #selector(serverCopy(_:))),
-                                      sbtn(L("srv_kill"), #selector(serverKill(_:)))])
-        bar.orientation = .horizontal
-        bar.spacing = 6
-        bar.translatesAutoresizingMaskIntoConstraints = false
-        bar.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
-        return bar
-    }
-
-    @objc private func serverOpen(_ b: NSButton) {
-        guard devServers.indices.contains(b.tag) else { return }
-        onServerOpen?(devServers[b.tag].port)
-    }
-    @objc private func serverCopy(_ b: NSButton) {
-        guard devServers.indices.contains(b.tag) else { return }
-        onServerCopy?(devServers[b.tag].port)
-    }
-    @objc private func serverKill(_ b: NSButton) {
-        guard devServers.indices.contains(b.tag) else { return }
-        onServerKill?(devServers[b.tag].pid, ":\(devServers[b.tag].port) \(devServers[b.tag].name)")
-    }
 
     private func askCard(_ ask: AgentAsk) -> NSView {
         cardAsks[ask.sessionID] = ask
@@ -1313,7 +1262,8 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         return wrapCard(NSStackView(views: [head, msg, controls]), head: head)
     }
 
-    /// Shared card chrome: dark amber background, orange border, fixed width.
+    /// Shared card chrome: dark amber gradient with a breathing orange border
+    /// — an unanswered question should be impossible to miss.
     private func wrapCard(_ col: NSStackView, head: NSView) -> NSView {
         col.orientation = .vertical
         col.alignment = .leading
@@ -1321,13 +1271,9 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         col.translatesAutoresizingMaskIntoConstraints = false
         head.widthAnchor.constraint(equalTo: col.widthAnchor).isActive = true
 
-        let card = NSView()
-        card.wantsLayer = true
-        card.layer?.backgroundColor = NSColor(calibratedRed: 0.15, green: 0.1, blue: 0.02, alpha: 1).cgColor
-        card.layer?.cornerRadius = 10
-        card.layer?.borderWidth = 1
-        card.layer?.borderColor = NSColor.systemOrange.withAlphaComponent(0.6).cgColor
-        card.translatesAutoresizingMaskIntoConstraints = false
+        let card = GlowCardView(accent: .systemOrange,
+                                base: NSColor(calibratedRed: 0.15, green: 0.1, blue: 0.02, alpha: 1),
+                                flair: .ask)
         card.addSubview(col)
         NSLayoutConstraint.activate([
             col.topAnchor.constraint(equalTo: card.topAnchor, constant: 8),
@@ -1452,7 +1398,9 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         let status: (String, NSColor) = s.anyBusy ? (L("st_working"), .systemGreen)
             : s.anyLive ? (L("st_waiting"), .systemOrange)
             : (L("st_done"), NSColor.systemGreen.withAlphaComponent(0.75))
-        views.append(label(status.0, size: 10, color: status.1, bold: true))
+        let statusLabel = label(status.0, size: 10, color: status.1, bold: true)
+        if s.anyBusy { pulse(statusLabel) }  // "Trabajando…" breathes while it works
+        views.append(statusLabel)
 
         let col = NSStackView(views: views)
         col.orientation = .vertical
@@ -1461,15 +1409,9 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         col.translatesAutoresizingMaskIntoConstraints = false
         top.widthAnchor.constraint(equalTo: col.widthAnchor).isActive = true
 
-        let card = NSView()
-        card.wantsLayer = true
-        card.layer?.backgroundColor = NSColor(white: 0.09, alpha: 1).cgColor
-        card.layer?.cornerRadius = 10
-        card.layer?.borderWidth = 1
         let accent = s.kind == .claude ? IndicatorView.claudeOrange : IndicatorView.codexTeal
-        card.layer?.borderColor = (s.anyBusy ? accent.withAlphaComponent(0.55)
-                                             : NSColor(white: 0.2, alpha: 1)).cgColor
-        card.translatesAutoresizingMaskIntoConstraints = false
+        let card = GlowCardView(accent: accent, base: NSColor(white: 0.09, alpha: 1),
+                                flair: s.anyBusy ? .running : .none)
         card.addSubview(col)
         NSLayoutConstraint.activate([
             col.topAnchor.constraint(equalTo: card.topAnchor, constant: 8),
@@ -1479,6 +1421,19 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
             card.widthAnchor.constraint(equalToConstant: contentWidth),
         ])
         return card
+    }
+
+    /// Slow opacity breathing (GPU-composited, phase-locked across rebuilds).
+    private func pulse(_ v: NSView, low: Float = 0.45, duration: Double = 0.9) {
+        v.wantsLayer = true
+        let a = CABasicAnimation(keyPath: "opacity")
+        a.fromValue = 1
+        a.toValue = low
+        a.duration = duration
+        a.autoreverses = true
+        a.repeatCount = .infinity
+        a.timeOffset = CACurrentMediaTime().truncatingRemainder(dividingBy: duration * 2)
+        v.layer?.add(a, forKey: "pulse")
     }
 
     private func label(_ text: String, size: CGFloat, color: NSColor, bold: Bool, lines: Int = 1) -> NSTextField {
@@ -1754,6 +1709,104 @@ final class FirstMouseTextField: NSTextField {
 /// a permission card must be answerable in one click, not two.
 final class FirstMouseButton: NSButton {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+/// Panel card with GPU-composited flair — everything is pure Core Animation
+/// (composited by WindowServer, no timers, ~zero CPU per frame):
+/// - a soft top-lit gradient background instead of a flat fill
+/// - `.running`: a slowly revolving conic ring around the border, in the
+///   agent's accent color — the card itself says "estoy laburando"
+/// - `.ask`: the border breathes in orange until you answer
+/// Animations are phase-locked to the clock, so the 3 s list rebuilds don't
+/// visibly reset them mid-spin.
+final class GlowCardView: NSView {
+    enum Flair { case none, running, ask }
+    private let accent: NSColor
+    private let flair: Flair
+    private let radius: CGFloat = 10
+    private let bg = CAGradientLayer()
+    private let ring = CALayer()
+    private let ringMask = CAShapeLayer()
+    private let ringGrad = CAGradientLayer()
+
+    init(accent: NSColor, base: NSColor, flair: Flair) {
+        self.accent = accent
+        self.flair = flair
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        guard let host = layer else { return }
+        host.cornerRadius = radius
+        host.masksToBounds = true
+        host.borderWidth = 1
+        let top = base.blended(withFraction: 0.10, of: .white) ?? base
+        let bottom = base.blended(withFraction: 0.35, of: .black) ?? base
+        bg.colors = [top.cgColor, bottom.cgColor]
+        bg.startPoint = CGPoint(x: 0.5, y: 1)
+        bg.endPoint = CGPoint(x: 0.5, y: 0)
+        host.insertSublayer(bg, at: 0)
+        switch flair {
+        case .none:
+            host.borderColor = NSColor(white: 0.2, alpha: 1).cgColor
+        case .running:
+            host.borderColor = accent.withAlphaComponent(0.20).cgColor
+            ringMask.fillColor = NSColor.clear.cgColor
+            ringMask.strokeColor = NSColor.white.cgColor
+            ringMask.lineWidth = 2.5
+            ring.mask = ringMask
+            ringGrad.type = .conic
+            ringGrad.startPoint = CGPoint(x: 0.5, y: 0.5)
+            ringGrad.endPoint = CGPoint(x: 0.5, y: 1)
+            // two bright arcs chasing each other around the card
+            ringGrad.colors = [accent.withAlphaComponent(0.95).cgColor,
+                               accent.withAlphaComponent(0.04).cgColor,
+                               accent.withAlphaComponent(0.55).cgColor,
+                               accent.withAlphaComponent(0.04).cgColor,
+                               accent.withAlphaComponent(0.95).cgColor]
+            ring.addSublayer(ringGrad)
+            host.addSublayer(ring)
+            let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+            spin.fromValue = 0
+            spin.toValue = -2 * Double.pi
+            spin.duration = 3.5
+            spin.repeatCount = .infinity
+            spin.timeOffset = CACurrentMediaTime().truncatingRemainder(dividingBy: 3.5)
+            ringGrad.add(spin, forKey: "spin")
+        case .ask:
+            host.borderWidth = 1.5
+            host.borderColor = accent.withAlphaComponent(0.6).cgColor
+            let breathe = CABasicAnimation(keyPath: "borderColor")
+            breathe.fromValue = accent.withAlphaComponent(0.25).cgColor
+            breathe.toValue = accent.withAlphaComponent(0.95).cgColor
+            breathe.duration = 1.1
+            breathe.autoreverses = true
+            breathe.repeatCount = .infinity
+            breathe.timeOffset = CACurrentMediaTime().truncatingRemainder(dividingBy: 2.2)
+            host.add(breathe, forKey: "breathe")
+        }
+    }
+    required init?(coder: NSCoder) { nil }
+
+    override func layout() {
+        super.layout()
+        guard let host = layer else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        bg.frame = host.bounds
+        if flair == .running {
+            ring.frame = host.bounds
+            ringMask.path = CGPath(roundedRect: host.bounds.insetBy(dx: 1, dy: 1),
+                                   cornerWidth: radius - 1, cornerHeight: radius - 1,
+                                   transform: nil)
+            // the gradient square must cover the diagonal so corners never
+            // run dry while it rotates
+            let side = sqrt(host.bounds.width * host.bounds.width
+                            + host.bounds.height * host.bounds.height)
+            ringGrad.bounds = CGRect(x: 0, y: 0, width: side, height: side)
+            ringGrad.position = CGPoint(x: host.bounds.midX, y: host.bounds.midY)
+        }
+        CATransaction.commit()
+    }
 }
 
 /// Borderless panel that can take keyboard focus (for the notch terminal).
@@ -2774,16 +2827,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         listController.onFocusAsk = { [weak self] ask in self?.focusTerminalFor(ask) }
         listController.onPermission = { [weak self] ask, decision in self?.answerAsk(ask, decision: decision) }
         listController.onAction = { [weak self] cmd in self?.runSavedAction(cmd) }
-        listController.onServerOpen = { port in
-            NSWorkspace.shared.open(URL(string: "http://localhost:\(port)")!)
-        }
-        listController.onServerCopy = { port in
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString("http://localhost:\(port)", forType: .string)
-        }
-        listController.onServerKill = { [weak self] pid, desc in
-            self?.killDevServer(pid: pid, label: desc)
-        }
 
         // Global hotkey ⌃⌥N toggles the panel. Carbon RegisterEventHotKey works
         // without Accessibility/Input-Monitoring permission, unlike key monitors.
@@ -3054,10 +3097,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func rescan() {
         if scanInFlight { return }
         scanInFlight = true
-        let scanServers = expanded  // read on main; dev servers only matter while visible
         scanQueue.async { [weak self] in
             guard let self else { return }
-            let servers = scanServers ? self.scanDevServers() : []
             // Process discovery is the authoritative liveness signal. Keys are
             // transcript paths, or "cwd#<encoded>#<i>" for claude's cwd fallback.
             var seen = Set<String>()
@@ -3127,7 +3168,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 IndicatorView.refreshPetChoice()
                 IndicatorView.refreshCustomGifs()
                 self.applyAsks(pendingAsks)
-                self.listController.devServers = servers
                 self.listController.sessions = result
                 // busy → mascot; alive-but-quiet → nothing (idle, not done);
                 // process exited → done blob (cleared on terminal focus)
@@ -4525,82 +4565,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         listController.asks = asks
         let safe = sanitizedSessionID(ask.sessionID)
         try? FileManager.default.removeItem(at: asksDir.appendingPathComponent("\(safe).json"))
-    }
-
-    // MARK: - Local dev servers
-
-    // process names worth showing — everything else on a LISTEN port is
-    // system/app noise (Docker Desktop's backend, Google Drive, Spotify, …)
-    private static let devServerNames: Set<String> = ["node", "python", "ruby", "php", "deno",
-                                                      "bun", "java", "beam", "rails", "flask",
-                                                      "vite", "next", "npm", "pnpm", "yarn",
-                                                      "cargo", "dotnet", "gradle", "webpack",
-                                                      "ollama", "puma", "uvicorn", "gunicorn",
-                                                      "caddy", "hugo", "php-fpm", "rackup"]
-
-    /// Exact process-name match, allowing only a version/variant suffix
-    /// ("python3.12", "beam.smp", "next-server"). A substring match was far
-    /// too broad — "go" used to match Google Drive.
-    private static func isDevServerName(_ cmd: String) -> Bool {
-        let name = cmd.lowercased()
-        return devServerNames.contains(where: { entry in
-            guard name.hasPrefix(entry) else { return false }
-            guard name.count > entry.count else { return true }  // exact
-            let next = name[name.index(name.startIndex, offsetBy: entry.count)]
-            return "0123456789.-_".contains(next)
-        })
-    }
-
-    /// One `lsof` sweep of the user's listening TCP ports (called on scanQueue,
-    /// only while the panel is expanded).
-    private func scanDevServers() -> [(port: Int, pid: Int32, name: String)] {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
-        p.arguments = ["-iTCP", "-sTCP:LISTEN", "-P", "-n", "-Fpcn"]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = FileHandle.nullDevice
-        do { try p.run() } catch { return [] }
-        let pid = p.processIdentifier
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 2.0) { [weak p] in
-            if let p, p.isRunning { kill(pid, SIGKILL) }  // closes the pipe below
-        }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard let out = String(data: data, encoding: .utf8) else { return [] }
-        var servers: [(port: Int, pid: Int32, name: String)] = []
-        var curPid: Int32 = 0
-        var curCmd = ""
-        var seenPorts = Set<Int>()
-        for line in out.split(whereSeparator: \.isNewline) {
-            let val = String(line.dropFirst())
-            switch line.first {
-            case "p": curPid = Int32(val) ?? 0
-            case "c": curCmd = val
-            case "n":
-                // "*:5173", "127.0.0.1:8000", "[::1]:3000"
-                guard let portStr = val.split(separator: ":").last, let port = Int(portStr),
-                      port > 1023, !seenPorts.contains(port),
-                      Self.isDevServerName(curCmd) else { continue }
-                seenPorts.insert(port)
-                servers.append((port, curPid, curCmd))
-            default: break
-            }
-        }
-        return servers.sorted { $0.port < $1.port }
-    }
-
-    private func killDevServer(pid: Int32, label desc: String) {
-        let a = NSAlert()
-        a.messageText = L("srv_kill_title")
-        a.informativeText = desc
-        a.addButton(withTitle: L("srv_kill"))
-        a.addButton(withTitle: L("cancel"))
-        a.alertStyle = .warning
-        let saved: [(NSWindow, NSWindow.Level)] = [window, indicatorWindow, termWindow]
-            .compactMap { $0 }.map { ($0, $0.level) }
-        saved.forEach { $0.0.level = .normal }
-        defer { saved.forEach { $0.0.level = $0.1 } }
-        if runModalSafely(a) == .alertFirstButtonReturn { kill(pid, SIGTERM) }
     }
 
     // MARK: - Saved actions (frequent shell commands, run from the notch)
