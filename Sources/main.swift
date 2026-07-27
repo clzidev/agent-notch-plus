@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.22"
+let appVersion = "2.9.23"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -2245,9 +2245,12 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
     /// External sync (terminal `cd`): update the view without echoing back.
     func setDirectory(_ url: URL) {
         guard url.path != dir.path else { return }
+        slideList(nil)  // external jump: crossfade
         dir = url
         reload()
     }
+
+    private let headerLabel = NSTextField(labelWithString: "")
 
     init(startDir: URL) {
         dir = startDir
@@ -2256,6 +2259,17 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
         layer?.backgroundColor = NSColor.black.cgColor
         // hard minimum: the split view must never crush the pane into a sliver
         widthAnchor.constraint(greaterThanOrEqualToConstant: 200).isActive = true
+        // mini title bar: current folder in green, hairline underneath
+        headerLabel.font = .monospacedSystemFont(ofSize: 10, weight: .semibold)
+        headerLabel.textColor = .systemGreen
+        headerLabel.lineBreakMode = .byTruncatingHead
+        headerLabel.translatesAutoresizingMaskIntoConstraints = false
+        let headerRule = NSView()
+        headerRule.wantsLayer = true
+        headerRule.layer?.backgroundColor = NSColor(white: 1, alpha: 0.07).cgColor
+        headerRule.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(headerLabel)
+        addSubview(headerRule)
         // no path bar / ▲ button — the ".." row handles going up
         table.addTableColumn(NSTableColumn(identifier: .init("file")))
         table.headerView = nil
@@ -2274,7 +2288,14 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
         scroll.translatesAutoresizingMaskIntoConstraints = false
         addSubview(scroll)
         NSLayoutConstraint.activate([
-            scroll.topAnchor.constraint(equalTo: topAnchor),
+            headerLabel.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+            headerLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            headerLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            headerRule.topAnchor.constraint(equalTo: headerLabel.bottomAnchor, constant: 4),
+            headerRule.leadingAnchor.constraint(equalTo: leadingAnchor),
+            headerRule.trailingAnchor.constraint(equalTo: trailingAnchor),
+            headerRule.heightAnchor.constraint(equalToConstant: 1),
+            scroll.topAnchor.constraint(equalTo: headerRule.bottomAnchor, constant: 2),
             scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
@@ -2282,6 +2303,15 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
         reload()
     }
     required init?(coder: NSCoder) { nil }
+
+    private func slideList(_ subtype: CATransitionSubtype?) {
+        guard let lyr = table.enclosingScrollView?.layer else { return }
+        let t = CATransition()
+        if let sub = subtype { t.type = .push; t.subtype = sub } else { t.type = .fade }
+        t.duration = 0.22
+        t.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        lyr.add(t, forKey: "nav")
+    }
 
     private func reload() {
         items = (try? FileManager.default.contentsOfDirectory(
@@ -2292,10 +2322,12 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
             if ad != bd { return ad && !bd }  // folders first, for hopping around
             return a.lastPathComponent.localizedCaseInsensitiveCompare(b.lastPathComponent) == .orderedAscending
         }
+        headerLabel.stringValue = dir.path == "/" ? "/" : dir.lastPathComponent
         table.reloadData()
     }
 
-    private func navigateAndNotify(_ url: URL) {
+    private func navigateAndNotify(_ url: URL, slide: CATransitionSubtype?) {
+        slideList(slide)
         dir = url
         reload()
         onNavigate?(url)
@@ -2304,7 +2336,7 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
     @objc private func goUp() {
         let parent = dir.deletingLastPathComponent()
         guard parent.path != dir.path else { return }
-        navigateAndNotify(parent)
+        navigateAndNotify(parent, slide: .fromLeft)
     }
 
     @objc private func openRow() {
@@ -2314,10 +2346,16 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
         let url = items[idx]
         let vals = try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
         if vals?.isDirectory == true, vals?.isPackage != true {
-            navigateAndNotify(url)
+            navigateAndNotify(url, slide: .fromRight)
         } else {
             NSWorkspace.shared.open(url)
         }
+    }
+
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        let rv = RoundedRowView()
+        rv.accent = .systemGreen
+        return rv
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { items.count + (hasParent ? 1 : 0) }
@@ -2501,7 +2539,19 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
 
     // MARK: navigation
 
-    private func navigate(to url: URL) {
+    /// Finder-like motion: descending pushes the list in from the right,
+    /// going up pushes in from the left, sidebar jumps crossfade.
+    private func slideList(_ subtype: CATransitionSubtype?) {
+        guard let lyr = table.enclosingScrollView?.layer else { return }
+        let t = CATransition()
+        if let sub = subtype { t.type = .push; t.subtype = sub } else { t.type = .fade }
+        t.duration = 0.22
+        t.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        lyr.add(t, forKey: "nav")
+    }
+
+    private func navigate(to url: URL, slide: CATransitionSubtype? = nil) {
+        slideList(slide)
         dir = url
         reload()
     }
@@ -2509,7 +2559,7 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
     @objc private func goUp() {
         let parent = dir.deletingLastPathComponent()
         guard parent.path != dir.path else { return }
-        navigate(to: parent)
+        navigate(to: parent, slide: .fromLeft)
     }
 
     @objc private func openRow() {
@@ -2519,7 +2569,7 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
         let url = items[row]
         let vals = try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
         if vals?.isDirectory == true, vals?.isPackage != true {
-            navigate(to: url)
+            navigate(to: url, slide: .fromRight)
         } else {
             NSWorkspace.shared.open(url)
         }
@@ -2551,7 +2601,22 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
             let bd = (try? b.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
             return ad > bd
         }
-        pathLabel.stringValue = dir.path
+        // breadcrumb style: dim parent path, current folder bright green
+        let crumb = NSMutableAttributedString()
+        let dim: [NSAttributedString.Key: Any] = [
+            .foregroundColor: NSColor.tertiaryLabelColor,
+            .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)]
+        let hot: [NSAttributedString.Key: Any] = [
+            .foregroundColor: NSColor.systemGreen,
+            .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold)]
+        if dir.path == "/" {
+            crumb.append(NSAttributedString(string: "/", attributes: hot))
+        } else {
+            let parent = dir.deletingLastPathComponent().path
+            crumb.append(NSAttributedString(string: parent == "/" ? "/" : parent + "/", attributes: dim))
+            crumb.append(NSAttributedString(string: dir.lastPathComponent, attributes: hot))
+        }
+        pathLabel.attributedStringValue = crumb
         table.reloadData()
     }
 
@@ -2744,6 +2809,12 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
         return cell
     }
 
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        let rv = RoundedRowView()
+        rv.accent = .systemGreen
+        return rv
+    }
+
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard let t = notification.object as? NSTableView else { return }
         if t === sideTable {
@@ -2828,26 +2899,43 @@ final class TermPane: NSView {
     let paneID = UUID().uuidString
     var onClose: ((TermPane) -> Void)?
     private let titleLabel = NSTextField(labelWithString: "")
-    private static let headerH: CGFloat = 18
+    private let header = NSView()
+    private let headerGrad = CAGradientLayer()
+    private let hairline = CALayer()
+    private let dot = CALayer()
+    private var isActive = false
+    private static let headerH: CGFloat = 20
 
     init(term: DropTerminalView) {
         self.term = term
         super.init(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
-        let header = NSView(frame: NSRect(x: 0, y: bounds.height - Self.headerH,
-                                          width: bounds.width, height: Self.headerH))
+        // each pane is a rounded "tile" — the window backdrop shows between them
+        wantsLayer = true
+        layer?.cornerRadius = 8
+        layer?.masksToBounds = true
+        header.frame = NSRect(x: 0, y: bounds.height - Self.headerH,
+                              width: bounds.width, height: Self.headerH)
         header.autoresizingMask = [.width, .minYMargin]
         header.wantsLayer = true
-        header.layer?.backgroundColor = NSColor(white: 0.09, alpha: 1).cgColor
+        headerGrad.startPoint = CGPoint(x: 0.5, y: 1)
+        headerGrad.endPoint = CGPoint(x: 0.5, y: 0)
+        header.layer?.insertSublayer(headerGrad, at: 0)
+        hairline.backgroundColor = NSColor(white: 1, alpha: 0.07).cgColor
+        header.layer?.addSublayer(hairline)
+        // focus dot: matrix green + glow on the pane that owns the keyboard
+        dot.cornerRadius = 3
+        dot.shadowOffset = .zero
+        dot.shadowRadius = 3
+        header.layer?.addSublayer(dot)
         titleLabel.font = .monospacedSystemFont(ofSize: 10, weight: .medium)
-        titleLabel.textColor = NSColor(white: 0.55, alpha: 1)
         titleLabel.lineBreakMode = .byTruncatingMiddle
-        titleLabel.frame = NSRect(x: 7, y: 2, width: bounds.width - 32, height: 14)
+        titleLabel.frame = NSRect(x: 18, y: 3, width: bounds.width - 44, height: 14)
         titleLabel.autoresizingMask = [.width]
         let close = NSButton(title: "✕", target: self, action: #selector(closeTapped))
         close.isBordered = false
         close.font = .systemFont(ofSize: 10, weight: .bold)
         close.contentTintColor = NSColor(white: 0.55, alpha: 1)
-        close.frame = NSRect(x: bounds.width - 22, y: 0, width: 18, height: Self.headerH)
+        close.frame = NSRect(x: bounds.width - 22, y: 1, width: 18, height: Self.headerH - 2)
         close.autoresizingMask = [.minXMargin]
         close.toolTip = L("pane_close")
         header.addSubview(titleLabel)
@@ -2856,10 +2944,49 @@ final class TermPane: NSView {
         term.autoresizingMask = [.width, .height]
         addSubview(term)
         addSubview(header)
+        applyActive()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) not supported") }
     @objc private func closeTapped() { onClose?(self) }
     func setTitle(_ title: String) { titleLabel.stringValue = title }
+
+    /// Highlight the pane that owns the keyboard: green-tinted header, bright
+    /// title, glowing dot. Called from the app's tick (cheap, state-guarded).
+    func setActive(_ on: Bool) {
+        guard on != isActive else { return }
+        isActive = on
+        applyActive()
+    }
+
+    private func applyActive() {
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.25)
+        if isActive {
+            headerGrad.colors = [NSColor(calibratedRed: 0.05, green: 0.15, blue: 0.08, alpha: 1).cgColor,
+                                 NSColor(calibratedRed: 0.03, green: 0.07, blue: 0.04, alpha: 1).cgColor]
+            titleLabel.textColor = NSColor(calibratedRed: 0.45, green: 0.95, blue: 0.55, alpha: 1)
+            dot.backgroundColor = NSColor(calibratedRed: 0.1, green: 0.95, blue: 0.35, alpha: 1).cgColor
+            dot.shadowColor = NSColor(calibratedRed: 0.1, green: 0.95, blue: 0.35, alpha: 1).cgColor
+            dot.shadowOpacity = 0.9
+        } else {
+            headerGrad.colors = [NSColor(white: 0.11, alpha: 1).cgColor,
+                                 NSColor(white: 0.07, alpha: 1).cgColor]
+            titleLabel.textColor = NSColor(white: 0.55, alpha: 1)
+            dot.backgroundColor = NSColor(white: 0.3, alpha: 1).cgColor
+            dot.shadowOpacity = 0
+        }
+        CATransaction.commit()
+    }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        headerGrad.frame = header.bounds
+        hairline.frame = CGRect(x: 0, y: 0, width: header.bounds.width, height: 1)
+        dot.frame = CGRect(x: 7, y: (Self.headerH - 6) / 2, width: 6, height: 6)
+        CATransaction.commit()
+    }
 }
 
 /// Floating /ia suggestion card, overlaid on the notch terminal: shows the
@@ -2943,6 +3070,42 @@ final class IACard: NSView {
         NSPasteboard.general.setString(command, forType: .string)
     }
     @objc private func closeTapped() { onClose?() }
+}
+
+/// Dark gradient backdrop for the terminal window — a barely-there blue-black
+/// lift so the rounded pane tiles read as floating on glass, not on void.
+final class BackdropView: NSView {
+    private let grad = CAGradientLayer()
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        grad.colors = [NSColor(calibratedRed: 0.055, green: 0.06, blue: 0.085, alpha: 1).cgColor,
+                       NSColor(calibratedRed: 0.01, green: 0.01, blue: 0.015, alpha: 1).cgColor]
+        grad.startPoint = CGPoint(x: 0.5, y: 1)
+        grad.endPoint = CGPoint(x: 0.5, y: 0)
+        layer?.insertSublayer(grad, at: 0)
+    }
+    required init?(coder: NSCoder) { nil }
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        grad.frame = layer?.bounds ?? .zero
+        CATransaction.commit()
+    }
+}
+
+/// Modern rounded selection for the browser tables (Finder-sidebar style)
+/// instead of the stock edge-to-edge blue bar.
+final class RoundedRowView: NSTableRowView {
+    var accent: NSColor = .systemGreen
+    override func drawSelection(in dirtyRect: NSRect) {
+        guard selectionHighlightStyle != .none else { return }
+        let r = bounds.insetBy(dx: 4, dy: 1)
+        let path = NSBezierPath(roundedRect: r, xRadius: 6, yRadius: 6)
+        accent.withAlphaComponent(isEmphasized ? 0.30 : 0.16).setFill()
+        path.fill()
+    }
 }
 
 /// Header strip of the notch terminal — visual only. The terminal is part of
@@ -3761,6 +3924,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         syncQuickFolders()
         if frame % 4 == 0 { quickPollAsks() }
         if frame % 2 == 0, termWindow != nil { checkIAQuery() }
+        // highlight the pane that owns the keyboard (state-guarded, cheap)
+        if frame % 2 == 1, termWindow?.isVisible == true, termPanes.count > 0 {
+            let fr = termWindow?.firstResponder
+            for pane in termPanes { pane.setActive(pane.term === fr) }
+        }
         // repaint only while something on screen actually animates — an
         // idle/empty indicator repainting 8×/s is pure wasted CPU
         let animating = claudeState == .running || codexState == .running
@@ -3895,9 +4063,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 w.setFrame(f, display: true)
             }
         }
-        let container = NSView(frame: NSRect(origin: .zero, size: NSSize(width: tw, height: th)))
-        container.wantsLayer = true
-        container.layer?.backgroundColor = NSColor.black.cgColor
+        let container = BackdropView(frame: NSRect(origin: .zero, size: NSSize(width: tw, height: th)))
         container.layer?.cornerRadius = 16
         container.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
         container.layer?.borderColor = NSColor(white: 0.24, alpha: 1).cgColor
@@ -4151,8 +4317,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         split.insertArrangedSubview(qf, at: 0)
         split.setHoldingPriority(NSLayoutConstraint.Priority(260), forSubviewAt: 0)
         split.adjustSubviews()
-        DispatchQueue.main.async { [weak split] in
+        DispatchQueue.main.async { [weak split, weak qf] in
             split?.setPosition(230, ofDividerAt: 0)
+            qf.map { AppDelegate.slideIn($0) }
+        }
+    }
+
+    /// Entrance for the side panes: fade + slide in from the left edge.
+    private static func slideIn(_ v: NSView) {
+        v.wantsLayer = true
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 0
+        fade.toValue = 1
+        let slide = CABasicAnimation(keyPath: "transform.translation.x")
+        slide.fromValue = -24
+        slide.toValue = 0
+        for a in [fade, slide] {
+            a.duration = 0.25
+            a.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            v.layer?.add(a, forKey: a.keyPath)
         }
     }
 
@@ -4181,6 +4364,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // only now the pane is in the window — earlier, makeFirstResponder
             // would fail and the arrow keys would need a click first
             fb.focusInitial()
+            Self.slideIn(fb)
         }
     }
 
