@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.18"
+let appVersion = "2.9.19"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -82,6 +82,9 @@ enum L10n {
         "cant_reply_info": [
             "This agent runs in an EXTERNAL terminal (Warp, Ghostty, iTerm…). To reply from the notch, run `claude` inside the notch terminal (⌃⌥Space) — replies go straight to it.",
             "Este agente corre en una terminal EXTERNA (Warp, Ghostty, iTerm…). Para responder desde el notch, corré `claude` dentro de la terminal del notch (⌃⌥Espacio) — la respuesta va directo."],
+        "menubar_mode": ["Menu bar mode:", "Modo barra de menú:"],
+        "menubar_check": ["Live in the menu bar instead of the notch (requires restart)",
+                          "Vivir en la barra de menú en vez del notch (requiere reiniciar)"],
         "srv_open": ["Open", "Abrir"],
         "srv_copy": ["Copy", "Copiar"],
         "srv_kill": ["Kill", "Matar"],
@@ -2638,6 +2641,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var foldersKeyPopupRef: NSPopUpButton?
     private var termHotkeyPopupRef: NSPopUpButton?
     private var loginCheckRef: NSButton?
+    private weak var menubarCheckRef: NSButton?
     private var pendTermDir = ""
     private weak var ollamaModelPopupRef: NSPopUpButton?
     private var termDirLabel: NSTextField?
@@ -2700,6 +2704,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         L10n.refresh()
+        // opt-in for Macs without a notch (config "menubar-mode", requires
+        // restart): the app lives in an NSStatusItem and the panel drops from
+        // it; the notch indicator/bar windows are never shown
+        menubarMode = FileManager.default.fileExists(atPath: configURL("menubar-mode").path)
         readSoundPrefs()
         readZoomPref()
         refreshHookScriptIfNeeded()  // apply hook-script fixes without re-toggling
@@ -2860,8 +2868,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.setExpanded(false)
             return e
         }
-        window.orderFrontRegardless()
-        indicatorWindow.orderFrontRegardless()
+        if menubarMode {
+            setupStatusItem()
+            window.ignoresMouseEvents = true  // shown only while expanded
+        } else {
+            window.orderFrontRegardless()
+            indicatorWindow.orderFrontRegardless()
+        }
 
         // After sleep/wake (or an external display turning off/on) the window
         // server can leave these statusBar-level windows unresponsive or
@@ -2936,8 +2949,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // (the technique used by boring.notch / NotchNook).
         if on {
             window.ignoresMouseEvents = false
-            window.setFrame(expandedFrame(), display: true)
-            indicatorWindow.orderOut(nil)  // spinner hides while the panel is open
+            var f = expandedFrame()
+            // menu bar mode: hang the panel from the status item instead of
+            // the notch, clamped to that screen
+            if menubarMode, let btnWin = statusItem?.button?.window {
+                let b = btnWin.frame
+                let scr = (btnWin.screen ?? screen).visibleFrame
+                f.origin.x = min(max(b.midX - f.width / 2, scr.minX), scr.maxX - f.width)
+                f.origin.y = b.minY - f.height
+            }
+            window.setFrame(f, display: true)
+            if !menubarMode { indicatorWindow.orderOut(nil) }  // spinner hides while the panel is open
             animatePanelLayer(open: true)
             // click/hotkey opens take keyboard focus so the reply field is
             // typeable; hover-opens stay passive (they'd steal focus otherwise)
@@ -2946,17 +2968,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 window.makeKeyAndOrderFront(nil)
             }
         } else {
-            indicatorWindow.orderFrontRegardless()  // back immediately — never leave a dead zone
+            if !menubarMode { indicatorWindow.orderFrontRegardless() }  // back immediately — never leave a dead zone
             window.ignoresMouseEvents = true
             animatePanelLayer(open: false) { [weak self] in
                 guard let self, !self.expanded else { return }
                 self.notchView.expanded = false
                 listView.removeFromSuperview()
                 self.window.setFrame(self.collapsedFrame(), display: true)
-                self.indicatorWindow.orderFrontRegardless()
+                if self.menubarMode {
+                    self.window.orderOut(nil)
+                } else {
+                    self.indicatorWindow.orderFrontRegardless()
+                }
             }
         }
     }
+
+    // MARK: - Menu bar mode
+
+    private var menubarMode = false
+    private var statusItem: NSStatusItem?
+
+    private func setupStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.title = "◇"
+        item.button?.font = .systemFont(ofSize: 13, weight: .semibold)
+        item.button?.target = self
+        item.button?.action = #selector(statusItemTapped)
+        statusItem = item
+    }
+
+    @objc private func statusItemTapped() { setExpanded(!expanded) }
 
     private var animating = false
     private var sigSource: DispatchSourceSignal?
@@ -3302,6 +3344,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// panel; it closes again once the mouse leaves it. Click/hotkey opens
     /// stay put until dismissed.
     private func checkHover() {
+        // menu bar mode: no notch to hover — the panel opens/closes only from
+        // the status item (or hotkey)
+        if menubarMode { return }
         let loc = NSEvent.mouseLocation
         if !expanded {
             if indicatorScreenRect.insetBy(dx: -4, dy: 0).contains(loc) {
@@ -3355,6 +3400,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         indicatorView.claudeState = claudeState
         indicatorView.codexState = codexState
         indicatorView.t = CGFloat(frame) * 0.12
+        if let btn = statusItem?.button {
+            let busy = claudeState == .running || codexState == .running
+            let done = claudeState == .done || codexState == .done
+            let title = !asks.isEmpty ? "🔔" : busy ? "◉" : done ? "✓" : "◇"
+            if btn.title != title { btn.title = title }
+        }
     }
 
     // MARK: - Notch terminal (SwiftTerm)
@@ -3850,6 +3901,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         loginCheckRef = loginCheck
 
+        let menubarCheck = NSButton(checkboxWithTitle: L("menubar_check"), target: nil, action: nil)
+        menubarCheck.state = FileManager.default.fileExists(atPath: configURL("menubar-mode").path) ? .on : .off
+        menubarCheckRef = menubarCheck
+
         let soundDoneCheck = NSButton(checkboxWithTitle: L("sound_done"), target: nil, action: nil)
         soundDoneCheck.state = soundDone ? .on : .off
         soundDoneRef = soundDoneCheck
@@ -3889,6 +3944,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             row(L("replies_title"), [hookBtn]),
             repliesHelp,
             row(L("startup"), [loginCheck]),
+            row(L("menubar_mode"), [menubarCheck]),
             row(L("sounds_title"), [soundCol]),
             row(L("project"), [linkBtn, versionLbl]),
             saveRow,
@@ -3950,6 +4006,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // placeholder item
         if let p = ollamaModelPopupRef, p.isEnabled, let model = p.titleOfSelectedItem {
             writeConfig("ollama-model", model)
+        }
+        if let c = menubarCheckRef {
+            writeConfig("menubar-mode", c.state == .on ? "1" : "")  // empty deletes the flag
         }
         let tsz = Int(min(95, max(20, Double(pendTermSizeField?.stringValue ?? "") ?? 50)))
         writeConfig("term-size", String(tsz))
@@ -4574,9 +4633,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if !self.expanded {
                 self.window.setFrame(self.collapsedFrame(), display: true)
             }
-            self.window.orderFrontRegardless()
-            self.indicatorWindow.setFrame(self.indicatorScreenRect, display: true)
-            if !self.expanded { self.indicatorWindow.orderFrontRegardless() }
+            if !self.menubarMode {
+                self.window.orderFrontRegardless()
+                self.indicatorWindow.setFrame(self.indicatorScreenRect, display: true)
+                if !self.expanded { self.indicatorWindow.orderFrontRegardless() }
+            }
             if let term = self.termWindow, term.isVisible {
                 let s = self.screen.frame
                 var f = term.frame
