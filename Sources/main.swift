@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.14"
+let appVersion = "2.9.15"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -65,14 +65,14 @@ enum L10n {
         "hook_off": ["Hook removed", "Hook quitado"],
         "hook_off_info": ["The notch will no longer be notified of agent questions.",
                           "El notch ya no será avisado de las preguntas de los agentes."],
-        "ext_inject": ["Reply to external terminals (needs Accessibility)",
-                       "Responder a terminales externas (requiere Accesibilidad)"],
         "cant_reply": ["Can't reply to this session", "No se puede responder a esta sesión"],
         "cant_reply_info": [
-            "This agent runs in an EXTERNAL terminal (Warp, Ghostty, iTerm…). To reply from the notch, either: (1) run `claude` inside the notch terminal (⌃⌥Space) — replies go straight to it; or (2) turn on \"Reply to external terminals\" in Settings and grant Accessibility permission.",
-            "Este agente corre en una terminal EXTERNA (Warp, Ghostty, iTerm…). Para responder desde el notch: (1) corré `claude` dentro de la terminal del notch (⌃⌥Espacio) — la respuesta va directo; o (2) activá \"Responder a terminales externas\" en la Configuración y otorgá permiso de Accesibilidad."],
-        "ext_inject_info": ["This reply targets a terminal outside the notch. Enable \"Reply to external terminals\" in settings and grant Accessibility — note keystrokes go to the focused window.",
-                            "Esta respuesta va a una terminal fuera del notch. Activá \"Responder a terminales externas\" en la configuración y otorgá Accesibilidad — ojo que las teclas van a la ventana enfocada."],
+            "This agent runs in an EXTERNAL terminal (Warp, Ghostty, iTerm…). To reply from the notch, run `claude` inside the notch terminal (⌃⌥Space) — replies go straight to it.",
+            "Este agente corre en una terminal EXTERNA (Warp, Ghostty, iTerm…). Para responder desde el notch, corré `claude` dentro de la terminal del notch (⌃⌥Espacio) — la respuesta va directo."],
+        "hook_bad_json": ["Couldn't update ~/.claude/settings.json", "No se pudo actualizar ~/.claude/settings.json"],
+        "hook_bad_json_info": [
+            "The file exists but isn't valid JSON, so it was left untouched. Fix or remove it and try again.",
+            "El archivo existe pero no es JSON válido, así que no se tocó. Arreglalo o borralo y probá de nuevo."],
         "shortcut_hint": ["Every shortcut below is configurable (⌘-keys work inside the terminal).",
                           "Todos los atajos de abajo son configurables (las teclas ⌘ funcionan dentro de la terminal)."],
         "panel_hotkey": ["Panel shortcut:", "Atajo del panel:"],
@@ -838,7 +838,13 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         if isEditingReply { return }  // defer; controlTextDidEndEditing re-runs
         lastAskSignature = sig
         askStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        replyFields.removeAll()  // cards below re-register; stale entries answered dead asks
         for ask in asks.prefix(3) { askStack.addArrangedSubview(askCard(ask)) }
+        if asks.count > 3 {
+            askStack.addArrangedSubview(label("+\(asks.count - 3)…", size: 10,
+                                              color: .secondaryLabelColor, bold: false))
+        }
+        onLayoutChange?()  // the panel frame must grow/shrink with the cards
     }
 
     private func rebuildSessions() {
@@ -869,6 +875,7 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
                 }
             }
         }
+        onLayoutChange?()  // session count changes panel height too
         if animTimer == nil {
             animTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
                 // skip while the panel is detached — no point animating rows
@@ -2226,8 +2233,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         indicatorWindow.contentView = indicatorView
 
         listController.onLayoutChange = { [weak self] in
-            guard let self, self.expanded else { return }
-            self.window.setFrame(self.expandedFrame(), display: true)
+            guard let self, self.expanded, !self.animating else { return }
+            // called on every rebuild (3 s poll) — only touch the window when
+            // the content height really changed
+            let f = self.expandedFrame()
+            if self.window.frame != f { self.window.setFrame(f, display: true) }
         }
         notchView.onCollapse = { [weak self] in
             guard let self, self.expanded else { return }
@@ -2268,6 +2278,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         registerPanelHotkey()
         registerTermHotkey()
         readTermKeys()
+        // the external-terminal keystroke-injection path was removed in 2.9.15;
+        // clear the leftover opt-in flag so nothing ever reads it again
+        try? FileManager.default.removeItem(at: configURL("ext-inject"))
         // fixed chord ⌃⌥⇧⌘K, not user-configurable, registered once and never
         // torn down (see EmergencyKill)
         let killKeyID = EventHotKeyID(signature: OSType(0x414E_4348), id: 3)
@@ -2520,13 +2533,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // External terminals (Warp, Ghostty…) can't receive a reply, so
                 // no card is shown for them — no false or dead-end prompts.
                 let notchCwds = Set(self.termViews.compactMap { ($0.process?.shellPid).flatMap(pidCwd) })
-                let shownAsks = pendingAsks.filter { self.termWindow?.isVisible == true && notchCwds.contains($0.cwd) }
+                let shownAsks = pendingAsks.filter { notchCwds.contains($0.cwd) }
                 // chime once when a NEW ask arrives (not every poll it persists)
                 let newAsk = shownAsks.contains { a in !self.asks.contains { $0.sessionID == a.sessionID } }
                 self.asks = shownAsks
                 self.listController.asks = shownAsks
                 self.listController.sessions = result
-                if newAsk, self.soundAttention { self.playSound("Ping") }
+                if newAsk {
+                    // one-time signal: open the panel and take key so the reply
+                    // field is a click away — never re-grab focus after this
+                    if self.soundAttention { self.playSound("Ping") }
+                    if !self.expanded { self.setExpanded(true) }
+                    NSApp.activate(ignoringOtherApps: true)
+                    self.window.makeKeyAndOrderFront(nil)
+                }
                 // busy → mascot; alive-but-quiet → nothing (idle, not done);
                 // process exited → done blob (cleared on terminal focus)
                 let claudeLive = result.contains { $0.kind == .claude && $0.anyLive }
@@ -2609,15 +2629,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             } else { hoverTicks = 0 }
         } else if hoverOpened {
-            // a pending question pins the panel open (and gives it keyboard
-            // focus) so you can click the reply field and type without it
-            // vanishing from under the cursor
+            // a pending question pins the panel open so it doesn't vanish from
+            // under the cursor. Focus is taken ONCE when the ask arrives (see
+            // rescan) — grabbing it here ran 8×/s and made every other app
+            // unusable while a card was pending.
             if !asks.isEmpty {
                 hoverOpened = false
-                if !window.isKeyWindow {
-                    NSApp.activate(ignoringOtherApps: true)
-                    window.makeKeyAndOrderFront(nil)
-                }
             } else if !window.frame.insetBy(dx: -24, dy: -24).contains(loc) {
                 hoverOpened = false
                 setExpanded(false)
@@ -2627,10 +2644,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             // sticky opens (click/hotkey): hovering grows the panel
             setZoomed(window.frame.contains(loc))
-            if !asks.isEmpty, !window.isKeyWindow {
-                NSApp.activate(ignoringOtherApps: true)
-                window.makeKeyAndOrderFront(nil)
-            }
         }
     }
 
@@ -3309,8 +3322,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // merge into ~/.claude/settings.json under hooks.{Notification,Stop,UserPromptSubmit}
         var root: [String: Any] = [:]
-        if let data = try? Data(contentsOf: claudeSettingsURL),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] { root = obj }
+        if let data = try? Data(contentsOf: claudeSettingsURL), !data.isEmpty {
+            // an existing file we can't parse must NOT be overwritten — doing
+            // so would silently wipe the user's whole Claude Code config
+            guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                alert(L("hook_bad_json"), L("hook_bad_json_info"))
+                return
+            }
+            root = obj
+        }
         var hooks = root["hooks"] as? [String: Any] ?? [:]
         let entry: [String: Any] = ["hooks": [["type": "command", "command": hookCommand]]]
         for event in ["Notification", "Stop", "UserPromptSubmit"] {
@@ -3322,7 +3342,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         root["hooks"] = hooks
         try? fm.createDirectory(at: claudeSettingsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         if let data = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted]) {
-            try? data.write(to: claudeSettingsURL)
+            try? data.write(to: claudeSettingsURL, options: .atomic)
         }
         alert(L("hook_ok"), L("hook_ok_info"))
         refreshHookButton()
@@ -3339,7 +3359,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if hooks.isEmpty { root.removeValue(forKey: "hooks") } else { root["hooks"] = hooks }
         if let d = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted]) {
-            try? d.write(to: claudeSettingsURL)
+            try? d.write(to: claudeSettingsURL, options: .atomic)
         }
         alert(L("hook_off"), L("hook_off_info"))
         refreshHookButton()
@@ -3487,23 +3507,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return out.sorted { $0.time > $1.time }
     }
 
-    /// Reply to an agent's question. The notch's own terminal is written to
-    /// directly (safe, exact). External terminals fall back to Accessibility
-    /// keystroke injection into the frontmost app (opt-in) — there is no safe
-    /// targeted path since macOS blocks TIOCSTI.
+    /// Reply to an agent's question. Only the notch's own terminal can be
+    /// written to directly (safe, exact); there is no reliable path to an
+    /// external terminal since macOS blocks TIOCSTI.
     private func replyToAsk(_ ask: AgentAsk, text: String) {
-        // 1) session running INSIDE a notch terminal pane → write to its shell
-        // directly (exact, no permissions). Only clear on successful delivery.
+        // session running INSIDE a notch terminal pane → write to its shell
+        // directly (works even while the window is hidden — it's a live pty).
+        // Only clear on successful delivery.
         if let term = termViews.first(where: { ($0.process?.shellPid).flatMap(pidCwd) == ask.cwd }),
-           termWindow?.isVisible == true, !ask.cwd.isEmpty {
+           !ask.cwd.isEmpty {
             term.send(txt: text + "\r")
-            clearAsk(ask)
-            return
-        }
-        // 2) external terminal (Warp, Ghostty…) → Accessibility keystroke
-        // injection into the FOCUSED window. Only if the user opted in.
-        if FileManager.default.fileExists(atPath: configURL("ext-inject").path) {
-            injectKeystrokes(text + "\r")
             clearAsk(ask)
             return
         }
@@ -3514,27 +3527,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func clearAsk(_ ask: AgentAsk) {
         asks.removeAll { $0.sessionID == ask.sessionID }
         listController.asks = asks
-        let safe = ask.sessionID.replacingOccurrences(of: "/", with: "_")
+        // must mirror the hook's sanitizer (every non-alphanumeric → "_"), or
+        // the file never matches and the answered card resurrects next poll
+        let safe = String(ask.sessionID.map { $0.isLetter || $0.isNumber ? $0 : Character("_") })
         try? FileManager.default.removeItem(at: asksDir.appendingPathComponent("\(safe).json"))
-    }
-
-    /// Post a string as keystrokes to the frontmost app (Accessibility).
-    private func injectKeystrokes(_ s: String) {
-        guard let src = CGEventSource(stateID: .combinedSessionState) else { return }
-        for ch in s.unicodeScalars {
-            for down in [true, false] {
-                let e = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: down)
-                var u = UniChar(ch.value <= 0xFFFF ? ch.value : 0x0020)
-                if ch == "\r" || ch == "\n" {
-                    // send Return as the real key so the shell/TUI accepts it
-                    let ret = CGEvent(keyboardEventSource: src, virtualKey: 0x24, keyDown: down)
-                    ret?.post(tap: .cghidEventTap)
-                    continue
-                }
-                e?.keyboardSetUnicodeString(stringLength: 1, unicodeString: &u)
-                e?.post(tap: .cghidEventTap)
-            }
-        }
     }
 
     private func focusTerminalFor(_ ask: AgentAsk) {
