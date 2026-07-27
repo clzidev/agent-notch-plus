@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.24"
+let appVersion = "2.9.25"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -72,7 +72,17 @@ enum L10n {
         "active": ["active", "activas"],
         "st_working": ["Working…", "Trabajando…"],
         "st_waiting": ["Waiting for you", "Esperando tu respuesta"],
+        "st_subagents": ["Waiting on subagents…", "Esperando subagentes…"],
         "st_done": ["Done ✓", "Terminado ✓"],
+        "tip_st_working": [
+            "The agent is actively working (CPU or transcript activity).",
+            "El agente está trabajando activamente (CPU o escritura en el transcript)."],
+        "tip_st_waiting": [
+            "The turn ended (Stop hook fired): the agent really is waiting for your next message.",
+            "El turno terminó (lo reportó el hook Stop): el agente espera de verdad tu próximo mensaje."],
+        "tip_st_subagents": [
+            "The turn is still open — the agent is waiting on its subagents/tools, not on you.",
+            "El turno sigue abierto — el agente espera a sus subagentes/herramientas, no a vos."],
         "asking": ["Needs your answer", "Necesita tu respuesta"],
         "reply_ph": ["Type your reply and press ↩", "Escribí tu respuesta y ↩"],
         "send": ["Send", "Enviar"],
@@ -240,6 +250,21 @@ struct AgentSession {
     var tokensOut = 0
     var cost = 0.0
     var branch = ""  // git branch of the session's cwd, "" outside a repo
+    // hook-reported turn state: "busy" (turn open), "idle" (Stop fired —
+    // truly waiting for the user), "" (no hook data)
+    var turnState = ""
+    /// Truly blocked on the user — not just quiet while subagents/tools run.
+    var isWaitingForUser: Bool {
+        guard anyLive, !anyBusy else { return false }
+        if turnState == "busy" { return false }
+        if turnState.isEmpty, hasRecentSubagents { return false }
+        return true
+    }
+    /// A subagent transcript moved in the last 3 min — the quiet parent is
+    /// almost certainly waiting on them, not on the user.
+    var hasRecentSubagents: Bool {
+        children.contains { Date().timeIntervalSince($0.lastModified) < 180 }
+    }
     var prompt: String = ""
     var threadID: String = ""
     var parentID: String?
@@ -1242,7 +1267,7 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
             c.toolTip = L("tip_chip_tokens")
             views.append(c)
         }
-        let waiting = asks.count + sessions.filter { $0.anyLive && !$0.anyBusy }.count
+        let waiting = asks.count + sessions.filter { $0.isWaitingForUser }.count
         let busy = sessions.filter { $0.anyBusy }.count
         if waiting > 0 {
             let d = dotCount(waiting, .systemOrange)
@@ -1666,11 +1691,26 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     /// prompt/snippet, and a colored status line. The active session's card
     /// gets a warm highlighted border, vibe-island style.
     private func row(for s: AgentSession) -> NSView {
-        // glowing status dot, screenshot-style: green pulsing = working,
-        // orange = waiting on you, dim green = done
-        let dot: NSView = s.anyBusy ? statusDot(.systemGreen, glow: true, pulsing: true)
-            : s.anyLive ? statusDot(.systemOrange, glow: true)
-            : statusDot(NSColor.systemGreen.withAlphaComponent(0.45), glow: false)
+        // four states now, thanks to the hook's turn tracking: working (green,
+        // pulsing), waiting on SUBAGENTS/tools with the turn still open (teal,
+        // pulsing — NOT "waiting for you"), truly waiting for the user
+        // (orange), done (dim green)
+        let state: (text: String, color: NSColor, pulsing: Bool, tip: String)
+        if s.anyBusy {
+            state = (L("st_working"), .systemGreen, true, L("tip_st_working"))
+        } else if s.anyLive {
+            if s.isWaitingForUser {
+                state = (L("st_waiting"), .systemOrange, false, L("tip_st_waiting"))
+            } else if s.hasRecentSubagents {
+                state = (L("st_subagents"), .systemTeal, true, L("tip_st_subagents"))
+            } else {
+                // turn open but everything quiet: tools/API call in flight
+                state = (L("st_working"), .systemGreen, true, L("tip_st_working"))
+            }
+        } else {
+            state = (L("st_done"), NSColor.systemGreen.withAlphaComponent(0.75), false, "")
+        }
+        let dot = statusDot(state.color, glow: s.anyLive || s.anyBusy, pulsing: state.pulsing)
         let icon = DitherIconView()
         icon.running = s.anyBusy
         icon.idle = s.anyLive && !s.anyBusy
@@ -1720,11 +1760,9 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
             snippet.widthAnchor.constraint(equalToConstant: w).isActive = true
             views.append(snippet)
         }
-        let status: (String, NSColor) = s.anyBusy ? (L("st_working"), .systemGreen)
-            : s.anyLive ? (L("st_waiting"), .systemOrange)
-            : (L("st_done"), NSColor.systemGreen.withAlphaComponent(0.75))
-        let statusLabel = label(status.0, size: 10, color: status.1, bold: true)
-        if s.anyBusy { pulse(statusLabel) }  // "Trabajando…" breathes while it works
+        let statusLabel = label(state.text, size: 10, color: state.color, bold: true)
+        if !state.tip.isEmpty { statusLabel.toolTip = state.tip }
+        if state.pulsing { pulse(statusLabel) }
         views.append(statusLabel)
 
         let col = NSStackView(views: views)
@@ -3742,6 +3780,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 result[i].cost = t.cost
                 result[i].branch = gitBranch(cwd: cwdByPath[result[i].id] ?? "")
             }
+            // the transcript filename IS the session id — match it against the
+            // hook's turn-state files to know if the turn is open or ended
+            let turnStates = self.loadTurnStates()
+            for i in result.indices where result[i].kind == .claude {
+                let sid = URL(fileURLWithPath: result[i].id).deletingPathExtension().lastPathComponent
+                result[i].turnState = turnStates[sanitizedSessionID(sid)] ?? ""
+            }
             let g5 = self.usage.window(hours: 5)
             let g7d = self.usage.window(hours: 7 * 24)
             let peak = self.usage.peak5hTokens()
@@ -4744,23 +4789,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Bump the leading VERSION comment whenever this changes so the app knows
     /// to rewrite an out-of-date copy on launch.
     private static let notchHookScript = """
-    # notch-hook v4
+    # notch-hook v5
     import sys, json, os, time, fnmatch
     try: d = json.load(sys.stdin)
     except Exception: sys.exit(0)
     home = os.path.expanduser('~')
     base = os.path.join(home, '.config/agent-notch/asks')
     ans_base = os.path.join(home, '.config/agent-notch/answers')
+    st_base = os.path.join(home, '.config/agent-notch/state')
     os.makedirs(base, exist_ok=True)
     os.makedirs(ans_base, exist_ok=True)
+    os.makedirs(st_base, exist_ok=True)
     sid = str(d.get('session_id', 'session'))
     safe = ''.join(c if c.isalnum() else '_' for c in sid)
     ev = d.get('hook_event_name', '')
     path = os.path.join(base, safe + '.json')
     apath = os.path.join(ans_base, safe + '.json')
+
+    # Turn state, the ground truth the CPU heuristic can't give: Stop = the
+    # turn ENDED (now it really waits for the user); UserPromptSubmit and any
+    # PreToolUse (subagent tool calls included) = the turn is OPEN.
+    def write_state(s):
+        try:
+            with open(os.path.join(st_base, safe + '.json'), 'w') as f:
+                json.dump({'state': s, 'time': time.time()}, f)
+        except OSError: pass
+
     # Stop (turn ended) and UserPromptSubmit (user answered) both CLEAR the ask
     # and any stale answer. We do NOT create an ask on Stop.
     if ev in ('Stop', 'UserPromptSubmit'):
+        write_state('idle' if ev == 'Stop' else 'busy')
         for p in (path, apath):
             try: os.remove(p)
             except OSError: pass
@@ -4806,6 +4864,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     # answer becomes an official permissionDecision; a timeout emits nothing,
     # so Claude Code falls back to its normal prompt in the terminal.
     if ev == 'PreToolUse':
+        write_state('busy')
         tool = d.get('tool_name') or ''
         tin = d.get('tool_input') or {}
         if not isinstance(tin, dict): tin = {}
@@ -4863,7 +4922,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refreshHookScriptIfNeeded() {
         guard hookInstalled() else { return }
         let onDisk = try? String(contentsOf: hookScriptURL, encoding: .utf8)
-        if onDisk?.contains("# notch-hook v4") != true {
+        if onDisk?.contains("# notch-hook v5") != true {
             try? Self.notchHookScript.write(to: hookScriptURL, atomically: true, encoding: .utf8)
         }
         if !hookRegistered(event: "PreToolUse") { mergeHookSettings() }
@@ -5066,6 +5125,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     private var answersDir: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/agent-notch/answers")
+    }
+    private var stateDir: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/agent-notch/state")
+    }
+
+    /// Hook-written turn states: sanitized session id → "busy"/"idle".
+    /// Old entries (>48h) are swept.
+    private func loadTurnStates() -> [String: String] {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: stateDir, includingPropertiesForKeys: nil) else { return [:] }
+        var out: [String: String] = [:]
+        for f in files where f.pathExtension == "json" {
+            guard let data = try? Data(contentsOf: f),
+                  let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let state = o["state"] as? String else { continue }
+            let ts = (o["time"] as? Double) ?? 0
+            if Date().timeIntervalSince1970 - ts > 48 * 3600 { try? fm.removeItem(at: f); continue }
+            out[f.deletingPathExtension().lastPathComponent] = state
+        }
+        return out
     }
 
     /// Read pending ask files; attach each session's tty (by cwd) for replies.
