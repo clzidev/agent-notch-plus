@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.13"
+let appVersion = "2.9.14"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -86,6 +86,8 @@ enum L10n {
         "term_size": ["Terminal size (% of screen):", "Tamaño de la terminal (% de pantalla):"],
         "panel_alpha": ["Panel opacity (%):", "Opacidad del panel (%):"],
         "term_alpha": ["Terminal opacity (%):", "Opacidad de la terminal (%):"],
+        "pane_close": ["Force close this pane (kills its shell, even a dead ssh)",
+                       "Forzar cierre de este panel (mata su shell, aunque sea un ssh muerto)"],
         "choose_dir": ["Choose…", "Elegir…"],
         "clear_dir": ["Reset", "Quitar"],
         "project": ["Project:", "Proyecto:"],
@@ -314,24 +316,97 @@ final class ProcessDiscovery {
         }
     }
 
+    // Tracks whether the watchdog fired; NSLock because watchdog and reader
+    // race on it from different threads.
+    private final class KilledFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+        func set() { lock.lock(); value = true; lock.unlock() }
+        var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
+    }
+
     private func run(_ path: String, _ args: [String], timeout: TimeInterval) -> String? {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: path)
         p.arguments = args
         let pipe = Pipe()
         p.standardOutput = pipe
-        p.standardError = Pipe()
+        p.standardError = FileHandle.nullDevice
         do { try p.run() } catch { return nil }
-        var data = Data()
-        let group = DispatchGroup()
-        group.enter()
-        DispatchQueue.global(qos: .utility).async {
-            data = pipe.fileHandleForReading.readDataToEndOfFile()
-            p.waitUntilExit()
-            group.leave()
+        // No waitUntilExit, no reader block on the global pool: waitUntilExit
+        // can hang forever even after the child dies, and each timed-out call
+        // stranded its reader thread — after hours of 3s polls the leaked
+        // threads exhausted the dispatch pool (~64) and every utility-QoS
+        // queue in the app froze. Instead: read on THIS thread (the pipe
+        // closes when the child exits), with a SIGKILL watchdog as deadline.
+        let pid = p.processIdentifier
+        let killed = KilledFlag()
+        let watchdog = DispatchWorkItem { [weak p] in
+            guard let p, p.isRunning else { return }
+            killed.set()
+            kill(pid, SIGKILL)  // closes the pipe → unblocks the read below
         }
-        guard group.wait(timeout: .now() + timeout) == .success else { p.terminate(); return nil }
-        return String(data: data, encoding: .utf8)
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + timeout, execute: watchdog)
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        watchdog.cancel()
+        return killed.isSet ? nil : String(data: data, encoding: .utf8)
+    }
+}
+
+// MARK: - Emergency kill
+
+// Dev escape hatch, intentionally absent from settings/docs: ⌃⌥⇧⌘K sends
+// SIGKILL to the app itself. Two independent delivery routes, because a "hang"
+// can leave different parts alive: a Carbon hotkey handled synchronously on
+// the main event loop (works when the main thread runs but the dispatch pool
+// is starved), and a CGEventTap on a dedicated Thread with its own run loop
+// (works even when the main thread is dead). SIGKILL cannot be blocked, so if
+// either route sees the chord, the process dies.
+enum EmergencyKill {
+    static let keyCode: Int64 = 40  // kVK_ANSI_K
+    private static var tap: CFMachPort?
+
+    static func startTapThread() {
+        let t = Thread {
+            let mask = CGEventMask(1) << CGEventType.keyDown.rawValue
+            var tapPort: CFMachPort?
+            // listen-only keyboard taps need Input Monitoring permission —
+            // retry so granting it later doesn't require an app restart
+            while tapPort == nil {
+                tapPort = makeTap(mask: mask)
+                if tapPort == nil { Thread.sleep(forTimeInterval: 60) }
+            }
+            guard let tap = tapPort else { return }
+            EmergencyKill.tap = tap
+            let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
+            CGEvent.tapEnable(tap: tap, enable: true)
+            CFRunLoopRun()
+        }
+        t.name = "emergency-kill"
+        t.qualityOfService = .userInteractive
+        t.start()
+    }
+
+    private static func makeTap(mask: CGEventMask) -> CFMachPort? {
+        CGEvent.tapCreate(
+                tap: .cgSessionEventTap,
+                place: .headInsertEventTap,
+                options: .listenOnly,
+                eventsOfInterest: mask,
+                callback: { _, type, event, _ -> Unmanaged<CGEvent>? in
+                    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                        if let tap = EmergencyKill.tap { CGEvent.tapEnable(tap: tap, enable: true) }
+                        return Unmanaged.passUnretained(event)
+                    }
+                    let chord: CGEventFlags = [.maskControl, .maskAlternate, .maskShift, .maskCommand]
+                    if event.flags.contains(chord),
+                       event.getIntegerValueField(.keyboardEventKeycode) == EmergencyKill.keyCode {
+                        kill(getpid(), SIGKILL)
+                    }
+                    return Unmanaged.passUnretained(event)
+                },
+                userInfo: nil)
     }
 }
 
@@ -1888,6 +1963,48 @@ final class DropTerminalView: LocalProcessTerminalView {
     }
 }
 
+/// One ⌘D pane of the notch terminal: a slim header (title + ✕) above its
+/// terminal view. The title tracks the shell's folder / running command, and
+/// the ✕ force-kills THAT shell only — the escape hatch for a dead ssh that
+/// no longer answers `exit`.
+final class TermPane: NSView {
+    let term: DropTerminalView
+    var onClose: ((TermPane) -> Void)?
+    private let titleLabel = NSTextField(labelWithString: "")
+    private static let headerH: CGFloat = 18
+
+    init(term: DropTerminalView) {
+        self.term = term
+        super.init(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
+        let header = NSView(frame: NSRect(x: 0, y: bounds.height - Self.headerH,
+                                          width: bounds.width, height: Self.headerH))
+        header.autoresizingMask = [.width, .minYMargin]
+        header.wantsLayer = true
+        header.layer?.backgroundColor = NSColor(white: 0.09, alpha: 1).cgColor
+        titleLabel.font = .monospacedSystemFont(ofSize: 10, weight: .medium)
+        titleLabel.textColor = NSColor(white: 0.55, alpha: 1)
+        titleLabel.lineBreakMode = .byTruncatingMiddle
+        titleLabel.frame = NSRect(x: 7, y: 2, width: bounds.width - 32, height: 14)
+        titleLabel.autoresizingMask = [.width]
+        let close = NSButton(title: "✕", target: self, action: #selector(closeTapped))
+        close.isBordered = false
+        close.font = .systemFont(ofSize: 10, weight: .bold)
+        close.contentTintColor = NSColor(white: 0.55, alpha: 1)
+        close.frame = NSRect(x: bounds.width - 22, y: 0, width: 18, height: Self.headerH)
+        close.autoresizingMask = [.minXMargin]
+        close.toolTip = L("pane_close")
+        header.addSubview(titleLabel)
+        header.addSubview(close)
+        term.frame = NSRect(x: 0, y: 0, width: bounds.width, height: bounds.height - Self.headerH)
+        term.autoresizingMask = [.width, .height]
+        addSubview(term)
+        addSubview(header)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) not supported") }
+    @objc private func closeTapped() { onClose?(self) }
+    func setTitle(_ title: String) { titleLabel.stringValue = title }
+}
+
 /// Header strip of the notch terminal — visual only. The terminal is part of
 /// the notch: it cannot be moved, it only hangs centered under it.
 final class TermDragStrip: NSView {
@@ -1989,6 +2106,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendZoomField: NSTextField?
     private var zoomPct: CGFloat = 25   // hover-zoom percentage (config "zoom")
     private var hotKeyRef2: EventHotKeyRef?
+    private var hotKeyRefKill: EventHotKeyRef?
     // one sound per episode: armed while busy, disarmed once played
     private var claudeDoneArmed = false, claudeAttArmed = false
     private var codexDoneArmed = false, codexAttArmed = false
@@ -2004,6 +2122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var termWindow: NSPanel?
     private var termSplit: NSSplitView?
     private var termViews: [LocalProcessTerminalView] = []
+    private var termPanes: [TermPane] = []
     private var fileBrowser: FileBrowserPane?
     private var quickFolders: QuickFoldersPane?
     // in-terminal ⌘-keys (configurable): split / files pane / quick folders
@@ -2130,6 +2249,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             var hkID = EventHotKeyID()
             GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
                               nil, MemoryLayout<EventHotKeyID>.size, nil, &hkID)
+            // id 3 = emergency kill: synchronous, never touches dispatch —
+            // it must work exactly when queues are wedged
+            if hkID.id == 3 { kill(getpid(), SIGKILL) }
             let me = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
             DispatchQueue.main.async {
                 if hkID.id == 2 {
@@ -2146,6 +2268,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         registerPanelHotkey()
         registerTermHotkey()
         readTermKeys()
+        // fixed chord ⌃⌥⇧⌘K, not user-configurable, registered once and never
+        // torn down (see EmergencyKill)
+        let killKeyID = EventHotKeyID(signature: OSType(0x414E_4348), id: 3)
+        RegisterEventHotKey(UInt32(EmergencyKill.keyCode),
+                            UInt32(controlKey | optionKey | shiftKey | cmdKey),
+                            killKeyID, GetApplicationEventTarget(), 0, &hotKeyRefKill)
+        EmergencyKill.startTapThread()
 
 
         // Right-click on the indicator → settings menu (the indicator window
@@ -2629,11 +2758,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         term.nativeForegroundColor = NSColor(white: 0.92, alpha: 1)
         term.caretColor = NSColor(red: 0.1, green: 0.95, blue: 0.35, alpha: 1)  // matrix green
         term.processDelegate = self
-        split.addArrangedSubview(term)
+        let pane = TermPane(term: term)
+        pane.onClose = { [weak self] p in self?.forceClosePane(p) }
+        split.addArrangedSubview(pane)
         split.adjustSubviews()
         // minimal prompt (project + git branch + blinking green block cursor)
         // via our own ZDOTDIR; the user's ~/.zshrc is still sourced first
         var env = ProcessInfo.processInfo.environment
+        // If the app itself was launched from inside a Claude Code session (e.g. `swift run`
+        // during development), it inherits Claude's child-session markers; passing them to the
+        // shell makes every new `claude` think it's a subagent and disable transcript saving.
+        for key in ["CLAUDE_CODE_CHILD_SESSION", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT"] {
+            env.removeValue(forKey: key)
+        }
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
         env["ZDOTDIR"] = notchZshDir().path
@@ -2645,7 +2782,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         FileManager.default.changeCurrentDirectoryPath(startDir)
         term.startProcess(executable: shell, args: ["-l"],
                           environment: env.map { "\($0.key)=\($0.value)" })
+        pane.setTitle(URL(fileURLWithPath: startDir).lastPathComponent)
         termViews.append(term)
+        termPanes.append(pane)
         termWindow?.makeFirstResponder(term)
     }
 
@@ -2674,7 +2813,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             PROMPT="%F{green}❯%f "
           fi
         }
-        precmd() { _notch_prompt; print -Pn '\\e[1 q' }
+        # pane title: current folder at the prompt, the running command while
+        # one runs (so a hung `ssh host` pane is easy to spot and ✕-close)
+        precmd() { _notch_prompt; print -Pn '\\e[1 q'; print -Pn '\\e]0;%1~\\a' }
+        preexec() { printf '\\e]0;%s\\a' "$1" }
         # Silent cd driven by the quick-folders pane: the app writes the
         # target to cd-target and sends ESC[24;5~ (a sequence no keyboard
         # produces) — the widget changes directory without typing anything.
@@ -2760,11 +2902,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         CATransaction.commit()
     }
 
+    /// Per-pane ✕: SIGKILL that pane's shell — works even when the shell is
+    /// stuck on a dead ssh and won't take `exit` — then drop just that pane.
+    private func forceClosePane(_ pane: TermPane) {
+        if let pid = pane.term.process?.shellPid, pid > 0 {
+            killpg(pid, SIGKILL)  // shell + its foreground job (the hung ssh)
+            kill(pid, SIGKILL)
+        }
+        removePane(pane)
+    }
+
+    /// Drop one pane from the split (✕ button or its shell exiting). Focus
+    /// moves to a surviving pane; the last pane closing closes the terminal.
+    private func removePane(_ pane: TermPane) {
+        if let idx = termViews.firstIndex(of: pane.term) { termViews.remove(at: idx) }
+        if let idx = termPanes.firstIndex(where: { $0 === pane }) { termPanes.remove(at: idx) }
+        pane.removeFromSuperview()
+        termSplit?.adjustSubviews()
+        if termViews.isEmpty {
+            forceCloseTerminal()
+        } else {
+            termWindow?.makeFirstResponder(termViews.first)
+        }
+    }
+
     /// Full close: kills every shell (✕ button, hung shells) and discards the
     /// window so the next ⌃⌥⇧T starts fresh.
     @objc fileprivate func forceCloseTerminal() {
         for t in termViews { t.terminate() }
         termViews.removeAll()
+        termPanes.removeAll()
         fileBrowser = nil
         quickFolders = nil
         termWindow?.orderOut(nil)
@@ -3413,6 +3580,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         a.addButton(withTitle: L("quit"))
         a.addButton(withTitle: L("cancel"))
         a.alertStyle = .warning
+        // the settings/gallery windows float above statusBar level, so a plain
+        // modal alert opens behind them — attach it as a sheet instead
+        if let host = [settingsWindow, galleryWindow].compactMap({ $0 }).first(where: { $0.isVisible }) {
+            a.beginSheetModal(for: host) { r in
+                if r == .alertFirstButtonReturn { NSApp.terminate(nil) }
+            }
+            return
+        }
         // NSAlert.runModal resets its own window level, so raising the alert
         // isn't enough — temporarily drop the notch/terminal below it, then
         // restore. Guarantees the dialog is on top and clickable.
@@ -3420,7 +3595,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .compactMap { $0 }.map { ($0, $0.level) }
         saved.forEach { $0.0.level = .normal }
         defer { saved.forEach { $0.0.level = $0.1 } }
-        if a.runModal() == .alertFirstButtonReturn { NSApp.terminate(nil) }
+        if runModalSafely(a) == .alertFirstButtonReturn { NSApp.terminate(nil) }
+    }
+
+    /// runModal with a watchdog: after sleep/wake AppKit can materialize the
+    /// alert window as a tiny alpha-0 husk (seen in the wild: 4×4 px) —
+    /// invisible but still modal, so the whole app freezes with nothing to
+    /// click. The timer fires inside the modal run-loop mode, re-lays-out and
+    /// reveals the window, and aborts the session if it can't be repaired.
+    private func runModalSafely(_ a: NSAlert) -> NSApplication.ModalResponse {
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak a] t in
+            guard let w = a?.window else { t.invalidate(); return }
+            if w.frame.width < 50 || w.alphaValue < 0.1 || !w.isVisible {
+                w.alphaValue = 1
+                a?.layout()
+                w.layoutIfNeeded()
+                w.center()
+                w.makeKeyAndOrderFront(nil)
+                if w.frame.width < 50 {
+                    t.invalidate()
+                    NSApp.abortModal()
+                }
+            } else {
+                t.invalidate()
+            }
+        }
+        RunLoop.current.add(timer, forMode: .modalPanel)
+        defer { timer.invalidate() }
+        return a.runModal()
     }
 
     private func alert(_ msg: String, _ info: String) {
@@ -3436,7 +3638,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let saved: [(NSWindow, NSWindow.Level)] = [window, indicatorWindow, termWindow]
                 .compactMap { $0 }.map { ($0, $0.level) }
             saved.forEach { $0.0.level = .normal }
-            a.runModal()
+            _ = runModalSafely(a)
             saved.forEach { $0.0.level = $0.1 }
         }
     }
@@ -3713,23 +3915,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 extension AppDelegate: LocalProcessTerminalViewDelegate {
     func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
-    func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}
+    /// The shell (or whatever it ran, e.g. a remote ssh prompt) set the
+    /// terminal title — show it in that pane's header.
+    func setTerminalTitle(source: LocalProcessTerminalView, title: String) {
+        DispatchQueue.main.async { [weak self] in
+            self?.termPanes.first { $0.term === source }?.setTitle(title)
+        }
+    }
     func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
     /// A shell ended (`exit`, crash, kill) — remove its pane; when the last
     /// one goes, close the notch terminal.
     func processTerminated(source: TerminalView, exitCode: Int32?) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            if let t = source as? LocalProcessTerminalView, let idx = self.termViews.firstIndex(of: t) {
-                self.termViews.remove(at: idx)
-                t.removeFromSuperview()
-                self.termSplit?.adjustSubviews()
-            }
-            if self.termViews.isEmpty {
-                self.forceCloseTerminal()
-            } else {
-                // keep typing without clicking: focus the next surviving pane
-                self.termWindow?.makeFirstResponder(self.termViews.first)
+            if let t = source as? LocalProcessTerminalView,
+               let pane = self.termPanes.first(where: { $0.term === t }) {
+                self.removePane(pane)
             }
         }
     }
