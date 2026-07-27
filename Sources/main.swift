@@ -195,6 +195,10 @@ struct AgentSession {
     let snippet: String
     let model: String
     let lastModified: Date
+    // accumulated by UsageTracker from the transcript's usage entries
+    var tokensIn = 0
+    var tokensOut = 0
+    var cost = 0.0
     var prompt: String = ""
     var threadID: String = ""
     var parentID: String?
@@ -472,6 +476,147 @@ enum EmergencyKill {
                     return Unmanaged.passUnretained(event)
                 },
                 userInfo: nil)
+    }
+}
+
+// MARK: - Token / cost tracking
+
+/// Incremental token+cost accounting from Claude Code transcripts: on each
+/// poll only the bytes APPENDED since the last read are parsed (never the
+/// whole file), so tracking stays cheap even with huge sessions. State is
+/// persisted to ~/.config/agent-notch/usage.json so totals survive restarts.
+final class UsageTracker {
+    struct Totals {
+        var input = 0
+        var output = 0
+        var cost = 0.0
+        mutating func add(_ o: Totals) { input += o.input; output += o.output; cost += o.cost }
+    }
+
+    private struct FileState {
+        var offset: UInt64 = 0
+        var totals = Totals()
+    }
+
+    private var files: [String: FileState] = [:]
+    // (when, tokens, cost) increments for the rolling 5-hour window
+    private var events: [(when: Date, input: Int, output: Int, cost: Double)] = []
+    private var saveURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/agent-notch/usage.json")
+    }
+
+    init() { load() }
+
+    /// $ per 1M tokens (input, output) by model id, approximate — matched on
+    /// substrings so dated snapshots and aliases both hit.
+    static func price(_ model: String) -> (inp: Double, out: Double) {
+        let m = model.lowercased()
+        if m.contains("fable") || m.contains("mythos") { return (10, 50) }
+        if m.contains("opus-4-1") || m.contains("opus-4-0") { return (15, 75) }
+        if m.contains("opus") { return (5, 25) }
+        if m.contains("haiku") { return (1, 5) }
+        return (3, 15)  // sonnet and anything unknown
+    }
+
+    func totals(for path: String) -> Totals? { files[path]?.totals }
+
+    /// Aggregate of the last 5 hours (pruned as a side effect).
+    func windowTotals() -> Totals {
+        let cutoff = Date().addingTimeInterval(-5 * 3600)
+        events.removeAll { $0.when < cutoff }
+        var t = Totals()
+        for e in events { t.input += e.input; t.output += e.output; t.cost += e.cost }
+        return t
+    }
+
+    func update(paths: [String]) {
+        var changed = false
+        for p in paths where updateOne(p) { changed = true }
+        if changed { save() }
+    }
+
+    private func updateOne(_ path: String) -> Bool {
+        guard let fh = FileHandle(forReadingAtPath: path) else { return false }
+        defer { try? fh.close() }
+        let size = (try? fh.seekToEnd()) ?? 0
+        var st = files[path] ?? FileState()
+        if st.offset > size { st = FileState() }  // truncated/rewritten: start over
+        guard size > st.offset else { return false }
+        try? fh.seek(toOffset: st.offset)
+        guard let data = try? fh.read(upToCount: Int(min(size - st.offset, 8_000_000))),
+              // only complete lines; a partially-written trailing line waits
+              // for the next poll
+              let lastNL = data.lastIndex(of: 0x0A) else { return false }
+        let chunk = data[data.startIndex...lastNL]
+        st.offset += UInt64(chunk.count)
+        var inc = Totals()
+        for lineData in chunk.split(separator: 0x0A) {
+            guard let line = String(data: lineData, encoding: .utf8),
+                  line.contains("\"usage\""),
+                  let o = try? JSONSerialization.jsonObject(with: Data(lineData)) as? [String: Any],
+                  let msg = o["message"] as? [String: Any],
+                  let usage = msg["usage"] as? [String: Any] else { continue }
+            let inp = (usage["input_tokens"] as? Int) ?? 0
+            let out = (usage["output_tokens"] as? Int) ?? 0
+            let cRead = (usage["cache_read_input_tokens"] as? Int) ?? 0
+            let cWrite = (usage["cache_creation_input_tokens"] as? Int) ?? 0
+            let p = Self.price((msg["model"] as? String) ?? "")
+            inc.input += inp + cRead + cWrite
+            inc.output += out
+            // cache reads ≈0.1× and cache writes ≈1.25× the input price
+            inc.cost += (Double(inp) * p.inp + Double(out) * p.out
+                         + Double(cRead) * p.inp * 0.1 + Double(cWrite) * p.inp * 1.25) / 1_000_000
+        }
+        files[path] = st
+        guard inc.input > 0 || inc.output > 0 else { return true }  // offset moved: persist
+        st.totals.add(inc)
+        files[path] = st
+        events.append((Date(), inc.input, inc.output, inc.cost))
+        return true
+    }
+
+    // MARK: persistence
+
+    private func save() {
+        var filesObj: [String: Any] = [:]
+        for (p, s) in files {
+            filesObj[p] = ["offset": s.offset, "in": s.totals.input,
+                           "out": s.totals.output, "cost": s.totals.cost]
+        }
+        let evs = events.suffix(2000).map { [$0.when.timeIntervalSince1970, Double($0.input),
+                                             Double($0.output), $0.cost] }
+        let root: [String: Any] = ["files": filesObj, "events": evs]
+        if let d = try? JSONSerialization.data(withJSONObject: root) {
+            try? d.write(to: saveURL, options: .atomic)
+        }
+    }
+
+    private func load() {
+        guard let d = try? Data(contentsOf: saveURL),
+              let root = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return }
+        let fm = FileManager.default
+        for (p, v) in (root["files"] as? [String: [String: Any]]) ?? [:] {
+            guard fm.fileExists(atPath: p) else { continue }  // gone: drop the entry
+            var s = FileState()
+            s.offset = UInt64((v["offset"] as? Double) ?? 0)
+            s.totals = Totals(input: (v["in"] as? Int) ?? 0,
+                              output: (v["out"] as? Int) ?? 0,
+                              cost: (v["cost"] as? Double) ?? 0)
+            files[p] = s
+        }
+        for e in (root["events"] as? [[Double]]) ?? [] where e.count == 4 {
+            events.append((Date(timeIntervalSince1970: e[0]), Int(e[1]), Int(e[2]), e[3]))
+        }
+    }
+}
+
+/// "12.3k" / "1.2M" — compact token counts for the panel.
+func fmtTokens(_ n: Int) -> String {
+    switch n {
+    case ..<1000: return "\(n)"
+    case ..<1_000_000: return String(format: "%.1fk", Double(n) / 1000)
+    default: return String(format: "%.1fM", Double(n) / 1_000_000)
     }
 }
 
@@ -865,6 +1010,7 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     var onSettings: (() -> Void)?
     var onTerminal: (() -> Void)?
     var asks: [AgentAsk] = [] { didSet { rebuildAsks() } }
+    var usageSummary = ""  // "5h: 1.2M↑ 45k↓ · $3.20", shown in the header bar
     var onReply: ((AgentAsk, String) -> Void)?
     var onFocusAsk: ((AgentAsk) -> Void)?
     var onPermission: ((AgentAsk, String) -> Void)?  // decision: allow/deny/always
@@ -971,8 +1117,9 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
             return b
         }
         let busy = sessions.filter { $0.anyBusy }.count
-        let summary = label("\(sessions.count) \(L("sessions")) · \(busy) \(L("active"))",
-                            size: 10, color: .secondaryLabelColor, bold: false)
+        var text = "\(sessions.count) \(L("sessions")) · \(busy) \(L("active"))"
+        if !usageSummary.isEmpty { text += " · " + usageSummary }
+        let summary = label(text, size: 10, color: .secondaryLabelColor, bold: false)
         let bar = NSStackView(views: [hbtn("⚙︎", #selector(hdrSettings)), hbtn("⌨︎", #selector(hdrTerminal)),
                                       NSView(), summary])
         bar.orientation = .horizontal
@@ -1184,8 +1331,11 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         icons.append(icon)
         let title = label(s.kind.rawValue, size: 12, color: .labelColor, bold: true)
         let proj = label("· \(s.title)", size: 11, color: .secondaryLabelColor, bold: false)
-        let tag = label("\(s.model.isEmpty ? "" : s.model + " · ")\(relative(s.effectiveLastModified))",
-                        size: 10, color: .secondaryLabelColor, bold: false)
+        var tagText = "\(s.model.isEmpty ? "" : s.model + " · ")\(relative(s.effectiveLastModified))"
+        if s.tokensOut > 0 {
+            tagText = "\(fmtTokens(s.tokensIn))↑ \(fmtTokens(s.tokensOut))↓ $\(String(format: "%.2f", s.cost)) · " + tagText
+        }
+        let tag = label(tagText, size: 10, color: .secondaryLabelColor, bold: false)
         tag.setContentCompressionResistancePriority(.required, for: .horizontal)
         let top = NSStackView(views: [icon, title, proj, NSView(), tag])
         top.orientation = .horizontal
@@ -2360,6 +2510,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // open-vibe-island removal rule: a transcript's process must be missing
     // for 2 consecutive polls (~6 s) before its session stops being live
     private var missCounts: [String: Int] = [:]
+    private let usage = UsageTracker()  // touched only on scanQueue
     private let listController = SessionListController()
     private var frame = 0
     private var claudeWasLive = false
@@ -2793,10 +2944,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     live.insert(key)
                 }
             }
-            let result = self.scanner.scan(live: live, claudeCwdCounts: cwdCounts,
+            var result = self.scanner.scan(live: live, claudeCwdCounts: cwdCounts,
                                            cpuByPath: cpuByPath, cpuByCwd: cpuByCwd)
+            // token/cost accounting: read only the newly-appended transcript
+            // bytes of claude sessions (incl. subagents), then attach totals
+            let usagePaths = result.flatMap { [$0] + $0.children }
+                .filter { $0.kind == .claude && $0.id.hasSuffix(".jsonl") }
+                .map(\.id)
+            self.usage.update(paths: usagePaths)
+            for i in result.indices {
+                var t = self.usage.totals(for: result[i].id) ?? UsageTracker.Totals()
+                for c in result[i].children {
+                    if let ct = self.usage.totals(for: c.id) { t.add(ct) }
+                }
+                result[i].tokensIn = t.input
+                result[i].tokensOut = t.output
+                result[i].cost = t.cost
+            }
+            let window = self.usage.windowTotals()
             DispatchQueue.main.async {
                 self.scanInFlight = false
+                self.listController.usageSummary = window.output == 0 && window.input == 0 ? ""
+                    : "5h: \(fmtTokens(window.input))↑ \(fmtTokens(window.output))↓ · $\(String(format: "%.2f", window.cost))"
                 // Track fullscreen-space changes: full-width bar when the menu bar is hidden
                 if !self.expanded, !self.animating {
                     if self.window.frame != self.collapsedFrame() {
