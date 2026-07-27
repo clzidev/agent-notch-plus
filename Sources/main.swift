@@ -1696,8 +1696,10 @@ final class FBTableView: NSTableView {
     var onCopy: (() -> Void)?
     var onPaste: (() -> Void)?
     var onUp: (() -> Void)?
+    var onReturn: (() -> Void)?
     override func keyDown(with event: NSEvent) {
         if event.charactersIgnoringModifiers == " " { onSpace?(); return }
+        if event.keyCode == 36 || event.keyCode == 76 { onReturn?(); return }  // ↩ / Enter
         if event.modifierFlags.contains(.command) {
             if event.keyCode == 126 { onUp?(); return }  // ⌘↑
             switch event.charactersIgnoringModifiers?.lowercased() {
@@ -1793,6 +1795,7 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
         table.onCopy = { [weak self] in self?.copySelection() }
         table.onPaste = { [weak self] in self?.pasteIntoDir() }
         table.onUp = { [weak self] in self?.goUp() }
+        table.onReturn = { [weak self] in self?.openRow() }
         let scroll = NSScrollView()
         scroll.documentView = table
         scroll.hasVerticalScroller = true
@@ -1838,7 +1841,8 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
     }
 
     @objc private func openRow() {
-        let row = table.clickedRow
+        // clickedRow for double-clicks; selectedRow when driven by ↩
+        let row = table.clickedRow >= 0 ? table.clickedRow : table.selectedRow
         guard row >= 0, row < items.count else { return }
         let url = items[row]
         let vals = try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
@@ -1847,6 +1851,21 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
         } else {
             NSWorkspace.shared.open(url)
         }
+    }
+
+    /// Finder-like state right after ⌘F: the configured folder highlighted in
+    /// the sidebar, the first file selected, and keyboard focus on the list so
+    /// the arrow keys work without a click.
+    func focusInitial() {
+        if let i = sidebar.firstIndex(where: { $0.url.path == dir.path }) {
+            sideTable.selectRowIndexes(IndexSet(integer: i), byExtendingSelection: false)
+            sideTable.scrollRowToVisible(i)
+        }
+        if !items.isEmpty {
+            table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+            table.scrollRowToVisible(0)
+        }
+        window?.makeFirstResponder(table)
     }
 
     private func reload() {
@@ -1948,6 +1967,7 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
         guard let panel = QLPreviewPanel.shared() else { return }
         if panel.isVisible {
             panel.orderOut(nil)
+            window?.makeFirstResponder(table)  // arrows must keep working after close
         } else {
             previewItems = selectedURLs
             guard !previewItems.isEmpty else { return }
@@ -1966,10 +1986,20 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
     override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
         panel.dataSource = nil
         panel.delegate = nil
+        window?.makeFirstResponder(table)
     }
     func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int { previewItems.count }
     func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
         previewItems[index] as NSURL
+    }
+
+    /// Finder behaviour while Quick Look is open: the panel is key, so keys
+    /// land here — forward them to the file list. Arrows move the selection
+    /// (tableViewSelectionDidChange refreshes the preview) and Space closes.
+    func previewPanel(_ panel: QLPreviewPanel!, handle event: NSEvent!) -> Bool {
+        guard event.type == .keyDown else { return false }
+        table.keyDown(with: event)
+        return true
     }
 
     // MARK: tables
@@ -2047,10 +2077,18 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
         if t === sideTable {
             let row = sideTable.selectedRow
             guard row >= 0, row < sidebar.count else { return }
+            // programmatic selection (focusInitial) also lands here — don't
+            // re-navigate into the current dir, it would wipe the file
+            // selection that was just placed
+            guard sidebar[row].url.path != dir.path else { return }
             navigate(to: sidebar[row].url)
         } else if let panel = QLPreviewPanel.shared(), panel.isVisible {
             previewItems = selectedURLs
-            panel.reloadData()
+            if previewItems.isEmpty {
+                panel.orderOut(nil)  // nothing to show; never reload with zero items
+            } else {
+                panel.reloadData()
+            }
         }
     }
 
@@ -3174,6 +3212,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         split.adjustSubviews()
         DispatchQueue.main.async { [weak split] in
             split?.setPosition(420, ofDividerAt: 0)  // sidebar + list need real width
+            // only now the pane is in the window — earlier, makeFirstResponder
+            // would fail and the arrow keys would need a click first
+            fb.focusInitial()
         }
     }
 
