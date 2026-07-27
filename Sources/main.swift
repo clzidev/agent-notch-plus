@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.25"
+let appVersion = "2.9.26"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -2981,6 +2981,7 @@ final class TermPane: NSView {
     private let header = NSView()
     private let headerGrad = CAGradientLayer()
     private let hairline = CALayer()
+    private let sweep = CAGradientLayer()  // light streak that scans the hairline of the active pane
     private let dot = CALayer()
     private var isActive = false
     private static let headerH: CGFloat = 20
@@ -3001,11 +3002,20 @@ final class TermPane: NSView {
         header.layer?.insertSublayer(headerGrad, at: 0)
         hairline.backgroundColor = NSColor(white: 1, alpha: 0.07).cgColor
         header.layer?.addSublayer(hairline)
+        // scanner streak: a soft green light that sweeps along the hairline
+        // while this pane owns the keyboard
+        let streak = NSColor(calibratedRed: 0.2, green: 0.95, blue: 0.45, alpha: 0.55)
+        sweep.colors = [NSColor.clear.cgColor, streak.cgColor, NSColor.clear.cgColor]
+        sweep.startPoint = CGPoint(x: 0, y: 0.5)
+        sweep.endPoint = CGPoint(x: 1, y: 0.5)
+        sweep.isHidden = true
+        header.layer?.addSublayer(sweep)
         // focus dot: matrix green + glow on the pane that owns the keyboard
         dot.cornerRadius = 3
         dot.shadowOffset = .zero
         dot.shadowRadius = 3
         header.layer?.addSublayer(dot)
+        titleLabel.wantsLayer = true
         titleLabel.font = .monospacedSystemFont(ofSize: 10, weight: .medium)
         titleLabel.lineBreakMode = .byTruncatingMiddle
         titleLabel.frame = NSRect(x: 18, y: 3, width: bounds.width - 44, height: 14)
@@ -3038,21 +3048,48 @@ final class TermPane: NSView {
     }
 
     private func applyActive() {
+        let green = NSColor(calibratedRed: 0.1, green: 0.95, blue: 0.35, alpha: 1)
         CATransaction.begin()
         CATransaction.setAnimationDuration(0.25)
         if isActive {
             headerGrad.colors = [NSColor(calibratedRed: 0.05, green: 0.15, blue: 0.08, alpha: 1).cgColor,
                                  NSColor(calibratedRed: 0.03, green: 0.07, blue: 0.04, alpha: 1).cgColor]
             titleLabel.textColor = NSColor(calibratedRed: 0.45, green: 0.95, blue: 0.55, alpha: 1)
-            dot.backgroundColor = NSColor(calibratedRed: 0.1, green: 0.95, blue: 0.35, alpha: 1).cgColor
-            dot.shadowColor = NSColor(calibratedRed: 0.1, green: 0.95, blue: 0.35, alpha: 1).cgColor
+            // soft glow behind the title text
+            titleLabel.layer?.shadowColor = green.cgColor
+            titleLabel.layer?.shadowOpacity = 0.55
+            titleLabel.layer?.shadowRadius = 5
+            titleLabel.layer?.shadowOffset = .zero
+            dot.backgroundColor = green.cgColor
+            dot.shadowColor = green.cgColor
             dot.shadowOpacity = 0.9
+            // the dot breathes while this pane has the keyboard
+            let breathe = CABasicAnimation(keyPath: "shadowRadius")
+            breathe.fromValue = 2.5
+            breathe.toValue = 5.5
+            breathe.duration = 1.2
+            breathe.autoreverses = true
+            breathe.repeatCount = .infinity
+            dot.add(breathe, forKey: "breathe")
+            // scanner streak sweeping the hairline, every few seconds
+            sweep.isHidden = false
+            let run = CABasicAnimation(keyPath: "position.x")
+            run.fromValue = -header.bounds.width * 0.3
+            run.toValue = header.bounds.width * 1.3
+            run.duration = 2.8
+            run.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            run.repeatCount = .infinity
+            sweep.add(run, forKey: "run")
         } else {
             headerGrad.colors = [NSColor(white: 0.11, alpha: 1).cgColor,
                                  NSColor(white: 0.07, alpha: 1).cgColor]
             titleLabel.textColor = NSColor(white: 0.55, alpha: 1)
+            titleLabel.layer?.shadowOpacity = 0
             dot.backgroundColor = NSColor(white: 0.3, alpha: 1).cgColor
             dot.shadowOpacity = 0
+            dot.removeAnimation(forKey: "breathe")
+            sweep.isHidden = true
+            sweep.removeAnimation(forKey: "run")
         }
         CATransaction.commit()
     }
@@ -3063,6 +3100,8 @@ final class TermPane: NSView {
         CATransaction.setDisableActions(true)
         headerGrad.frame = header.bounds
         hairline.frame = CGRect(x: 0, y: 0, width: header.bounds.width, height: 1)
+        sweep.bounds = CGRect(x: 0, y: 0, width: header.bounds.width * 0.35, height: 1.5)
+        sweep.position = CGPoint(x: 0, y: 0.75)
         dot.frame = CGRect(x: 7, y: (Self.headerH - 6) / 2, width: 6, height: 6)
         CATransaction.commit()
     }
@@ -3155,6 +3194,7 @@ final class IACard: NSView {
 /// lift so the rounded pane tiles read as floating on glass, not on void.
 final class BackdropView: NSView {
     private let grad = CAGradientLayer()
+    private let notchGlow = CAGradientLayer()
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
@@ -3163,13 +3203,31 @@ final class BackdropView: NSView {
         grad.startPoint = CGPoint(x: 0.5, y: 1)
         grad.endPoint = CGPoint(x: 0.5, y: 0)
         layer?.insertSublayer(grad, at: 0)
+        // faint light spilling down from the notch, breathing very slowly —
+        // the terminal literally hangs from it, so it glows from it too
+        notchGlow.type = .radial
+        notchGlow.colors = [NSColor(calibratedRed: 0.25, green: 0.85, blue: 0.45, alpha: 0.09).cgColor,
+                            NSColor.clear.cgColor]
+        notchGlow.startPoint = CGPoint(x: 0.5, y: 1)
+        notchGlow.endPoint = CGPoint(x: 1.0, y: 0.0)
+        layer?.insertSublayer(notchGlow, above: grad)
+        let breathe = CABasicAnimation(keyPath: "opacity")
+        breathe.fromValue = 1.0
+        breathe.toValue = 0.45
+        breathe.duration = 4.0
+        breathe.autoreverses = true
+        breathe.repeatCount = .infinity
+        notchGlow.add(breathe, forKey: "breathe")
     }
     required init?(coder: NSCoder) { nil }
     override func layout() {
         super.layout()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        grad.frame = layer?.bounds ?? .zero
+        let b = layer?.bounds ?? .zero
+        grad.frame = b
+        let w = b.width * 0.55
+        notchGlow.frame = CGRect(x: b.midX - w / 2, y: b.maxY - 80, width: w, height: 80)
         CATransaction.commit()
     }
 }
@@ -4343,7 +4401,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         curtain(panel, open: false) { panel.orderOut(nil) }
     }
 
-    /// Curtain animation: unroll down from the notch / roll back up into it.
+    /// Curtain animation: unroll down from the notch with a tiny spring settle
+    /// (the fabric "lands"), roll back up on hide. A subtle fade rides along.
     private func curtain(_ panel: NSWindow, open: Bool, completion: (() -> Void)? = nil) {
         guard let view = panel.contentView, let layer = view.layer else { completion?(); return }
         let b = view.bounds
@@ -4354,12 +4413,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             completion?()
             if !open { layer.transform = CATransform3DIdentity }
         }
-        let a = CABasicAnimation(keyPath: "transform")
-        a.fromValue = NSValue(caTransform3D: open ? rolled : CATransform3DIdentity)
-        a.toValue = NSValue(caTransform3D: open ? CATransform3DIdentity : rolled)
-        a.duration = 0.28
-        a.timingFunction = CAMediaTimingFunction(name: open ? .easeOut : .easeIn)
-        layer.add(a, forKey: "curtain")
+        if open {
+            let s = CASpringAnimation(keyPath: "transform")
+            s.fromValue = NSValue(caTransform3D: rolled)
+            s.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+            s.stiffness = 260
+            s.damping = 24
+            s.mass = 1
+            s.initialVelocity = 2
+            s.duration = s.settlingDuration
+            layer.add(s, forKey: "curtain")
+        } else {
+            let a = CABasicAnimation(keyPath: "transform")
+            a.fromValue = NSValue(caTransform3D: CATransform3DIdentity)
+            a.toValue = NSValue(caTransform3D: rolled)
+            a.duration = 0.24
+            a.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            layer.add(a, forKey: "curtain")
+        }
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = open ? 0.4 : 1
+        fade.toValue = open ? 1 : 0.3
+        fade.duration = open ? 0.3 : 0.24
+        layer.add(fade, forKey: "curtainFade")
         CATransaction.commit()
     }
 
