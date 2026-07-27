@@ -82,6 +82,10 @@ enum L10n {
         "cant_reply_info": [
             "This agent runs in an EXTERNAL terminal (Warp, Ghostty, iTerm…). To reply from the notch, run `claude` inside the notch terminal (⌃⌥Space) — replies go straight to it.",
             "Este agente corre en una terminal EXTERNA (Warp, Ghostty, iTerm…). Para responder desde el notch, corré `claude` dentro de la terminal del notch (⌃⌥Espacio) — la respuesta va directo."],
+        "srv_open": ["Open", "Abrir"],
+        "srv_copy": ["Copy", "Copiar"],
+        "srv_kill": ["Kill", "Matar"],
+        "srv_kill_title": ["Stop this dev server?", "¿Frenar este dev server?"],
         "actions_title": ["Saved actions:", "Acciones guardadas:"],
         "actions_edit": ["Edit…", "Editar…"],
         "ollama_model": ["Ollama model (/ia):", "Modelo de Ollama (/ia):"],
@@ -1016,6 +1020,11 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     // saved shell actions (~/.config/agent-notch/actions) shown as buttons
     var actions: [(name: String, cmd: String)] = []
     var onAction: ((String) -> Void)?
+    // local dev servers detected while the panel is open
+    var devServers: [(port: Int, pid: Int32, name: String)] = []
+    var onServerOpen: ((Int) -> Void)?
+    var onServerCopy: ((Int) -> Void)?
+    var onServerKill: ((Int32, String) -> Void)?
     var onReply: ((AgentAsk, String) -> Void)?
     var onFocusAsk: ((AgentAsk) -> Void)?
     var onPermission: ((AgentAsk, String) -> Void)?  // decision: allow/deny/always
@@ -1077,6 +1086,7 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         icons.removeAll()
         sessionStack.addArrangedSubview(headerBar())
         if !actions.isEmpty { sessionStack.addArrangedSubview(actionsBar()) }
+        for i in devServers.indices.prefix(5) { sessionStack.addArrangedSubview(serverRow(i)) }
         if sessions.isEmpty {
             sessionStack.addArrangedSubview(label(L("no_sessions"), size: 12, color: .secondaryLabelColor, bold: false))
             return
@@ -1160,6 +1170,42 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     @objc private func actionTapped(_ b: NSButton) {
         guard b.tag >= 0, b.tag < actions.count else { return }
         onAction?(actions[b.tag].cmd)
+    }
+
+    /// ":5173 node · Open · Copy · Kill" — one compact row per dev server.
+    private func serverRow(_ i: Int) -> NSView {
+        let s = devServers[i]
+        let name = label(":\(s.port)  \(s.name)", size: 10, color: .systemTeal, bold: true)
+        name.font = .monospacedSystemFont(ofSize: 10, weight: .semibold)
+        func sbtn(_ title: String, _ sel: Selector) -> NSButton {
+            let b = FirstMouseButton(title: title, target: self, action: sel)
+            b.bezelStyle = .rounded
+            b.controlSize = .mini
+            b.tag = i
+            return b
+        }
+        let bar = NSStackView(views: [name, NSView(),
+                                      sbtn(L("srv_open"), #selector(serverOpen(_:))),
+                                      sbtn(L("srv_copy"), #selector(serverCopy(_:))),
+                                      sbtn(L("srv_kill"), #selector(serverKill(_:)))])
+        bar.orientation = .horizontal
+        bar.spacing = 6
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        bar.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
+        return bar
+    }
+
+    @objc private func serverOpen(_ b: NSButton) {
+        guard devServers.indices.contains(b.tag) else { return }
+        onServerOpen?(devServers[b.tag].port)
+    }
+    @objc private func serverCopy(_ b: NSButton) {
+        guard devServers.indices.contains(b.tag) else { return }
+        onServerCopy?(devServers[b.tag].port)
+    }
+    @objc private func serverKill(_ b: NSButton) {
+        guard devServers.indices.contains(b.tag) else { return }
+        onServerKill?(devServers[b.tag].pid, ":\(devServers[b.tag].port) \(devServers[b.tag].name)")
     }
 
     private func askCard(_ ask: AgentAsk) -> NSView {
@@ -2705,6 +2751,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         listController.onFocusAsk = { [weak self] ask in self?.focusTerminalFor(ask) }
         listController.onPermission = { [weak self] ask, decision in self?.answerAsk(ask, decision: decision) }
         listController.onAction = { [weak self] cmd in self?.runSavedAction(cmd) }
+        listController.onServerOpen = { port in
+            NSWorkspace.shared.open(URL(string: "http://localhost:\(port)")!)
+        }
+        listController.onServerCopy = { port in
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString("http://localhost:\(port)", forType: .string)
+        }
+        listController.onServerKill = { [weak self] pid, desc in
+            self?.killDevServer(pid: pid, label: desc)
+        }
 
         // Global hotkey ⌃⌥N toggles the panel. Carbon RegisterEventHotKey works
         // without Accessibility/Input-Monitoring permission, unlike key monitors.
@@ -2941,8 +2997,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func rescan() {
         if scanInFlight { return }
         scanInFlight = true
+        let scanServers = expanded  // read on main; dev servers only matter while visible
         scanQueue.async { [weak self] in
             guard let self else { return }
+            let servers = scanServers ? self.scanDevServers() : []
             // Process discovery is the authoritative liveness signal. Keys are
             // transcript paths, or "cwd#<encoded>#<i>" for claude's cwd fallback.
             var seen = Set<String>()
@@ -3012,6 +3070,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 IndicatorView.refreshPetChoice()
                 IndicatorView.refreshCustomGifs()
                 self.applyAsks(pendingAsks)
+                self.listController.devServers = servers
                 self.listController.sessions = result
                 // busy → mascot; alive-but-quiet → nothing (idle, not done);
                 // process exited → done blob (cleared on terminal focus)
@@ -4392,6 +4451,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         listController.asks = asks
         let safe = sanitizedSessionID(ask.sessionID)
         try? FileManager.default.removeItem(at: asksDir.appendingPathComponent("\(safe).json"))
+    }
+
+    // MARK: - Local dev servers
+
+    // command names worth showing — everything else on a LISTEN port is
+    // system/app noise (rapportd, Spotify, …)
+    private static let devServerNames = ["node", "python", "ruby", "php", "deno", "bun",
+                                         "java", "go", "beam", "rails", "flask", "vite",
+                                         "next", "npm", "pnpm", "yarn", "cargo", "dotnet",
+                                         "swift", "gradle", "webpack", "ollama", "docker",
+                                         "puma", "uvicorn", "gunicorn", "caddy", "hugo"]
+
+    /// One `lsof` sweep of the user's listening TCP ports (called on scanQueue,
+    /// only while the panel is expanded).
+    private func scanDevServers() -> [(port: Int, pid: Int32, name: String)] {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        p.arguments = ["-iTCP", "-sTCP:LISTEN", "-P", "-n", "-Fpcn"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return [] }
+        let pid = p.processIdentifier
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 2.0) { [weak p] in
+            if let p, p.isRunning { kill(pid, SIGKILL) }  // closes the pipe below
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let out = String(data: data, encoding: .utf8) else { return [] }
+        var servers: [(port: Int, pid: Int32, name: String)] = []
+        var curPid: Int32 = 0
+        var curCmd = ""
+        var seenPorts = Set<Int>()
+        for line in out.split(whereSeparator: \.isNewline) {
+            let val = String(line.dropFirst())
+            switch line.first {
+            case "p": curPid = Int32(val) ?? 0
+            case "c": curCmd = val
+            case "n":
+                // "*:5173", "127.0.0.1:8000", "[::1]:3000"
+                guard let portStr = val.split(separator: ":").last, let port = Int(portStr),
+                      port > 1023, !seenPorts.contains(port) else { continue }
+                let lowered = curCmd.lowercased()
+                guard Self.devServerNames.contains(where: { lowered.contains($0) }) else { continue }
+                seenPorts.insert(port)
+                servers.append((port, curPid, curCmd))
+            default: break
+            }
+        }
+        return servers.sorted { $0.port < $1.port }
+    }
+
+    private func killDevServer(pid: Int32, label desc: String) {
+        let a = NSAlert()
+        a.messageText = L("srv_kill_title")
+        a.informativeText = desc
+        a.addButton(withTitle: L("srv_kill"))
+        a.addButton(withTitle: L("cancel"))
+        a.alertStyle = .warning
+        let saved: [(NSWindow, NSWindow.Level)] = [window, indicatorWindow, termWindow]
+            .compactMap { $0 }.map { ($0, $0.level) }
+        saved.forEach { $0.0.level = .normal }
+        defer { saved.forEach { $0.0.level = $0.1 } }
+        if runModalSafely(a) == .alertFirstButtonReturn { kill(pid, SIGTERM) }
     }
 
     // MARK: - Saved actions (frequent shell commands, run from the notch)
