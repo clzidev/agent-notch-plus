@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.21"
+let appVersion = "2.9.22"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -24,12 +24,23 @@ struct AgentAsk {
     var toolDetail: String = ""  // the exact command / file path shown on the card
     var toolUseID: String = ""
     var canReply: Bool = false   // info cards: session runs inside a notch pane
+    var branch: String = ""      // git branch of the ask's cwd
 }
 
 /// The hook writes ask files named after the session id with every
 /// non-alphanumeric character replaced by "_" — both sides must agree.
 func sanitizedSessionID(_ s: String) -> String {
     String(s.map { $0.isLetter || $0.isNumber ? $0 : Character("_") })
+}
+
+/// Current git branch of a directory ("" outside a repo). Reads .git/HEAD —
+/// a ~30-byte file, cheap enough to read on every poll.
+func gitBranch(cwd: String) -> String {
+    guard !cwd.isEmpty,
+          let head = try? String(contentsOfFile: cwd + "/.git/HEAD", encoding: .utf8) else { return "" }
+    let t = head.trimmingCharacters(in: .whitespacesAndNewlines)
+    if t.hasPrefix("ref: refs/heads/") { return String(t.dropFirst(16)) }
+    return String(t.prefix(7))  // detached: short sha
 }
 
 // MARK: - Localization
@@ -96,9 +107,14 @@ enum L10n {
         "ia_thinking": ["thinking…", "pensando…"],
         "ia_insert": ["Insert", "Insertar"],
         "ia_copy": ["Copy", "Copiar"],
+        "agent_one": ["agent", "agente"],
+        "agents": ["agents", "agentes"],
+        "g_active": ["active", "activas"],
+        "g_total": ["total", "total"],
+        "perm_danger": ["⚠ CAREFUL", "⚠ CUIDADO"],
         "perm_allow": ["Allow", "Permitir"],
         "perm_deny": ["Deny", "Denegar"],
-        "perm_always": ["Always allow", "Permitir siempre"],
+        "perm_always": ["Always", "Siempre"],
         "perm_title": ["Permission", "Permiso"],
         "perm_hint": ["No answer here → the prompt appears in the terminal after a bit.",
                       "Si no respondés acá → el prompt aparece en la terminal en un rato."],
@@ -204,6 +220,7 @@ struct AgentSession {
     var tokensIn = 0
     var tokensOut = 0
     var cost = 0.0
+    var branch = ""  // git branch of the session's cwd, "" outside a repo
     var prompt: String = ""
     var threadID: String = ""
     var parentID: String?
@@ -526,13 +543,43 @@ final class UsageTracker {
 
     func totals(for path: String) -> Totals? { files[path]?.totals }
 
-    /// Aggregate of the last 5 hours (pruned as a side effect).
-    func windowTotals() -> Totals {
-        let cutoff = Date().addingTimeInterval(-5 * 3600)
+    /// Events older than 7 days are dropped — the gauges need a week of
+    /// history (5h window, 7d window, weekly peak).
+    private func prune() {
+        let cutoff = Date().addingTimeInterval(-7 * 24 * 3600)
         events.removeAll { $0.when < cutoff }
+    }
+
+    /// Aggregate of the last N hours.
+    func window(hours: Double) -> Totals {
+        prune()
+        let cutoff = Date().addingTimeInterval(-hours * 3600)
         var t = Totals()
-        for e in events { t.input += e.input; t.output += e.output; t.cost += e.cost }
+        for e in events where e.when >= cutoff {
+            t.input += e.input
+            t.output += e.output
+            t.cost += e.cost
+        }
         return t
+    }
+
+    /// Busiest 5-hour token window of the last week (1h buckets) — the honest
+    /// denominator for the "how hot is the current 5h window" gauge.
+    func peak5hTokens() -> Int {
+        prune()
+        guard !events.isEmpty else { return 0 }
+        var buckets: [Int: Int] = [:]
+        for e in events {
+            buckets[Int(e.when.timeIntervalSince1970 / 3600), default: 0] += e.input + e.output
+        }
+        guard let minH = buckets.keys.min(), let maxH = buckets.keys.max() else { return 0 }
+        var best = 0
+        for start in minH...maxH {
+            var sum = 0
+            for h in start..<(start + 5) { sum += buckets[h] ?? 0 }
+            best = max(best, sum)
+        }
+        return best
     }
 
     func update(paths: [String]) {
@@ -595,7 +642,7 @@ final class UsageTracker {
             filesObj[p] = ["offset": s.offset, "in": s.totals.input,
                            "out": s.totals.output, "cost": s.totals.cost]
         }
-        let evs = events.suffix(2000).map { [$0.when.timeIntervalSince1970, Double($0.input),
+        let evs = events.suffix(5000).map { [$0.when.timeIntervalSince1970, Double($0.input),
                                              Double($0.output), $0.cost] }
         let root: [String: Any] = ["v": 2, "files": filesObj, "events": evs]
         if let d = try? JSONSerialization.data(withJSONObject: root) {
@@ -1024,7 +1071,15 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     var onSettings: (() -> Void)?
     var onTerminal: (() -> Void)?
     var asks: [AgentAsk] = [] { didSet { rebuildAsks() } }
-    var usageSummary = ""  // "5h: 1.2M↑ 45k↓ · $3.20", shown in the header bar
+    // usage windows for the header chip + gauges (5h, 7d, weekly 5h peak)
+    var gaugeData: (t5: UsageTracker.Totals, t7d: UsageTracker.Totals, peak5h: Int)?
+    private var pendingGaugeAnimation = false
+    /// Called right before the panel is shown — the next rebuild's gauges
+    /// animate their fill once.
+    func panelWillShow() {
+        pendingGaugeAnimation = true
+        rebuildSessions()
+    }
     // saved shell actions (~/.config/agent-notch/actions) shown as buttons
     var actions: [(name: String, cmd: String)] = []
     var onAction: ((String) -> Void)?
@@ -1081,6 +1136,24 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
             askStack.addArrangedSubview(label("+\(asks.count - 3)…", size: 10,
                                               color: .secondaryLabelColor, bold: false))
         }
+        // one-shot entrance (this code only runs when the ask set changed):
+        // new cards fade in and slide up a touch
+        if view.window != nil {
+            for v in askStack.arrangedSubviews {
+                v.wantsLayer = true
+                let fade = CABasicAnimation(keyPath: "opacity")
+                fade.fromValue = 0
+                fade.toValue = 1
+                fade.duration = 0.28
+                let slide = CABasicAnimation(keyPath: "transform.translation.y")
+                slide.fromValue = 10
+                slide.toValue = 0
+                slide.duration = 0.28
+                slide.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                v.layer?.add(fade, forKey: "in")
+                v.layer?.add(slide, forKey: "slide")
+            }
+        }
         onLayoutChange?()  // the panel frame must grow/shrink with the cards
     }
 
@@ -1088,12 +1161,20 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         sessionStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         icons.removeAll()
         sessionStack.addArrangedSubview(headerBar())
+        if let gauges = gaugesRow() {
+            sessionStack.addArrangedSubview(gauges)
+            sessionStack.addArrangedSubview(hairline())
+        }
+        pendingGaugeAnimation = false
         if !actions.isEmpty { sessionStack.addArrangedSubview(actionsBar()) }
         if sessions.isEmpty {
             sessionStack.addArrangedSubview(label(L("no_sessions"), size: 12, color: .secondaryLabelColor, bold: false))
             return
         }
+        var first = true
         for s in sessions.prefix(6) {
+            if !first { sessionStack.addArrangedSubview(hairline()) }
+            first = false
             sessionStack.addArrangedSubview(row(for: s))
             if !s.children.isEmpty {
                 let open = expandedIDs.contains(s.id)
@@ -1124,8 +1205,8 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         }
     }
 
-    /// Top bar of the panel: quick actions on the left, session summary on
-    /// the right — the panel is a small control center now, not just a list.
+    /// Top bar, agentnotch-style: "N agentes" on the left; a ⚡tokens chip,
+    /// colored status counters and the quick buttons on the right.
     private func headerBar() -> NSView {
         func hbtn(_ title: String, _ action: Selector) -> NSButton {
             let b = NSButton(title: title, target: self, action: action)
@@ -1134,20 +1215,146 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
             b.font = .systemFont(ofSize: 15)
             return b
         }
+        let title = label("\(sessions.count) \(sessions.count == 1 ? L("agent_one") : L("agents"))",
+                          size: 13, color: .labelColor, bold: true)
+        var views: [NSView] = [title, NSView()]
+        if let g = gaugeData, g.t5.input + g.t5.output > 0 {
+            views.append(chip("⚡ " + fmtTokens(g.t5.input + g.t5.output)))
+        }
+        let waiting = asks.count + sessions.filter { $0.anyLive && !$0.anyBusy }.count
         let busy = sessions.filter { $0.anyBusy }.count
-        var text = "\(sessions.count) \(L("sessions")) · \(busy) \(L("active"))"
-        if !usageSummary.isEmpty { text += " · " + usageSummary }
-        let summary = label(text, size: 10, color: .secondaryLabelColor, bold: false)
-        let bar = NSStackView(views: [hbtn("⚙︎", #selector(hdrSettings)), hbtn("⌨︎", #selector(hdrTerminal)),
-                                      NSView(), summary])
+        if waiting > 0 { views.append(dotCount(waiting, .systemOrange)) }
+        if busy > 0 { views.append(dotCount(busy, .systemGreen)) }
+        views.append(hbtn("⌨︎", #selector(hdrTerminal)))
+        views.append(hbtn("⚙︎", #selector(hdrSettings)))
+        let bar = NSStackView(views: views)
         bar.orientation = .horizontal
-        bar.spacing = 12
+        bar.spacing = 10
         bar.translatesAutoresizingMaskIntoConstraints = false
         bar.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
         return bar
     }
     @objc private func hdrSettings() { onSettings?() }
     @objc private func hdrTerminal() { onTerminal?() }
+
+    /// Capsule chip ("⚡ 12.3M", model names…).
+    private func chip(_ text: String, color: NSColor = .labelColor) -> NSView {
+        let l = label(text, size: 10, color: color, bold: true)
+        l.font = .monospacedSystemFont(ofSize: 10, weight: .semibold)
+        let v = NSView()
+        v.wantsLayer = true
+        v.layer?.backgroundColor = NSColor(white: 1, alpha: 0.06).cgColor
+        v.layer?.borderColor = NSColor(white: 1, alpha: 0.15).cgColor
+        v.layer?.borderWidth = 1
+        v.layer?.cornerRadius = 9
+        v.translatesAutoresizingMaskIntoConstraints = false
+        l.translatesAutoresizingMaskIntoConstraints = false
+        v.addSubview(l)
+        NSLayoutConstraint.activate([
+            l.topAnchor.constraint(equalTo: v.topAnchor, constant: 3),
+            l.bottomAnchor.constraint(equalTo: v.bottomAnchor, constant: -3),
+            l.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 8),
+            l.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -8),
+        ])
+        return v
+    }
+
+    /// "● 2" colored status counter for the header.
+    private func dotCount(_ n: Int, _ color: NSColor) -> NSView {
+        let l = label("● \(n)", size: 11, color: color, bold: true)
+        l.font = .monospacedSystemFont(ofSize: 11, weight: .bold)
+        return l
+    }
+
+    /// 1px separator line spanning the panel.
+    private func hairline() -> NSView {
+        let v = NSView()
+        v.wantsLayer = true
+        v.layer?.backgroundColor = NSColor(white: 1, alpha: 0.08).cgColor
+        v.translatesAutoresizingMaskIntoConstraints = false
+        v.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        v.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
+        return v
+    }
+
+    /// Small glowing status circle (the screenshot's red/green dots).
+    private func statusDot(_ color: NSColor, glow: Bool, pulsing: Bool = false) -> NSView {
+        let v = NSView()
+        v.translatesAutoresizingMaskIntoConstraints = false
+        v.widthAnchor.constraint(equalToConstant: 8).isActive = true
+        v.heightAnchor.constraint(equalToConstant: 8).isActive = true
+        v.wantsLayer = true
+        v.layer?.backgroundColor = color.cgColor
+        v.layer?.cornerRadius = 4
+        if glow {
+            v.layer?.masksToBounds = false
+            v.layer?.shadowColor = color.cgColor
+            v.layer?.shadowOpacity = 0.9
+            v.layer?.shadowRadius = 4
+            v.layer?.shadowOffset = .zero
+        }
+        if pulsing { pulse(v, low: 0.55, duration: 1.0) }
+        return v
+    }
+
+    /// The three gradient gauges: 5h usage vs weekly peak, 5h/7d cost share,
+    /// and active/total sessions — all fed by our own tracker, nothing faked.
+    private func gaugesRow() -> NSView? {
+        guard let g = gaugeData else { return nil }
+        let tok5 = g.t5.input + g.t5.output
+        let tok7 = g.t7d.input + g.t7d.output
+        guard tok7 > 0 || !sessions.isEmpty else { return nil }
+        let active = sessions.filter { $0.anyBusy }.count
+
+        func cluster(_ ring: RingGauge, _ l1: String, _ v1: String,
+                     _ l2: String, _ v2: String) -> NSView {
+            ring.animateOnAppear = pendingGaugeAnimation
+            func line(_ tag: String, _ value: String, dim: Bool) -> NSView {
+                let t = label(tag, size: 10, color: dim ? .tertiaryLabelColor : .secondaryLabelColor, bold: false)
+                t.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+                t.widthAnchor.constraint(equalToConstant: 46).isActive = true
+                let v = label(value, size: 10, color: dim ? .secondaryLabelColor : .labelColor, bold: !dim)
+                v.font = .monospacedSystemFont(ofSize: 10, weight: dim ? .regular : .semibold)
+                let h = NSStackView(views: [t, v])
+                h.orientation = .horizontal
+                h.spacing = 4
+                return h
+            }
+            let colL = NSStackView(views: [line(l1, v1, dim: false), line(l2, v2, dim: true)])
+            colL.orientation = .vertical
+            colL.alignment = .leading
+            colL.spacing = 3
+            let h = NSStackView(views: [ring, colL])
+            h.orientation = .horizontal
+            h.spacing = 8
+            return h
+        }
+
+        let r1 = RingGauge(symbol: "✳", symbolColor: IndicatorView.claudeOrange,
+                           colors: [.systemBlue, .systemTeal])
+        r1.progress = g.peak5h > 0 ? CGFloat(tok5) / CGFloat(g.peak5h) : 0
+        let r2 = RingGauge(symbol: "$", symbolColor: .systemGreen,
+                           colors: [.systemGreen, .systemTeal])
+        r2.progress = g.t7d.cost > 0 ? CGFloat(g.t5.cost / g.t7d.cost) : 0
+        let r3 = RingGauge(symbol: "⬡", symbolColor: IndicatorView.codexTeal,
+                           colors: [.systemPurple, .systemBlue])
+        r3.progress = sessions.isEmpty ? 0 : CGFloat(active) / CGFloat(sessions.count)
+
+        let row = NSStackView(views: [
+            cluster(r1, "5h", fmtTokens(tok5), "7d", fmtTokens(tok7)),
+            NSView(),
+            cluster(r2, "5h", String(format: "$%.2f", g.t5.cost),
+                    "7d", String(format: "$%.2f", g.t7d.cost)),
+            NSView(),
+            cluster(r3, L("g_active"), "\(active)", L("g_total"), "\(sessions.count)"),
+        ])
+        row.orientation = .horizontal
+        row.spacing = 8
+        row.edgeInsets = NSEdgeInsets(top: 2, left: 4, bottom: 4, right: 4)
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
+        return row
+    }
 
     /// One small button per saved action — click runs it in the notch terminal.
     private func actionsBar() -> NSView {
@@ -1180,46 +1387,108 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         return ask.kind == "permission" ? permissionCard(ask) : infoCard(ask)
     }
 
-    /// AgentPeek-style permission card: what the agent wants to run, in mono,
-    /// with big full-width Allow / Deny / Always-allow buttons. The decision
-    /// travels through the blocked PreToolUse hook — works for sessions in ANY
-    /// terminal, not just the notch's.
+    /// Permission card, agentnotch-style: project + branch in the head, the
+    /// exact command in a dark mono inset ($-prefixed for Bash), a red danger
+    /// badge for scary commands, and pill buttons — Approve filled white,
+    /// Deny dark, ★ Always dark. The decision travels through the blocked
+    /// PreToolUse hook — works for sessions in ANY terminal.
     private func permissionCard(_ ask: AgentAsk) -> NSView {
         let title = label("🔒 \(L("perm_title")) · \(ask.toolName)", size: 12, color: .systemOrange, bold: true)
-        let proj = label(((ask.cwd as NSString).lastPathComponent), size: 10, color: .secondaryLabelColor, bold: false)
-        let head = NSStackView(views: [title, NSView(), proj])
+        var headViews: [NSView] = [title]
+        if isRisky(ask.toolDetail) { headViews.append(riskBadge()) }
+        headViews.append(NSView())
+        var projText = (ask.cwd as NSString).lastPathComponent
+        if !ask.branch.isEmpty { projText += "  ⎇ \(ask.branch)" }
+        let proj = label(projText, size: 10, color: .secondaryLabelColor, bold: false)
+        proj.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        headViews.append(proj)
+        let head = NSStackView(views: headViews)
         head.orientation = .horizontal
-        let detail = label(ask.toolDetail.isEmpty ? ask.message : ask.toolDetail,
-                           size: 12, color: NSColor(white: 0.92, alpha: 1), bold: false, lines: 5)
-        detail.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        detail.preferredMaxLayoutWidth = contentWidth - 28
+        head.spacing = 8
 
-        func bigBtn(_ text: String, _ color: NSColor, _ sel: Selector) -> NSButton {
-            let b = FirstMouseButton(title: text, target: self, action: sel)
+        let cmdText = ask.toolDetail.isEmpty ? ask.message
+            : (ask.toolName == "Bash" ? "$ " + ask.toolDetail : ask.toolDetail)
+        let cmd = commandBlock(cmdText)
+
+        func pill(_ text: String, fill: NSColor, textColor: NSColor, _ sel: Selector) -> NSButton {
+            let b = FirstMouseButton(title: "", target: self, action: sel)
             b.isBordered = false
             b.wantsLayer = true
-            b.layer?.backgroundColor = color.withAlphaComponent(0.18).cgColor
-            b.layer?.cornerRadius = 8
-            b.layer?.borderWidth = 1
-            b.layer?.borderColor = color.withAlphaComponent(0.85).cgColor
-            b.contentTintColor = color
-            b.font = .systemFont(ofSize: 13, weight: .semibold)
-            b.heightAnchor.constraint(equalToConstant: 36).isActive = true
+            b.layer?.backgroundColor = fill.cgColor
+            b.layer?.cornerRadius = 15
+            b.attributedTitle = NSAttributedString(string: text, attributes: [
+                .font: NSFont.systemFont(ofSize: 12.5, weight: .semibold),
+                .foregroundColor: textColor,
+            ])
+            b.heightAnchor.constraint(equalToConstant: 30).isActive = true
+            b.widthAnchor.constraint(greaterThanOrEqualToConstant: 92).isActive = true
             b.identifier = NSUserInterfaceItemIdentifier(ask.sessionID)
             return b
         }
         let btns = NSStackView(views: [
-            bigBtn("✓ " + L("perm_allow"), .systemGreen, #selector(permAllow(_:))),
-            bigBtn("✕ " + L("perm_deny"), .systemRed, #selector(permDeny(_:))),
-            bigBtn("★ " + L("perm_always"), .systemBlue, #selector(permAlways(_:))),
+            NSView(),
+            pill("★ " + L("perm_always"), fill: NSColor(white: 1, alpha: 0.10),
+                 textColor: NSColor(white: 0.85, alpha: 1), #selector(permAlways(_:))),
+            pill(L("perm_deny"), fill: NSColor(white: 1, alpha: 0.10),
+                 textColor: NSColor(calibratedRed: 1, green: 0.55, blue: 0.5, alpha: 1),
+                 #selector(permDeny(_:))),
+            pill(L("perm_allow"), fill: .white, textColor: .black, #selector(permAllow(_:))),
         ])
         btns.orientation = .horizontal
-        btns.distribution = .fillEqually
         btns.spacing = 8
         btns.widthAnchor.constraint(equalToConstant: contentWidth - 20).isActive = true
         let hint = label(L("perm_hint"), size: 9, color: .tertiaryLabelColor, bold: false)
 
-        return wrapCard(NSStackView(views: [head, detail, btns, hint]), head: head)
+        return wrapCard(NSStackView(views: [head, cmd, btns, hint]), head: head)
+    }
+
+    /// Dark mono inset for the exact command/path an agent wants to run.
+    private func commandBlock(_ text: String) -> NSView {
+        let l = label(text, size: 12, color: NSColor(white: 0.95, alpha: 1), bold: false, lines: 4)
+        l.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        l.preferredMaxLayoutWidth = contentWidth - 60
+        let v = NSView()
+        v.wantsLayer = true
+        v.layer?.backgroundColor = NSColor(white: 0, alpha: 0.35).cgColor
+        v.layer?.cornerRadius = 6
+        v.translatesAutoresizingMaskIntoConstraints = false
+        l.translatesAutoresizingMaskIntoConstraints = false
+        v.addSubview(l)
+        NSLayoutConstraint.activate([
+            l.topAnchor.constraint(equalTo: v.topAnchor, constant: 6),
+            l.bottomAnchor.constraint(equalTo: v.bottomAnchor, constant: -6),
+            l.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 10),
+            l.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -10),
+            v.widthAnchor.constraint(equalToConstant: contentWidth - 20),
+        ])
+        return v
+    }
+
+    /// Red "⚠ careful" chip (the screenshot's "Outside sandbox" vibe) for
+    /// commands that can bite.
+    private func riskBadge() -> NSView {
+        let l = label(L("perm_danger"), size: 9, color: NSColor(calibratedRed: 1, green: 0.45, blue: 0.4, alpha: 1), bold: true)
+        l.font = .monospacedSystemFont(ofSize: 9, weight: .bold)
+        let v = NSView()
+        v.wantsLayer = true
+        v.layer?.backgroundColor = NSColor(calibratedRed: 0.35, green: 0.08, blue: 0.06, alpha: 1).cgColor
+        v.layer?.cornerRadius = 7
+        v.translatesAutoresizingMaskIntoConstraints = false
+        l.translatesAutoresizingMaskIntoConstraints = false
+        v.addSubview(l)
+        NSLayoutConstraint.activate([
+            l.topAnchor.constraint(equalTo: v.topAnchor, constant: 2),
+            l.bottomAnchor.constraint(equalTo: v.bottomAnchor, constant: -2),
+            l.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 7),
+            l.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -7),
+        ])
+        return v
+    }
+
+    private func isRisky(_ cmd: String) -> Bool {
+        let c = cmd.lowercased()
+        return ["rm -rf", "rm -fr", "sudo ", "dd if=", "mkfs", "chmod -r 777", "chmod 777",
+                "--force", "--hard", "| sh", "| bash", "> /dev/", ":(){"].contains { c.contains($0) }
     }
 
     /// A highlighted card for an agent waiting on you: the question, a reply
@@ -1362,6 +1631,11 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     /// prompt/snippet, and a colored status line. The active session's card
     /// gets a warm highlighted border, vibe-island style.
     private func row(for s: AgentSession) -> NSView {
+        // glowing status dot, screenshot-style: green pulsing = working,
+        // orange = waiting on you, dim green = done
+        let dot: NSView = s.anyBusy ? statusDot(.systemGreen, glow: true, pulsing: true)
+            : s.anyLive ? statusDot(.systemOrange, glow: true)
+            : statusDot(NSColor.systemGreen.withAlphaComponent(0.45), glow: false)
         let icon = DitherIconView()
         icon.running = s.anyBusy
         icon.idle = s.anyLive && !s.anyBusy
@@ -1370,15 +1644,25 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         icon.widthAnchor.constraint(equalToConstant: 18).isActive = true
         icon.heightAnchor.constraint(equalToConstant: 16).isActive = true
         icons.append(icon)
-        let title = label(s.kind.rawValue, size: 12, color: .labelColor, bold: true)
-        let proj = label("· \(s.title)", size: 11, color: .secondaryLabelColor, bold: false)
-        var tagText = "\(s.model.isEmpty ? "" : s.model + " · ")\(relative(s.effectiveLastModified))"
+        let title = label(s.kind.rawValue, size: 13, color: .labelColor, bold: true)
+        let proj = label("· \(s.title)", size: 12, color: .secondaryLabelColor, bold: false)
+        var topViews: [NSView] = [dot, icon, title, proj]
+        if !s.branch.isEmpty {
+            let br = label("⎇ \(s.branch)", size: 10, color: .tertiaryLabelColor, bold: false)
+            br.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+            topViews.append(br)
+        }
+        topViews.append(NSView())
+        if !s.model.isEmpty { topViews.append(chip(s.model, color: .secondaryLabelColor)) }
+        var tagText = relative(s.effectiveLastModified)
         if s.tokensOut > 0 {
             tagText = "\(fmtTokens(s.tokensIn))↑ \(fmtTokens(s.tokensOut))↓ $\(String(format: "%.2f", s.cost)) · " + tagText
         }
         let tag = label(tagText, size: 10, color: .secondaryLabelColor, bold: false)
+        tag.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
         tag.setContentCompressionResistancePriority(.required, for: .horizontal)
-        let top = NSStackView(views: [icon, title, proj, NSView(), tag])
+        topViews.append(tag)
+        let top = NSStackView(views: topViews)
         top.orientation = .horizontal
         top.spacing = 5
         top.translatesAutoresizingMaskIntoConstraints = false
@@ -1410,8 +1694,10 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         top.widthAnchor.constraint(equalTo: col.widthAnchor).isActive = true
 
         let accent = s.kind == .claude ? IndicatorView.claudeOrange : IndicatorView.codexTeal
+        // hybrid style: flat borderless row when idle (hairlines separate),
+        // the revolving conic ring only around the row that's working
         let card = GlowCardView(accent: accent, base: NSColor(white: 0.09, alpha: 1),
-                                flair: s.anyBusy ? .running : .none)
+                                flair: s.anyBusy ? .running : .none, bordered: false)
         card.addSubview(col)
         NSLayoutConstraint.activate([
             col.topAnchor.constraint(equalTo: card.topAnchor, constant: 8),
@@ -1711,6 +1997,83 @@ final class FirstMouseButton: NSButton {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
+/// Gradient progress ring (donut gauge, agentnotch-style): the arc starts at
+/// the lower-left, sweeps over the top and ends lower-right, leaving a gap at
+/// the bottom like a speedometer. The fill animates in the first time the
+/// panel opens; later list rebuilds just set the value. Pure Core Animation.
+final class RingGauge: NSView {
+    var progress: CGFloat = 0
+    var animateOnAppear = false
+    private let track = CAShapeLayer()
+    private let fillMask = CAShapeLayer()
+    private let grad = CAGradientLayer()
+    private let center = NSTextField(labelWithString: "")
+    private let lineW: CGFloat = 4
+
+    init(symbol: String, symbolColor: NSColor, colors: [NSColor], diameter: CGFloat = 46) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: diameter).isActive = true
+        heightAnchor.constraint(equalToConstant: diameter).isActive = true
+        wantsLayer = true
+        for shape in [track, fillMask] {
+            shape.fillColor = NSColor.clear.cgColor
+            shape.lineWidth = lineW
+            shape.lineCap = .round
+        }
+        track.strokeColor = NSColor(white: 0.18, alpha: 1).cgColor
+        layer?.addSublayer(track)
+        grad.colors = colors.map(\.cgColor)
+        grad.startPoint = CGPoint(x: 0, y: 0)
+        grad.endPoint = CGPoint(x: 1, y: 1)
+        fillMask.strokeColor = NSColor.white.cgColor
+        fillMask.strokeEnd = 0
+        grad.mask = fillMask
+        layer?.addSublayer(grad)
+        center.stringValue = symbol
+        center.font = .systemFont(ofSize: 13, weight: .semibold)
+        center.textColor = symbolColor
+        center.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(center)
+        NSLayoutConstraint.activate([
+            center.centerXAnchor.constraint(equalTo: centerXAnchor),
+            center.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+    required init?(coder: NSCoder) { nil }
+
+    override func layout() {
+        super.layout()
+        guard let host = layer else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        track.frame = host.bounds
+        grad.frame = host.bounds
+        fillMask.frame = host.bounds
+        let c = CGPoint(x: host.bounds.midX, y: host.bounds.midY)
+        let r = min(host.bounds.width, host.bounds.height) / 2 - lineW / 2 - 1
+        let path = CGMutablePath()
+        // 225° → -45° clockwise: lower-left, over the top, to lower-right
+        path.addArc(center: c, radius: r, startAngle: 5 * .pi / 4, endAngle: -.pi / 4, clockwise: true)
+        track.path = path
+        fillMask.path = path
+        fillMask.strokeEnd = max(0.02, min(1, progress))
+        CATransaction.commit()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window != nil, animateOnAppear else { return }
+        animateOnAppear = false
+        let a = CABasicAnimation(keyPath: "strokeEnd")
+        a.fromValue = 0
+        a.toValue = max(0.02, min(1, progress))
+        a.duration = 0.7
+        a.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        fillMask.add(a, forKey: "fill")
+    }
+}
+
 /// Panel card with GPU-composited flair — everything is pure Core Animation
 /// (composited by WindowServer, no timers, ~zero CPU per frame):
 /// - a soft top-lit gradient background instead of a flat fill
@@ -1729,7 +2092,7 @@ final class GlowCardView: NSView {
     private let ringMask = CAShapeLayer()
     private let ringGrad = CAGradientLayer()
 
-    init(accent: NSColor, base: NSColor, flair: Flair) {
+    init(accent: NSColor, base: NSColor, flair: Flair, bordered: Bool = true) {
         self.accent = accent
         self.flair = flair
         super.init(frame: .zero)
@@ -1747,6 +2110,8 @@ final class GlowCardView: NSView {
         host.insertSublayer(bg, at: 0)
         switch flair {
         case .none:
+            // "row" style: hairline separators do the framing, no box border
+            host.borderWidth = bordered ? 1 : 0
             host.borderColor = NSColor(white: 0.2, alpha: 1).cgColor
         case .running:
             host.borderColor = accent.withAlphaComponent(0.20).cgColor
@@ -2988,6 +3353,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if on { readSavedActions() }  // pick up external edits to the actions file
         listController.zoomFactor = 1
         listController.contentWidth = panelContentWidth()
+        if on { listController.panelWillShow() }  // gauges animate their fill once
         // Attach the list only while expanded — its Auto Layout content would
         // otherwise force the borderless window wider than the collapsed frame.
         let listView = listController.view
@@ -3106,10 +3472,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             var cpuByPath: [String: Double] = [:]
             var cpuByCwd: [String: Double] = [:]
             var ttyMap: [String: String] = [:]  // cwd → tty, for routing replies
+            var cwdByPath: [String: String] = [:]  // transcript → cwd, for ⎇ branch
             for snap in self.discovery.liveTranscripts() {
                 if let cwd = snap.cwd { ttyMap[cwd] = snap.tty }
                 if let path = snap.transcriptPath {
                     seen.insert(path)
+                    if let cwd = snap.cwd { cwdByPath[path] = cwd }
                     cpuByPath[path] = max(cpuByPath[path] ?? 0, snap.cpu)
                 } else if snap.kind == .claude, let cwd = snap.cwd {
                     let encoded = encodeProjectDir(cwd)
@@ -3150,12 +3518,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 result[i].tokensIn = t.input
                 result[i].tokensOut = t.output
                 result[i].cost = t.cost
+                result[i].branch = gitBranch(cwd: cwdByPath[result[i].id] ?? "")
             }
-            let window = self.usage.windowTotals()
+            let g5 = self.usage.window(hours: 5)
+            let g7d = self.usage.window(hours: 7 * 24)
+            let peak = self.usage.peak5hTokens()
             DispatchQueue.main.async {
                 self.scanInFlight = false
-                self.listController.usageSummary = window.output == 0 && window.input == 0 ? ""
-                    : "5h: \(fmtTokens(window.input))↑ \(fmtTokens(window.output))↓ · $\(String(format: "%.2f", window.cost))"
+                self.listController.gaugeData = (t5: g5, t7d: g7d, peak5h: peak)
                 // Track fullscreen-space changes: full-width bar when the menu bar is hidden
                 if !self.expanded, !self.animating {
                     if self.window.frame != self.collapsedFrame() {
@@ -3232,7 +3602,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func applyAsks(_ pendingAsks: [AgentAsk]) {
         let notchCwds = Set(termViews.compactMap { ($0.process?.shellPid).flatMap(pidCwd) })
         var shown = pendingAsks
-        for i in shown.indices { shown[i].canReply = notchCwds.contains(shown[i].cwd) }
+        for i in shown.indices {
+            shown[i].canReply = notchCwds.contains(shown[i].cwd)
+            shown[i].branch = gitBranch(cwd: shown[i].cwd)
+        }
         // signal once when a NEW ask arrives (not every poll it persists)
         let newAsk = shown.contains { a in !asks.contains { $0.sessionID == a.sessionID } }
         asks = shown
