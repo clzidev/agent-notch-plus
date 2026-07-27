@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.23"
+let appVersion = "2.9.24"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -111,6 +111,25 @@ enum L10n {
         "agents": ["agents", "agentes"],
         "g_active": ["active", "activas"],
         "g_total": ["total", "total"],
+        "tip_gauge_usage": [
+            "Tokens processed in the last 5 hours (ring: vs your busiest 5h window of the week). 7d = weekly total.",
+            "Tokens procesados en las últimas 5 horas (anillo: contra tu pico de 5h de la semana). 7d = total semanal."],
+        "tip_gauge_cost": [
+            "≈ APPROXIMATE cost at API prices, computed from your token usage. If you're on a subscription (Pro/Max) this is NOT what you pay — it's the equivalent value of your usage.",
+            "≈ Costo APROXIMADO a precios de API, calculado desde tus tokens. Si usás un abono (Pro/Max) NO es lo que pagás — es el valor equivalente de tu uso."],
+        "tip_gauge_sessions": [
+            "Agent sessions working right now / total detected sessions.",
+            "Sesiones de agentes trabajando ahora / total de sesiones detectadas."],
+        "tip_chip_tokens": [
+            "Total tokens (input + output) across all sessions in the last 5 hours.",
+            "Tokens totales (entrada + salida) de todas las sesiones en las últimas 5 horas."],
+        "tip_dot_waiting": ["Sessions waiting for your answer.", "Sesiones esperando tu respuesta."],
+        "tip_dot_working": ["Sessions working right now.", "Sesiones trabajando ahora."],
+        "tip_row_metrics": [
+            "This session: input tokens ↑, output tokens ↓, and ≈ estimated API-equivalent cost (not your subscription bill).",
+            "Esta sesión: tokens de entrada ↑, de salida ↓, y ≈ costo API equivalente estimado (no es tu factura de abono)."],
+        "tip_model": ["Model this session is using.", "Modelo que usa esta sesión."],
+        "tip_branch": ["Git branch of the session's folder.", "Rama de git de la carpeta de la sesión."],
         "perm_danger": ["⚠ CAREFUL", "⚠ CUIDADO"],
         "perm_allow": ["Allow", "Permitir"],
         "perm_deny": ["Deny", "Denegar"],
@@ -1219,12 +1238,22 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
                           size: 13, color: .labelColor, bold: true)
         var views: [NSView] = [title, NSView()]
         if let g = gaugeData, g.t5.input + g.t5.output > 0 {
-            views.append(chip("⚡ " + fmtTokens(g.t5.input + g.t5.output)))
+            let c = chip("⚡ " + fmtTokens(g.t5.input + g.t5.output))
+            c.toolTip = L("tip_chip_tokens")
+            views.append(c)
         }
         let waiting = asks.count + sessions.filter { $0.anyLive && !$0.anyBusy }.count
         let busy = sessions.filter { $0.anyBusy }.count
-        if waiting > 0 { views.append(dotCount(waiting, .systemOrange)) }
-        if busy > 0 { views.append(dotCount(busy, .systemGreen)) }
+        if waiting > 0 {
+            let d = dotCount(waiting, .systemOrange)
+            d.toolTip = L("tip_dot_waiting")
+            views.append(d)
+        }
+        if busy > 0 {
+            let d = dotCount(busy, .systemGreen)
+            d.toolTip = L("tip_dot_working")
+            views.append(d)
+        }
         views.append(hbtn("⌨︎", #selector(hdrTerminal)))
         views.append(hbtn("⚙︎", #selector(hdrSettings)))
         let bar = NSStackView(views: views)
@@ -1340,17 +1369,23 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
                            colors: [.systemPurple, .systemBlue])
         r3.progress = sessions.isEmpty ? 0 : CGFloat(active) / CGFloat(sessions.count)
 
-        let row = NSStackView(views: [
-            cluster(r1, "5h", fmtTokens(tok5), "7d", fmtTokens(tok7)),
-            NSView(),
-            cluster(r2, "5h", String(format: "$%.2f", g.t5.cost),
-                    "7d", String(format: "$%.2f", g.t7d.cost)),
-            NSView(),
-            cluster(r3, L("g_active"), "\(active)", L("g_total"), "\(sessions.count)"),
-        ])
+        // "≈" marks the money as an API-price estimate — with a subscription
+        // it is NOT what the user pays (the tooltip spells it out)
+        let c1 = cluster(r1, "5h", fmtTokens(tok5), "7d", fmtTokens(tok7))
+        c1.toolTip = L("tip_gauge_usage")
+        let c2 = cluster(r2, "5h", String(format: "≈$%.2f", g.t5.cost),
+                         "7d", String(format: "≈$%.2f", g.t7d.cost))
+        c2.toolTip = L("tip_gauge_cost")
+        let c3 = cluster(r3, L("g_active"), "\(active)", L("g_total"), "\(sessions.count)")
+        c3.toolTip = L("tip_gauge_sessions")
+
+        // equalSpacing (no floating spacer views): the clusters land in their
+        // final spots on the first layout pass instead of drifting left
+        let row = NSStackView(views: [c1, c2, c3])
         row.orientation = .horizontal
+        row.distribution = .equalSpacing
         row.spacing = 8
-        row.edgeInsets = NSEdgeInsets(top: 2, left: 4, bottom: 4, right: 4)
+        row.edgeInsets = NSEdgeInsets(top: 2, left: 4, bottom: 4, right: 12)
         row.translatesAutoresizingMaskIntoConstraints = false
         row.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
         return row
@@ -1650,17 +1685,23 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         if !s.branch.isEmpty {
             let br = label("⎇ \(s.branch)", size: 10, color: .tertiaryLabelColor, bold: false)
             br.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+            br.toolTip = L("tip_branch")
             topViews.append(br)
         }
         topViews.append(NSView())
-        if !s.model.isEmpty { topViews.append(chip(s.model, color: .secondaryLabelColor)) }
+        if !s.model.isEmpty {
+            let mc = chip(s.model, color: .secondaryLabelColor)
+            mc.toolTip = L("tip_model")
+            topViews.append(mc)
+        }
         var tagText = relative(s.effectiveLastModified)
         if s.tokensOut > 0 {
-            tagText = "\(fmtTokens(s.tokensIn))↑ \(fmtTokens(s.tokensOut))↓ $\(String(format: "%.2f", s.cost)) · " + tagText
+            tagText = "\(fmtTokens(s.tokensIn))↑ \(fmtTokens(s.tokensOut))↓ ≈$\(String(format: "%.2f", s.cost)) · " + tagText
         }
         let tag = label(tagText, size: 10, color: .secondaryLabelColor, bold: false)
         tag.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
         tag.setContentCompressionResistancePriority(.required, for: .horizontal)
+        tag.toolTip = L("tip_row_metrics")
         topViews.append(tag)
         let top = NSStackView(views: topViews)
         top.orientation = .horizontal
@@ -3468,10 +3509,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // them on wake and on any screen-geometry change.
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.reestablishWindows() }
+        ) { [weak self] _ in
+            self?.prepareForDisplayChange()
+            self?.reestablishWindows()
+        }
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.reestablishWindows() }
+        ) { [weak self] _ in
+            self?.prepareForDisplayChange()
+            self?.reestablishWindows()
+        }
+        // lock/unlock with external monitors: the window server can restore
+        // the indicator on the wrong display for a beat — hide it on lock and
+        // only show it again once it's re-anchored under the notch
+        DistributedNotificationCenter.default().addObserver(
+            forName: .init("com.apple.screenIsLocked"), object: nil, queue: .main
+        ) { [weak self] _ in self?.prepareForDisplayChange() }
+        DistributedNotificationCenter.default().addObserver(
+            forName: .init("com.apple.screenIsUnlocked"), object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.prepareForDisplayChange()
+            self?.reestablishWindows()
+        }
 
         // Revisiting the terminal acknowledges finished agents — green clears
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -5170,6 +5229,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // so surface the cwd so the user knows which window to click.
         if termWindow != nil { toggleTerminal(); return }
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// The instant a wake/unlock/display change happens, hide the floating
+    /// windows: better invisible for half a second than visibly parked on the
+    /// wrong monitor sliding into place. reestablishWindows() re-shows them
+    /// already anchored.
+    private func prepareForDisplayChange() {
+        indicatorWindow.orderOut(nil)
+        if !expanded { window.orderOut(nil) }
     }
 
     /// Recover from sleep/wake or screen changes: re-anchor and re-float every
