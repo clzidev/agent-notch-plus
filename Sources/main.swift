@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.16"
+let appVersion = "2.9.18"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -82,6 +82,15 @@ enum L10n {
         "cant_reply_info": [
             "This agent runs in an EXTERNAL terminal (Warp, Ghostty, iTerm…). To reply from the notch, run `claude` inside the notch terminal (⌃⌥Space) — replies go straight to it.",
             "Este agente corre en una terminal EXTERNA (Warp, Ghostty, iTerm…). Para responder desde el notch, corré `claude` dentro de la terminal del notch (⌃⌥Espacio) — la respuesta va directo."],
+        "ollama_model": ["Ollama model (/ia):", "Modelo de Ollama (/ia):"],
+        "ollama_off": ["Ollama not detected", "Ollama no detectado"],
+        "ollama_no_model": ["Pick a model in Settings to use /ia",
+                            "Elegí un modelo en Configuración para usar /ia"],
+        "ollama_down": ["Ollama isn't responding on localhost:11434 — start it with `ollama serve`",
+                        "Ollama no responde en localhost:11434 — arrancalo con `ollama serve`"],
+        "ia_thinking": ["thinking…", "pensando…"],
+        "ia_insert": ["Insert", "Insertar"],
+        "ia_copy": ["Copy", "Copiar"],
         "perm_allow": ["Allow", "Permitir"],
         "perm_deny": ["Deny", "Denegar"],
         "perm_always": ["Always allow", "Permitir siempre"],
@@ -2151,6 +2160,9 @@ final class DropTerminalView: LocalProcessTerminalView {
 /// no longer answers `exit`.
 final class TermPane: NSView {
     let term: DropTerminalView
+    // exported as $NOTCH_PANE so /ia answers land in the pane that asked,
+    // even if focus moved while Ollama was thinking
+    let paneID = UUID().uuidString
     var onClose: ((TermPane) -> Void)?
     private let titleLabel = NSTextField(labelWithString: "")
     private static let headerH: CGFloat = 18
@@ -2185,6 +2197,89 @@ final class TermPane: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) not supported") }
     @objc private func closeTapped() { onClose?(self) }
     func setTitle(_ title: String) { titleLabel.stringValue = title }
+}
+
+/// Floating /ia suggestion card, overlaid on the notch terminal: shows the
+/// Ollama-generated command; "Insert" types it into the asking pane's input
+/// line WITHOUT running it — the user presses ⏎ to run or edits/deletes it
+/// like text they typed themselves.
+final class IACard: NSView {
+    var onInsert: ((String) -> Void)?
+    var onClose: (() -> Void)?
+    private let title = NSTextField(labelWithString: "")
+    private let body = NSTextField(wrappingLabelWithString: "")
+    private let insertBtn = FirstMouseButton(title: "", target: nil, action: nil)
+    private let copyBtn = FirstMouseButton(title: "", target: nil, action: nil)
+    private(set) var command = ""
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(white: 0.05, alpha: 0.97).cgColor
+        layer?.cornerRadius = 10
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.systemGreen.withAlphaComponent(0.7).cgColor
+        title.font = .systemFont(ofSize: 11, weight: .semibold)
+        title.textColor = .systemGreen
+        title.frame = NSRect(x: 12, y: frame.height - 24, width: frame.width - 60, height: 16)
+        title.autoresizingMask = [.width, .minYMargin]
+        body.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        body.textColor = NSColor(white: 0.92, alpha: 1)
+        body.frame = NSRect(x: 12, y: 38, width: frame.width - 24, height: frame.height - 66)
+        body.autoresizingMask = [.width, .height]
+        body.maximumNumberOfLines = 2
+        body.lineBreakMode = .byTruncatingTail
+        body.isSelectable = true
+        let close = FirstMouseButton(title: "✕", target: self, action: #selector(closeTapped))
+        close.isBordered = false
+        close.font = .systemFont(ofSize: 11, weight: .bold)
+        close.contentTintColor = NSColor(white: 0.6, alpha: 1)
+        close.frame = NSRect(x: frame.width - 30, y: frame.height - 26, width: 20, height: 18)
+        close.autoresizingMask = [.minXMargin, .minYMargin]
+        insertBtn.target = self
+        insertBtn.action = #selector(insertTapped)
+        insertBtn.bezelStyle = .rounded
+        insertBtn.title = "▸ " + L("ia_insert")
+        insertBtn.frame = NSRect(x: frame.width - 196, y: 8, width: 104, height: 24)
+        insertBtn.autoresizingMask = [.minXMargin]
+        copyBtn.target = self
+        copyBtn.action = #selector(copyTapped)
+        copyBtn.bezelStyle = .rounded
+        copyBtn.title = L("ia_copy")
+        copyBtn.frame = NSRect(x: frame.width - 86, y: 8, width: 74, height: 24)
+        copyBtn.autoresizingMask = [.minXMargin]
+        for v in [title, body, close, insertBtn, copyBtn] { addSubview(v) }
+    }
+    required init?(coder: NSCoder) { nil }
+
+    func showThinking(_ query: String) {
+        title.stringValue = "🤖 /ia — " + L("ia_thinking")
+        body.stringValue = query
+        command = ""
+        insertBtn.isHidden = true
+        copyBtn.isHidden = true
+    }
+    func showCommand(_ cmd: String) {
+        title.stringValue = "🤖 /ia"
+        body.stringValue = cmd
+        command = cmd
+        insertBtn.isHidden = false
+        copyBtn.isHidden = false
+    }
+    func showError(_ msg: String) {
+        title.stringValue = "🤖 /ia"
+        body.stringValue = msg
+        command = ""
+        insertBtn.isHidden = true
+        copyBtn.isHidden = true
+    }
+    @objc private func insertTapped() { if !command.isEmpty { onInsert?(command) } }
+    @objc private func copyTapped() {
+        guard !command.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(command, forType: .string)
+    }
+    @objc private func closeTapped() { onClose?() }
 }
 
 /// Header strip of the notch terminal — visual only. The terminal is part of
@@ -2316,6 +2411,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var termHotkeyPopupRef: NSPopUpButton?
     private var loginCheckRef: NSButton?
     private var pendTermDir = ""
+    private weak var ollamaModelPopupRef: NSPopUpButton?
     private var termDirLabel: NSTextField?
     private var pendTermSizeField: NSTextField?
     private var pendPanelAlphaField: NSTextField?
@@ -2815,11 +2911,124 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: - /ia (local Ollama command help)
+
+    private var iaCard: IACard?
+    private var iaTargetPane = ""
+
+    /// The zsh accept-line widget wrote ~/.config/agent-notch/ia-query
+    /// ("<paneID>\n<query>"). Consume it and ask Ollama.
+    private func checkIAQuery() {
+        let url = configURL("ia-query")
+        guard let data = try? Data(contentsOf: url) else { return }
+        try? FileManager.default.removeItem(at: url)
+        guard let s = String(data: data, encoding: .utf8) else { return }
+        let parts = s.split(separator: "\n", maxSplits: 1).map(String.init)
+        let paneID = parts.count == 2 ? parts[0] : ""
+        let query = (parts.count == 2 ? parts[1] : parts.first ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return }
+        runIAQuery(paneID: paneID, query: query)
+    }
+
+    private func runIAQuery(paneID: String, query: String) {
+        guard let card = showIACard() else { return }
+        iaTargetPane = paneID
+        let model = (try? String(contentsOf: configURL("ollama-model"), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !model.isEmpty else { card.showError(L("ollama_no_model")); return }
+        card.showThinking(query)
+        var req = URLRequest(url: URL(string: "http://localhost:11434/api/generate")!)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 60  // first request loads the model — slow
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: Any] = [
+            "model": model, "stream": false,
+            "system": "You are a shell command generator for macOS zsh. Reply with EXACTLY ONE shell command that does what the user asks. No markdown, no backticks, no explanations, no comments.",
+            "prompt": query,
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, err in
+            DispatchQueue.main.async {
+                // the card may have been closed (or the terminal discarded)
+                // while Ollama was thinking — then the answer just drops
+                guard let self, let card = self.iaCard else { return }
+                guard err == nil, let data,
+                      let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let resp = o["response"] as? String else {
+                    card.showError(L("ollama_down"))
+                    return
+                }
+                let cmd = Self.sanitizeIACommand(resp)
+                cmd.isEmpty ? card.showError(L("ollama_down")) : card.showCommand(cmd)
+            }
+        }.resume()
+    }
+
+    /// Model output → one clean command line: strip fences/backticks and keep
+    /// the first non-empty line.
+    static func sanitizeIACommand(_ raw: String) -> String {
+        let lines = raw.replacingOccurrences(of: "\r", with: "\n")
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("```") }
+        return (lines.first ?? "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "`"))
+            .trimmingCharacters(in: .whitespaces)
+    }
+
+    private func showIACard() -> IACard? {
+        guard let container = termWindow?.contentView else { return nil }
+        if let card = iaCard, card.superview === container { return card }
+        iaCard?.removeFromSuperview()
+        let w = min(560, container.bounds.width - 60)
+        let h: CGFloat = 96
+        let card = IACard(frame: NSRect(x: (container.bounds.width - w) / 2,
+                                        y: container.bounds.height - 22 - h - 8,
+                                        width: w, height: h))
+        card.autoresizingMask = [.minXMargin, .maxXMargin, .minYMargin]
+        card.onClose = { [weak self] in self?.closeIACard() }
+        card.onInsert = { [weak self] cmd in
+            guard let self else { return }
+            // send WITHOUT "\\r": the command lands on the input line as if
+            // typed — ⏎ runs it, ⌫ deletes it (same pattern as file drops)
+            let target = self.termPanes.first { $0.paneID == self.iaTargetPane }?.term
+                ?? self.focusedTerminal
+            target?.send(txt: cmd)
+            self.closeIACard()
+            if let t = target { self.termWindow?.makeFirstResponder(t) }
+        }
+        container.addSubview(card)
+        iaCard = card
+        return card
+    }
+
+    private func closeIACard() {
+        iaCard?.removeFromSuperview()
+        iaCard = nil
+    }
+
+    /// GET /api/tags → installed model names ([] when Ollama isn't running).
+    private func fetchOllamaModels(_ done: @escaping ([String]) -> Void) {
+        var req = URLRequest(url: URL(string: "http://localhost:11434/api/tags")!)
+        req.timeoutInterval = 3
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            var names: [String] = []
+            if let data,
+               let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let models = o["models"] as? [[String: Any]] {
+                names = models.compactMap { $0["name"] as? String }
+            }
+            DispatchQueue.main.async { done(names) }
+        }.resume()
+    }
+
     private func tick() {
         frame += 1
         checkHover()
         syncQuickFolders()
         if frame % 4 == 0 { quickPollAsks() }
+        if frame % 2 == 0, termWindow != nil { checkIAQuery() }
         // repaint only while something on screen actually animates — an
         // idle/empty indicator repainting 8×/s is pure wasted CPU
         let animating = claudeState == .running || codexState == .running
@@ -3000,6 +3209,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
         env["ZDOTDIR"] = notchZshDir().path
+        env["NOTCH_PANE"] = pane.paneID
         let shell = env["SHELL"] ?? "/bin/zsh"
         // start folder (config "term-dir"); root if unset or gone
         var startDir = (try? String(contentsOf: configURL("term-dir"), encoding: .utf8))?
@@ -3056,6 +3266,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         zle -N _agent_notch_cd
         bindkey '\\e[24;5~' _agent_notch_cd
         RPROMPT=''
+        # "/ia <ask>": intercept the line BEFORE zsh runs it — hand the query
+        # to the app (which asks the local Ollama), clear the buffer, keep it
+        # out of history. Defined last so it wins over any user plugin that
+        # rebinds accept-line.
+        _notch_accept_line() {
+          if [[ "$BUFFER" == "/ia "* ]]; then
+            print -r -- "$NOTCH_PANE"$'\\n'"${BUFFER#/ia }" > "$HOME/.config/agent-notch/ia-query"
+            BUFFER=""
+            zle reset-prompt
+            return 0
+          fi
+          zle .accept-line
+        }
+        zle -N accept-line _notch_accept_line
         """
         try? rc.write(to: dir.appendingPathComponent(".zshrc"), atomically: true, encoding: .utf8)
         return dir
@@ -3160,6 +3384,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         termPanes.removeAll()
         fileBrowser = nil
         quickFolders = nil
+        iaCard = nil  // its superview is being discarded with the window
         termWindow?.orderOut(nil)
         termWindow = nil
         termSplit = nil
@@ -3311,6 +3536,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         termDirLbl.widthAnchor.constraint(lessThanOrEqualToConstant: 260).isActive = true
         termDirLabel = termDirLbl
 
+        // /ia model picker: starts disabled with the saved value, then GET
+        // /api/tags fills it in — stays disabled (and is never saved) when
+        // Ollama isn't running
+        let savedModel = (try? String(contentsOf: configURL("ollama-model"), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let ollamaPopup = NSPopUpButton()
+        ollamaPopup.addItem(withTitle: savedModel.isEmpty ? L("ollama_off") : savedModel)
+        ollamaPopup.isEnabled = false
+        ollamaModelPopupRef = ollamaPopup
+        fetchOllamaModels { [weak self, weak ollamaPopup] models in
+            // the settings window is rebuilt on every open — only touch the
+            // popup if it's still THE one on screen
+            guard let self, let popup = ollamaPopup, self.ollamaModelPopupRef === popup else { return }
+            popup.removeAllItems()
+            if models.isEmpty {
+                popup.addItem(withTitle: L("ollama_off"))
+                popup.isEnabled = false
+            } else {
+                popup.addItems(withTitles: models)
+                if !savedModel.isEmpty, models.contains(savedModel) {
+                    popup.selectItem(withTitle: savedModel)
+                }
+                popup.isEnabled = true
+            }
+        }
+
         let linkBtn = NSButton(title: "github.com/clzidev/agent-notch-plus", target: self,
                                action: #selector(openProjectPage))
         linkBtn.isBordered = false
@@ -3365,6 +3616,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                  foldersPop, smallLabel(L("key_folders"))]),
             row(L("term_dir"), [termDirLbl, button(L("choose_dir"), #selector(chooseTermDir)),
                                 button(L("clear_dir"), #selector(clearTermDir))]),
+            row(L("ollama_model"), [ollamaPopup]),
             row(L("term_size"), [termSizeField, termSizePctLabel]),
             row(L("panel_alpha"), [panelAlphaField, paPct]),
             row(L("term_alpha"), [termAlphaField, taPct]),
@@ -3430,6 +3682,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         saveKey(foldersKeyPopupRef, "key-folders")
         readTermKeys()
         writeConfig("term-dir", pendTermDir)
+        // isEnabled guards the race: Save clicked before /api/tags answered
+        // (or with Ollama down) must not clobber the stored model with the
+        // placeholder item
+        if let p = ollamaModelPopupRef, p.isEnabled, let model = p.titleOfSelectedItem {
+            writeConfig("ollama-model", model)
+        }
         let tsz = Int(min(95, max(20, Double(pendTermSizeField?.stringValue ?? "") ?? 50)))
         writeConfig("term-size", String(tsz))
         let pa = Int(min(100, max(30, Double(pendPanelAlphaField?.stringValue ?? "") ?? 100)))
