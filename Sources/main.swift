@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.15"
+let appVersion = "2.9.16"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -17,6 +17,19 @@ struct AgentAsk {
     let cwd: String
     let tty: String       // set by the app from process discovery, for replies
     let time: Date
+    // "permission" = a blocked PreToolUse waiting for Allow/Deny via the
+    // answers/ file; "info" = a plain Notification (plan approval, questions)
+    var kind: String = "info"
+    var toolName: String = ""
+    var toolDetail: String = ""  // the exact command / file path shown on the card
+    var toolUseID: String = ""
+    var canReply: Bool = false   // info cards: session runs inside a notch pane
+}
+
+/// The hook writes ask files named after the session id with every
+/// non-alphanumeric character replaced by "_" — both sides must agree.
+func sanitizedSessionID(_ s: String) -> String {
+    String(s.map { $0.isLetter || $0.isNumber ? $0 : Character("_") })
 }
 
 // MARK: - Localization
@@ -69,6 +82,12 @@ enum L10n {
         "cant_reply_info": [
             "This agent runs in an EXTERNAL terminal (Warp, Ghostty, iTerm…). To reply from the notch, run `claude` inside the notch terminal (⌃⌥Space) — replies go straight to it.",
             "Este agente corre en una terminal EXTERNA (Warp, Ghostty, iTerm…). Para responder desde el notch, corré `claude` dentro de la terminal del notch (⌃⌥Espacio) — la respuesta va directo."],
+        "perm_allow": ["Allow", "Permitir"],
+        "perm_deny": ["Deny", "Denegar"],
+        "perm_always": ["Always allow", "Permitir siempre"],
+        "perm_title": ["Permission", "Permiso"],
+        "perm_hint": ["No answer here → the prompt appears in the terminal after a bit.",
+                      "Si no respondés acá → el prompt aparece en la terminal en un rato."],
         "hook_bad_json": ["Couldn't update ~/.claude/settings.json", "No se pudo actualizar ~/.claude/settings.json"],
         "hook_bad_json_info": [
             "The file exists but isn't valid JSON, so it was left untouched. Fix or remove it and try again.",
@@ -797,6 +816,8 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     var asks: [AgentAsk] = [] { didSet { rebuildAsks() } }
     var onReply: ((AgentAsk, String) -> Void)?
     var onFocusAsk: ((AgentAsk) -> Void)?
+    var onPermission: ((AgentAsk, String) -> Void)?  // decision: allow/deny/always
+    private var cardAsks: [String: AgentAsk] = [:]   // sessionID → ask, for button targets
     // ask cards live in their OWN stack, rebuilt only when the ask set changes;
     // the session rows refresh every poll WITHOUT touching the reply field, so
     // typing is never interrupted
@@ -833,12 +854,14 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     /// Ask cards (with the reply field). Rebuilt only when the ask set really
     /// changes, and never while you're typing — so the field is stable.
     private func rebuildAsks(force: Bool = false) {
-        let sig = asks.map { "\($0.sessionID)|\($0.message)" }.joined(separator: "~")
+        let sig = asks.map { "\($0.sessionID)|\($0.kind)|\($0.message)|\($0.toolDetail)|\($0.canReply)" }
+            .joined(separator: "~")
         if !force, sig == lastAskSignature { return }
         if isEditingReply { return }  // defer; controlTextDidEndEditing re-runs
         lastAskSignature = sig
         askStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         replyFields.removeAll()  // cards below re-register; stale entries answered dead asks
+        cardAsks.removeAll()
         for ask in asks.prefix(3) { askStack.addArrangedSubview(askCard(ask)) }
         if asks.count > 3 {
             askStack.addArrangedSubview(label("+\(asks.count - 3)…", size: 10,
@@ -910,9 +933,57 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     @objc private func hdrSettings() { onSettings?() }
     @objc private func hdrTerminal() { onTerminal?() }
 
-    /// A highlighted card for an agent waiting on you: the question, a reply
-    /// field (↩ or Send), and a "focus terminal" shortcut.
     private func askCard(_ ask: AgentAsk) -> NSView {
+        cardAsks[ask.sessionID] = ask
+        return ask.kind == "permission" ? permissionCard(ask) : infoCard(ask)
+    }
+
+    /// AgentPeek-style permission card: what the agent wants to run, in mono,
+    /// with big full-width Allow / Deny / Always-allow buttons. The decision
+    /// travels through the blocked PreToolUse hook — works for sessions in ANY
+    /// terminal, not just the notch's.
+    private func permissionCard(_ ask: AgentAsk) -> NSView {
+        let title = label("🔒 \(L("perm_title")) · \(ask.toolName)", size: 12, color: .systemOrange, bold: true)
+        let proj = label(((ask.cwd as NSString).lastPathComponent), size: 10, color: .secondaryLabelColor, bold: false)
+        let head = NSStackView(views: [title, NSView(), proj])
+        head.orientation = .horizontal
+        let detail = label(ask.toolDetail.isEmpty ? ask.message : ask.toolDetail,
+                           size: 12, color: NSColor(white: 0.92, alpha: 1), bold: false, lines: 5)
+        detail.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        detail.preferredMaxLayoutWidth = contentWidth - 28
+
+        func bigBtn(_ text: String, _ color: NSColor, _ sel: Selector) -> NSButton {
+            let b = FirstMouseButton(title: text, target: self, action: sel)
+            b.isBordered = false
+            b.wantsLayer = true
+            b.layer?.backgroundColor = color.withAlphaComponent(0.18).cgColor
+            b.layer?.cornerRadius = 8
+            b.layer?.borderWidth = 1
+            b.layer?.borderColor = color.withAlphaComponent(0.85).cgColor
+            b.contentTintColor = color
+            b.font = .systemFont(ofSize: 13, weight: .semibold)
+            b.heightAnchor.constraint(equalToConstant: 36).isActive = true
+            b.identifier = NSUserInterfaceItemIdentifier(ask.sessionID)
+            return b
+        }
+        let btns = NSStackView(views: [
+            bigBtn("✓ " + L("perm_allow"), .systemGreen, #selector(permAllow(_:))),
+            bigBtn("✕ " + L("perm_deny"), .systemRed, #selector(permDeny(_:))),
+            bigBtn("★ " + L("perm_always"), .systemBlue, #selector(permAlways(_:))),
+        ])
+        btns.orientation = .horizontal
+        btns.distribution = .fillEqually
+        btns.spacing = 8
+        btns.widthAnchor.constraint(equalToConstant: contentWidth - 20).isActive = true
+        let hint = label(L("perm_hint"), size: 9, color: .tertiaryLabelColor, bold: false)
+
+        return wrapCard(NSStackView(views: [head, detail, btns, hint]), head: head)
+    }
+
+    /// A highlighted card for an agent waiting on you: the question, a reply
+    /// field (↩ or Send) when the session runs inside the notch terminal, and
+    /// a "focus terminal" shortcut.
+    private func infoCard(_ ask: AgentAsk) -> NSView {
         let title = label("🔔 " + L("asking"), size: 11, color: .systemOrange, bold: true)
         let proj = label(((ask.cwd as NSString).lastPathComponent), size: 10, color: .secondaryLabelColor, bold: false)
         let head = NSStackView(views: [title, NSView(), proj])
@@ -921,29 +992,39 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
                         lines: 3)
         msg.preferredMaxLayoutWidth = contentWidth - 28
 
-        let field = FirstMouseTextField(string: "")
-        field.placeholderString = L("reply_ph")
-        field.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        field.target = self
-        field.action = #selector(replyFieldSubmit(_:))
-        field.delegate = self
-        field.identifier = NSUserInterfaceItemIdentifier(ask.sessionID)
-        replyFields[ask.sessionID] = (field, ask)
-        let send = NSButton(title: L("send"), target: self, action: #selector(replyButton(_:)))
-        send.bezelStyle = .rounded
-        send.identifier = NSUserInterfaceItemIdentifier(ask.sessionID)
         let focus = NSButton(title: L("focus_term"), target: self, action: #selector(focusAskButton(_:)))
         focus.bezelStyle = .rounded
         focus.identifier = NSUserInterfaceItemIdentifier(ask.sessionID)
-        let controls = NSStackView(views: [field, send, focus])
+        var views: [NSView] = []
+        if ask.canReply {
+            let field = FirstMouseTextField(string: "")
+            field.placeholderString = L("reply_ph")
+            field.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+            field.target = self
+            field.action = #selector(replyFieldSubmit(_:))
+            field.delegate = self
+            field.identifier = NSUserInterfaceItemIdentifier(ask.sessionID)
+            replyFields[ask.sessionID] = (field, ask)
+            let send = NSButton(title: L("send"), target: self, action: #selector(replyButton(_:)))
+            send.bezelStyle = .rounded
+            send.identifier = NSUserInterfaceItemIdentifier(ask.sessionID)
+            field.widthAnchor.constraint(equalToConstant: contentWidth - 190).isActive = true
+            views = [field, send, focus]
+        } else {
+            views = [focus]
+        }
+        let controls = NSStackView(views: views)
         controls.orientation = .horizontal
         controls.spacing = 6
-        field.widthAnchor.constraint(equalToConstant: contentWidth - 190).isActive = true
 
-        let col = NSStackView(views: [head, msg, controls])
+        return wrapCard(NSStackView(views: [head, msg, controls]), head: head)
+    }
+
+    /// Shared card chrome: dark amber background, orange border, fixed width.
+    private func wrapCard(_ col: NSStackView, head: NSView) -> NSView {
         col.orientation = .vertical
         col.alignment = .leading
-        col.spacing = 5
+        col.spacing = 6
         col.translatesAutoresizingMaskIntoConstraints = false
         head.widthAnchor.constraint(equalTo: col.widthAnchor).isActive = true
 
@@ -965,6 +1046,14 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         return card
     }
 
+    @objc private func permAllow(_ b: NSButton) { answerPermission(b, "allow") }
+    @objc private func permDeny(_ b: NSButton) { answerPermission(b, "deny") }
+    @objc private func permAlways(_ b: NSButton) { answerPermission(b, "always") }
+    private func answerPermission(_ b: NSButton, _ decision: String) {
+        guard let id = b.identifier?.rawValue, let ask = cardAsks[id] else { return }
+        onPermission?(ask, decision)
+    }
+
     private var replyFields: [String: (NSTextField, AgentAsk)] = [:]
     func controlTextDidBeginEditing(_ obj: Notification) { isEditingReply = true }
     func controlTextDidEndEditing(_ obj: Notification) {
@@ -980,7 +1069,7 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         onReply?(ask, text)
     }
     @objc private func focusAskButton(_ b: NSButton) {
-        guard let id = b.identifier?.rawValue, let (_, ask) = replyFields[id] else { return }
+        guard let id = b.identifier?.rawValue, let ask = cardAsks[id] else { return }
         onFocusAsk?(ask)
     }
 
@@ -1362,6 +1451,12 @@ final class KeyableWindow: NSWindow {
 /// isn't key yet — without this the first click only activates the window and
 /// you have to click twice to start typing.
 final class FirstMouseTextField: NSTextField {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+/// Button that reacts to the FIRST click even when its window isn't key yet —
+/// a permission card must be answerable in one click, not two.
+final class FirstMouseButton: NSButton {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
@@ -2250,6 +2345,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         listController.onTerminal = { [weak self] in self?.toggleTerminal() }
         listController.onReply = { [weak self] ask, text in self?.replyToAsk(ask, text: text) }
         listController.onFocusAsk = { [weak self] ask in self?.focusTerminalFor(ask) }
+        listController.onPermission = { [weak self] ask, decision in self?.answerAsk(ask, decision: decision) }
 
         // Global hotkey ⌃⌥N toggles the panel. Carbon RegisterEventHotKey works
         // without Accessibility/Input-Monitoring permission, unlike key monitors.
@@ -2528,25 +2624,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 IndicatorView.refreshPetChoice()
                 IndicatorView.refreshCustomGifs()
-                // Only show ask cards for sessions we can actually reply to:
-                // those running INSIDE a notch terminal pane (matched by cwd).
-                // External terminals (Warp, Ghostty…) can't receive a reply, so
-                // no card is shown for them — no false or dead-end prompts.
-                let notchCwds = Set(self.termViews.compactMap { ($0.process?.shellPid).flatMap(pidCwd) })
-                let shownAsks = pendingAsks.filter { notchCwds.contains($0.cwd) }
-                // chime once when a NEW ask arrives (not every poll it persists)
-                let newAsk = shownAsks.contains { a in !self.asks.contains { $0.sessionID == a.sessionID } }
-                self.asks = shownAsks
-                self.listController.asks = shownAsks
+                self.applyAsks(pendingAsks)
                 self.listController.sessions = result
-                if newAsk {
-                    // one-time signal: open the panel and take key so the reply
-                    // field is a click away — never re-grab focus after this
-                    if self.soundAttention { self.playSound("Ping") }
-                    if !self.expanded { self.setExpanded(true) }
-                    NSApp.activate(ignoringOtherApps: true)
-                    self.window.makeKeyAndOrderFront(nil)
-                }
                 // busy → mascot; alive-but-quiet → nothing (idle, not done);
                 // process exited → done blob (cleared on terminal focus)
                 let claudeLive = result.contains { $0.kind == .claude && $0.anyLive }
@@ -2603,10 +2682,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Publish freshly-loaded asks to the UI. Permission cards are shown for
+    /// sessions in ANY terminal (the hook delivers the answer); info cards get
+    /// a reply field only when the session runs inside a notch pane.
+    private func applyAsks(_ pendingAsks: [AgentAsk]) {
+        let notchCwds = Set(termViews.compactMap { ($0.process?.shellPid).flatMap(pidCwd) })
+        var shown = pendingAsks
+        for i in shown.indices { shown[i].canReply = notchCwds.contains(shown[i].cwd) }
+        // signal once when a NEW ask arrives (not every poll it persists)
+        let newAsk = shown.contains { a in !asks.contains { $0.sessionID == a.sessionID } }
+        asks = shown
+        listController.asks = shown
+        if newAsk {
+            // one-time: open the panel and take key so the buttons are one
+            // click away — focus is never re-grabbed after this
+            if soundAttention { playSound("Ping") }
+            if !expanded { setExpanded(true) }
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    // touched only on scanQueue
+    private var askDirSig = ""
+
+    /// Permission asks must surface fast — the blocked hook is holding the
+    /// agent while it waits. Cheap directory-signature check every ~0.5 s; a
+    /// full load + UI update only when something actually changed.
+    private func quickPollAsks() {
+        scanQueue.async { [weak self] in
+            guard let self else { return }
+            let files = (try? FileManager.default.contentsOfDirectory(
+                at: self.asksDir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+            let sig = files.map { f -> String in
+                let m = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate?.timeIntervalSince1970 ?? 0
+                return "\(f.lastPathComponent)#\(m)"
+            }.sorted().joined(separator: "|")
+            guard sig != self.askDirSig else { return }
+            self.askDirSig = sig
+            let pending = self.loadAsks(ttyByCwd: [:])
+            DispatchQueue.main.async { self.applyAsks(pending) }
+        }
+    }
+
     private func tick() {
         frame += 1
         checkHover()
         syncQuickFolders()
+        if frame % 4 == 0 { quickPollAsks() }
         // repaint only while something on screen actually animates — an
         // idle/empty indicator repainting 8×/s is pure wasted CPU
         let animating = claudeState == .running || codexState == .running
@@ -3277,72 +3401,183 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Bump the leading VERSION comment whenever this changes so the app knows
     /// to rewrite an out-of-date copy on launch.
     private static let notchHookScript = """
-    # notch-hook v3
-    import sys, json, os, time
+    # notch-hook v4
+    import sys, json, os, time, fnmatch
     try: d = json.load(sys.stdin)
     except Exception: sys.exit(0)
-    base = os.path.expanduser('~/.config/agent-notch/asks')
+    home = os.path.expanduser('~')
+    base = os.path.join(home, '.config/agent-notch/asks')
+    ans_base = os.path.join(home, '.config/agent-notch/answers')
     os.makedirs(base, exist_ok=True)
+    os.makedirs(ans_base, exist_ok=True)
     sid = str(d.get('session_id', 'session'))
     safe = ''.join(c if c.isalnum() else '_' for c in sid)
     ev = d.get('hook_event_name', '')
     path = os.path.join(base, safe + '.json')
-    # Stop (turn ended) and UserPromptSubmit (user answered) both CLEAR the ask.
-    # We do NOT create an ask on Stop -- that fired on every completion.
+    apath = os.path.join(ans_base, safe + '.json')
+    # Stop (turn ended) and UserPromptSubmit (user answered) both CLEAR the ask
+    # and any stale answer. We do NOT create an ask on Stop.
     if ev in ('Stop', 'UserPromptSubmit'):
-        try: os.remove(path)
-        except OSError: pass
+        for p in (path, apath):
+            try: os.remove(p)
+            except OSError: pass
         sys.exit(0)
-    # Only a PERMISSION Notification creates an ask. Claude Code also sends an
-    # idle Notification ("waiting for your input") after 60s idle -- skip it.
+
+    # Tools Claude Code runs without asking; blocking on them would stall every
+    # file read for the ask-card timeout.
+    SAFE_TOOLS = ('Read', 'Glob', 'Grep', 'LS', 'TodoWrite', 'TodoRead', 'Task',
+                  'NotebookRead', 'BashOutput', 'TaskList', 'TaskGet', 'TaskCreate',
+                  'TaskUpdate', 'TaskOutput', 'ExitPlanMode', 'AskUserQuestion',
+                  'ToolSearch', 'ListMcpResources', 'ReadMcpResource')
+
+    def would_auto_allow(tool, tin, mode, cwd):
+        if mode == 'bypassPermissions' or tool in SAFE_TOOLS: return True
+        if mode == 'acceptEdits' and tool in ('Edit', 'Write', 'MultiEdit', 'NotebookEdit'):
+            return True
+        rules = []
+        paths = [os.path.join(home, '.claude/settings.json')]
+        if cwd:
+            paths += [os.path.join(cwd, '.claude/settings.json'),
+                      os.path.join(cwd, '.claude/settings.local.json')]
+        for p in paths:
+            try:
+                with open(p) as f: s = json.load(f)
+                rules += (s.get('permissions') or {}).get('allow') or []
+            except Exception: pass
+        arg = ''
+        if tool == 'Bash': arg = (tin.get('command') or '').strip()
+        elif isinstance(tin.get('file_path'), str): arg = tin['file_path']
+        for r in rules:
+            if not isinstance(r, str): continue
+            if r == tool: return True
+            if r.startswith(tool + '(') and r.endswith(')'):
+                pat = r[len(tool) + 1:-1]
+                if pat.endswith(':*'):
+                    if arg.startswith(pat[:-2]): return True
+                elif arg == pat or fnmatch.fnmatch(arg, pat):
+                    return True
+        return False
+
+    # PreToolUse: if this call would need approval, publish an ask and BLOCK
+    # until the notch answers (answers/<sid>.json) or the wait expires. An
+    # answer becomes an official permissionDecision; a timeout emits nothing,
+    # so Claude Code falls back to its normal prompt in the terminal.
+    if ev == 'PreToolUse':
+        tool = d.get('tool_name') or ''
+        tin = d.get('tool_input') or {}
+        if not isinstance(tin, dict): tin = {}
+        cwd = d.get('cwd') or ''
+        if would_auto_allow(tool, tin, d.get('permission_mode') or 'default', cwd):
+            sys.exit(0)
+        tuid = str(d.get('tool_use_id') or '')
+        try: os.remove(apath)  # never consume an answer meant for a past call
+        except OSError: pass
+        out = {'session_id': sid, 'cwd': cwd, 'kind': 'permission', 'tool_name': tool,
+               'tool_input': tin, 'tool_use_id': tuid, 'time': time.time(),
+               'message': tool}
+        with open(path, 'w') as f: json.dump(out, f)
+        wait = 60.0
+        try:
+            with open(os.path.join(home, '.config/agent-notch/ask-wait')) as f:
+                wait = max(5.0, min(240.0, float(f.read().strip())))
+        except Exception: pass
+        decision = None
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            if os.path.exists(apath):
+                try:
+                    with open(apath) as f: a = json.load(f)
+                    os.remove(apath)
+                    if str(a.get('tool_use_id') or '') in ('', tuid):
+                        decision = a
+                    break
+                except Exception: pass
+            time.sleep(0.2)
+        try: os.remove(path)  # answered or expired: the card must go either way
+        except OSError: pass
+        if decision and decision.get('decision') in ('allow', 'deny'):
+            print(json.dumps({'hookSpecificOutput': {
+                'hookEventName': 'PreToolUse',
+                'permissionDecision': decision['decision'],
+                'permissionDecisionReason': decision.get('reason') or 'Decided from the notch'}}))
+        sys.exit(0)
+
+    # Only a PERMISSION Notification creates an info ask. Claude Code also sends
+    # an idle Notification ("waiting for your input") after 60s idle -- skip it.
     if ev != 'Notification': sys.exit(0)
     msg = (d.get('message') or 'Necesita tu respuesta').strip().replace(chr(10), ' ')[:300]
     low = msg.lower()
     if 'waiting for your input' in low or 'esperando tu' in low or 'is waiting' in low:
         sys.exit(0)
-    out = {'session_id': sid, 'cwd': d.get('cwd', ''), 'message': msg, 'time': time.time()}
+    out = {'session_id': sid, 'cwd': d.get('cwd', ''), 'kind': 'info', 'message': msg, 'time': time.time()}
     with open(path, 'w') as f: json.dump(out, f)
     """
 
-    /// Keep the on-disk hook script current. The install button only ran once,
-    /// so script fixes never reached users who'd already installed — now the
-    /// app refreshes it on every launch when the hook is present.
+    /// Keep the on-disk hook current. The install button only ran once, so
+    /// script fixes never reached users who'd already installed — now the app
+    /// refreshes the script on every launch when the hook is present, and also
+    /// registers newly-added events (v4 added PreToolUse) into settings.json.
     private func refreshHookScriptIfNeeded() {
         guard hookInstalled() else { return }
         let onDisk = try? String(contentsOf: hookScriptURL, encoding: .utf8)
-        if onDisk?.contains("# notch-hook v3") != true {
+        if onDisk?.contains("# notch-hook v4") != true {
             try? Self.notchHookScript.write(to: hookScriptURL, atomically: true, encoding: .utf8)
         }
+        if !hookRegistered(event: "PreToolUse") { mergeHookSettings() }
+    }
+
+    private static let hookEvents = ["PreToolUse", "Notification", "Stop", "UserPromptSubmit"]
+
+    private func hookRegistered(event: String) -> Bool {
+        guard let data = try? Data(contentsOf: claudeSettingsURL),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let hooks = root["hooks"] as? [String: Any],
+              let arr = hooks[event] as? [[String: Any]] else { return false }
+        return arr.contains { ($0["hooks"] as? [[String: Any]])?.contains { ($0["command"] as? String)?.contains("notch-hook.py") == true } == true }
+    }
+
+    /// Merge our hook into ~/.claude/settings.json under every hookEvents key.
+    /// Returns false when the file exists but isn't parseable — it is then left
+    /// untouched (overwriting would wipe the user's whole Claude Code config).
+    @discardableResult
+    private func mergeHookSettings() -> Bool {
+        var root: [String: Any] = [:]
+        if let data = try? Data(contentsOf: claudeSettingsURL), !data.isEmpty {
+            guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return false
+            }
+            root = obj
+        }
+        var hooks = root["hooks"] as? [String: Any] ?? [:]
+        for event in Self.hookEvents {
+            var arr = hooks[event] as? [[String: Any]] ?? []
+            let already = arr.contains { ($0["hooks"] as? [[String: Any]])?.contains { ($0["command"] as? String)?.contains("notch-hook.py") == true } == true }
+            if !already {
+                var h: [String: Any] = ["type": "command", "command": hookCommand]
+                // the PreToolUse hook intentionally blocks waiting for the card
+                // answer — give it more room than the 60 s default
+                if event == "PreToolUse" { h["timeout"] = 90 }
+                arr.append(["hooks": [h]])
+            }
+            hooks[event] = arr
+        }
+        root["hooks"] = hooks
+        try? FileManager.default.createDirectory(at: claudeSettingsURL.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true)
+        if let data = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted]) {
+            try? data.write(to: claudeSettingsURL, options: .atomic)
+        }
+        return true
     }
 
     private func installHook() {
         let fm = FileManager.default
         try? fm.createDirectory(at: asksDir, withIntermediateDirectories: true)
+        try? fm.createDirectory(at: answersDir, withIntermediateDirectories: true)
         try? Self.notchHookScript.write(to: hookScriptURL, atomically: true, encoding: .utf8)
-
-        // merge into ~/.claude/settings.json under hooks.{Notification,Stop,UserPromptSubmit}
-        var root: [String: Any] = [:]
-        if let data = try? Data(contentsOf: claudeSettingsURL), !data.isEmpty {
-            // an existing file we can't parse must NOT be overwritten — doing
-            // so would silently wipe the user's whole Claude Code config
-            guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                alert(L("hook_bad_json"), L("hook_bad_json_info"))
-                return
-            }
-            root = obj
-        }
-        var hooks = root["hooks"] as? [String: Any] ?? [:]
-        let entry: [String: Any] = ["hooks": [["type": "command", "command": hookCommand]]]
-        for event in ["Notification", "Stop", "UserPromptSubmit"] {
-            var arr = hooks[event] as? [[String: Any]] ?? []
-            let already = arr.contains { ($0["hooks"] as? [[String: Any]])?.contains { ($0["command"] as? String)?.contains("notch-hook.py") == true } == true }
-            if !already { arr.append(entry) }
-            hooks[event] = arr
-        }
-        root["hooks"] = hooks
-        try? fm.createDirectory(at: claudeSettingsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if let data = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted]) {
-            try? data.write(to: claudeSettingsURL, options: .atomic)
+        guard mergeHookSettings() else {
+            alert(L("hook_bad_json"), L("hook_bad_json_info"))
+            return
         }
         alert(L("hook_ok"), L("hook_ok_info"))
         refreshHookButton()
@@ -3352,7 +3587,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let data = try? Data(contentsOf: claudeSettingsURL),
               var root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               var hooks = root["hooks"] as? [String: Any] else { return }
-        for event in ["Notification", "Stop", "UserPromptSubmit"] {
+        for event in Self.hookEvents {
             guard var arr = hooks[event] as? [[String: Any]] else { continue }
             arr.removeAll { ($0["hooks"] as? [[String: Any]])?.contains { ($0["command"] as? String)?.contains("notch-hook.py") == true } == true }
             if arr.isEmpty { hooks.removeValue(forKey: event) } else { hooks[event] = arr }
@@ -3486,6 +3721,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var asksDir: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/agent-notch/asks")
     }
+    private var answersDir: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/agent-notch/answers")
+    }
 
     /// Read pending ask files; attach each session's tty (by cwd) for replies.
     /// Stale asks (>10 min) are swept so a crashed session doesn't linger.
@@ -3500,11 +3738,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let ts = (o["time"] as? Double) ?? 0
             let when = ts > 0 ? Date(timeIntervalSince1970: ts) : ((try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? Date())
             if Date().timeIntervalSince(when) > 600 { try? fm.removeItem(at: f); continue }
+            let toolName = (o["tool_name"] as? String) ?? ""
+            let toolInput = (o["tool_input"] as? [String: Any]) ?? [:]
             out.append(AgentAsk(sessionID: (o["session_id"] as? String) ?? f.lastPathComponent,
                                 message: (o["message"] as? String) ?? L("asking"),
-                                cwd: cwd, tty: ttyByCwd[cwd] ?? "", time: when))
+                                cwd: cwd, tty: ttyByCwd[cwd] ?? "", time: when,
+                                kind: (o["kind"] as? String) ?? "info",
+                                toolName: toolName,
+                                toolDetail: Self.toolDetail(toolName, toolInput),
+                                toolUseID: (o["tool_use_id"] as? String) ?? ""))
         }
         return out.sorted { $0.time > $1.time }
+    }
+
+    /// What the permission card shows in monospace: the exact command for
+    /// Bash, the file path for file tools, compact JSON otherwise.
+    private static func toolDetail(_ tool: String, _ input: [String: Any]) -> String {
+        if tool == "Bash", let cmd = input["command"] as? String { return cmd }
+        if let path = input["file_path"] as? String { return path }
+        if input.isEmpty { return "" }
+        let data = (try? JSONSerialization.data(withJSONObject: input, options: [.sortedKeys])) ?? Data()
+        return String(String(data: data, encoding: .utf8)?.prefix(300) ?? "")
+    }
+
+    /// Answer a permission card: persist an "always" rule if asked, then write
+    /// the decision where the blocked PreToolUse hook is polling for it.
+    private func answerAsk(_ ask: AgentAsk, decision: String) {
+        if decision == "always" { appendAllowRule(for: ask) }
+        let dec = decision == "deny" ? "deny" : "allow"
+        let out: [String: Any] = ["tool_use_id": ask.toolUseID, "decision": dec,
+                                  "reason": dec == "deny" ? "Denied by the user from the notch"
+                                                          : "Approved by the user from the notch"]
+        try? FileManager.default.createDirectory(at: answersDir, withIntermediateDirectories: true)
+        if let data = try? JSONSerialization.data(withJSONObject: out) {
+            let safe = sanitizedSessionID(ask.sessionID)
+            try? data.write(to: answersDir.appendingPathComponent("\(safe).json"), options: .atomic)
+        }
+        clearAsk(ask)
+    }
+
+    /// "Always allow": append a permission rule to the project's gitignored
+    /// .claude/settings.local.json. The hook re-reads it on every call, so the
+    /// rule takes effect immediately even if the CLI caches its settings.
+    private func appendAllowRule(for ask: AgentAsk) {
+        guard !ask.cwd.isEmpty else { return }
+        let rule: String
+        switch ask.toolName {
+        case "Bash":
+            // first two words ("git push", "npm run") + prefix wildcard — broad
+            // enough to stop re-asking, narrow enough to not blanket-allow Bash
+            let toks = ask.toolDetail.split(separator: " ").prefix(2).joined(separator: " ")
+            guard !toks.isEmpty else { return }
+            rule = "Bash(\(toks):*)"
+        case "Edit", "Write", "MultiEdit", "NotebookEdit", "Read":
+            guard !ask.toolDetail.isEmpty else { return }
+            rule = "\(ask.toolName)(\(ask.toolDetail))"
+        default:
+            guard !ask.toolName.isEmpty else { return }
+            rule = ask.toolName
+        }
+        let url = URL(fileURLWithPath: ask.cwd).appendingPathComponent(".claude/settings.local.json")
+        var root: [String: Any] = [:]
+        if let data = try? Data(contentsOf: url), !data.isEmpty {
+            guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            root = obj
+        }
+        var perms = root["permissions"] as? [String: Any] ?? [:]
+        var allow = perms["allow"] as? [String] ?? []
+        guard !allow.contains(rule) else { return }
+        allow.append(rule)
+        perms["allow"] = allow
+        root["permissions"] = perms
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true)
+        if let d = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys]) {
+            try? d.write(to: url, options: .atomic)
+        }
     }
 
     /// Reply to an agent's question. Only the notch's own terminal can be
@@ -3527,9 +3836,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func clearAsk(_ ask: AgentAsk) {
         asks.removeAll { $0.sessionID == ask.sessionID }
         listController.asks = asks
-        // must mirror the hook's sanitizer (every non-alphanumeric → "_"), or
-        // the file never matches and the answered card resurrects next poll
-        let safe = String(ask.sessionID.map { $0.isLetter || $0.isNumber ? $0 : Character("_") })
+        let safe = sanitizedSessionID(ask.sessionID)
         try? FileManager.default.removeItem(at: asksDir.appendingPathComponent("\(safe).json"))
     }
 
