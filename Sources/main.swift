@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.26"
+let appVersion = "2.9.27"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -83,6 +83,15 @@ enum L10n {
         "tip_st_subagents": [
             "The turn is still open — the agent is waiting on its subagents/tools, not on you.",
             "El turno sigue abierto — el agente espera a sus subagentes/herramientas, no a vos."],
+        "g_cores": ["cores", "núcleos"],
+        "g_free": ["free", "libre"],
+        "g_disk": ["disk", "disco"],
+        "tip_sys_cpu": ["Whole-machine CPU usage right now (all cores).",
+                        "Uso de CPU de toda la máquina ahora (todos los núcleos)."],
+        "tip_sys_ram": ["Memory in use (active + wired + compressed) vs installed RAM.",
+                        "Memoria en uso (activa + fija + comprimida) contra la RAM instalada."],
+        "tip_sys_disk": ["Startup disk: space used and freely available.",
+                         "Disco de arranque: espacio usado y disponible."],
         "asking": ["Needs your answer", "Necesita tu respuesta"],
         "reply_ph": ["Type your reply and press ↩", "Escribí tu respuesta y ↩"],
         "send": ["Send", "Enviar"],
@@ -725,6 +734,71 @@ func fmtTokens(_ n: Int) -> String {
     }
 }
 
+// MARK: - System stats (CPU / RAM / disk for the notch panel)
+
+struct SysStats {
+    var cpu: Double = 0        // 0-100, whole machine
+    var cores = ProcessInfo.processInfo.activeProcessorCount
+    var memUsed: Double = 0    // bytes
+    var memTotal = Double(ProcessInfo.processInfo.physicalMemory)
+    var diskFree: Double = 0   // bytes
+    var diskTotal: Double = 0
+}
+
+/// Whole-machine snapshot: CPU from host tick deltas between polls (the same
+/// honest-delta approach as the per-process monitor), memory from the VM
+/// statistics, disk from the root volume. One sample per 3 s poll — free.
+final class SystemMonitor {
+    private var lastTicks: (user: UInt64, sys: UInt64, idle: UInt64, nice: UInt64)?
+
+    func sample() -> SysStats {
+        var s = SysStats()
+        var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info_data_t>.size
+                                           / MemoryLayout<integer_t>.size)
+        var info = host_cpu_load_info_data_t()
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, $0, &count)
+            }
+        }
+        if kr == KERN_SUCCESS {
+            let t = (user: UInt64(info.cpu_ticks.0), sys: UInt64(info.cpu_ticks.1),
+                     idle: UInt64(info.cpu_ticks.2), nice: UInt64(info.cpu_ticks.3))
+            if let l = lastTicks {
+                let busy = (t.user &- l.user) &+ (t.sys &- l.sys) &+ (t.nice &- l.nice)
+                let total = busy &+ (t.idle &- l.idle)
+                if total > 0 { s.cpu = Double(busy) / Double(total) * 100 }
+            }
+            lastTicks = t
+        }
+        var vmCount = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size
+                                             / MemoryLayout<integer_t>.size)
+        var vm = vm_statistics64_data_t()
+        let kr2 = withUnsafeMutablePointer(to: &vm) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(vmCount)) {
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &vmCount)
+            }
+        }
+        if kr2 == KERN_SUCCESS {
+            let page = Double(vm_kernel_page_size)
+            s.memUsed = (Double(vm.active_count) + Double(vm.wire_count)
+                         + Double(vm.compressor_page_count)) * page
+        }
+        if let vals = try? URL(fileURLWithPath: "/").resourceValues(
+            forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeTotalCapacityKey]) {
+            s.diskFree = Double(vals.volumeAvailableCapacityForImportantUsage ?? 0)
+            s.diskTotal = Double(vals.volumeTotalCapacity ?? 0)
+        }
+        return s
+    }
+}
+
+/// "12.5G" / "980G" — compact byte counts for the panel.
+func fmtGB(_ bytes: Double) -> String {
+    let g = bytes / 1_000_000_000
+    return g >= 100 ? String(format: "%.0fG", g) : String(format: "%.1fG", g)
+}
+
 // MARK: - Session scanning
 
 final class SessionScanner {
@@ -1117,6 +1191,7 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     var asks: [AgentAsk] = [] { didSet { rebuildAsks() } }
     // usage windows for the header chip + gauges (5h, 7d, weekly 5h peak)
     var gaugeData: (t5: UsageTracker.Totals, t7d: UsageTracker.Totals, peak5h: Int)?
+    var sysStats: SysStats?  // machine CPU/RAM/disk for the system gauges
     private var pendingGaugeAnimation = false
     /// Called right before the panel is shown — the next rebuild's gauges
     /// animate their fill once.
@@ -1207,8 +1282,11 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         sessionStack.addArrangedSubview(headerBar())
         if let gauges = gaugesRow() {
             sessionStack.addArrangedSubview(gauges)
-            sessionStack.addArrangedSubview(hairline())
         }
+        if let sys = sysRow() {
+            sessionStack.addArrangedSubview(sys)
+        }
+        if gaugeData != nil || sysStats != nil { sessionStack.addArrangedSubview(hairline()) }
         pendingGaugeAnimation = false
         if !actions.isEmpty { sessionStack.addArrangedSubview(actionsBar()) }
         if sessions.isEmpty {
@@ -1351,6 +1429,62 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         return v
     }
 
+    /// Ring + two "label value" lines, the building block of the gauge rows.
+    private func cluster(_ ring: RingGauge, _ l1: String, _ v1: String,
+                         _ l2: String, _ v2: String) -> NSView {
+        ring.animateOnAppear = pendingGaugeAnimation
+        func line(_ tag: String, _ value: String, dim: Bool) -> NSView {
+            let t = label(tag, size: 10, color: dim ? .tertiaryLabelColor : .secondaryLabelColor, bold: false)
+            t.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+            t.widthAnchor.constraint(equalToConstant: 46).isActive = true
+            let v = label(value, size: 10, color: dim ? .secondaryLabelColor : .labelColor, bold: !dim)
+            v.font = .monospacedSystemFont(ofSize: 10, weight: dim ? .regular : .semibold)
+            let h = NSStackView(views: [t, v])
+            h.orientation = .horizontal
+            h.spacing = 4
+            return h
+        }
+        let colL = NSStackView(views: [line(l1, v1, dim: false), line(l2, v2, dim: true)])
+        colL.orientation = .vertical
+        colL.alignment = .leading
+        colL.spacing = 3
+        let h = NSStackView(views: [ring, colL])
+        h.orientation = .horizontal
+        h.spacing = 8
+        return h
+    }
+
+    /// Machine vitals: CPU (delta-based), RAM and disk as smaller rings.
+    private func sysRow() -> NSView? {
+        guard let s = sysStats else { return nil }
+        let rc = RingGauge(symbol: "⚙", symbolColor: .systemOrange,
+                           colors: [.systemOrange, .systemRed], diameter: 36)
+        rc.progress = CGFloat(s.cpu / 100)
+        let c1 = cluster(rc, "CPU", String(format: "%.0f%%", s.cpu),
+                         L("g_cores"), "\(s.cores)")
+        c1.toolTip = L("tip_sys_cpu")
+        let rm = RingGauge(symbol: "≣", symbolColor: .systemBlue,
+                           colors: [.systemBlue, .systemTeal], diameter: 36)
+        rm.progress = s.memTotal > 0 ? CGFloat(s.memUsed / s.memTotal) : 0
+        let c2 = cluster(rm, "RAM", fmtGB(s.memUsed),
+                         L("g_free"), fmtGB(max(0, s.memTotal - s.memUsed)))
+        c2.toolTip = L("tip_sys_ram")
+        let rd = RingGauge(symbol: "◍", symbolColor: .systemPurple,
+                           colors: [.systemPurple, .systemPink], diameter: 36)
+        rd.progress = s.diskTotal > 0 ? CGFloat((s.diskTotal - s.diskFree) / s.diskTotal) : 0
+        let c3 = cluster(rd, L("g_disk"), fmtGB(s.diskTotal - s.diskFree),
+                         L("g_free"), fmtGB(s.diskFree))
+        c3.toolTip = L("tip_sys_disk")
+        let row = NSStackView(views: [c1, c2, c3])
+        row.orientation = .horizontal
+        row.distribution = .equalSpacing
+        row.spacing = 8
+        row.edgeInsets = NSEdgeInsets(top: 0, left: 4, bottom: 4, right: 12)
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
+        return row
+    }
+
     /// The three gradient gauges: 5h usage vs weekly peak, 5h/7d cost share,
     /// and active/total sessions — all fed by our own tracker, nothing faked.
     private func gaugesRow() -> NSView? {
@@ -1359,30 +1493,6 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         let tok7 = g.t7d.input + g.t7d.output
         guard tok7 > 0 || !sessions.isEmpty else { return nil }
         let active = sessions.filter { $0.anyBusy }.count
-
-        func cluster(_ ring: RingGauge, _ l1: String, _ v1: String,
-                     _ l2: String, _ v2: String) -> NSView {
-            ring.animateOnAppear = pendingGaugeAnimation
-            func line(_ tag: String, _ value: String, dim: Bool) -> NSView {
-                let t = label(tag, size: 10, color: dim ? .tertiaryLabelColor : .secondaryLabelColor, bold: false)
-                t.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
-                t.widthAnchor.constraint(equalToConstant: 46).isActive = true
-                let v = label(value, size: 10, color: dim ? .secondaryLabelColor : .labelColor, bold: !dim)
-                v.font = .monospacedSystemFont(ofSize: 10, weight: dim ? .regular : .semibold)
-                let h = NSStackView(views: [t, v])
-                h.orientation = .horizontal
-                h.spacing = 4
-                return h
-            }
-            let colL = NSStackView(views: [line(l1, v1, dim: false), line(l2, v2, dim: true)])
-            colL.orientation = .vertical
-            colL.alignment = .leading
-            colL.spacing = 3
-            let h = NSStackView(views: [ring, colL])
-            h.orientation = .horizontal
-            h.spacing = 8
-            return h
-        }
 
         let r1 = RingGauge(symbol: "✳", symbolColor: IndicatorView.claudeOrange,
                            colors: [.systemBlue, .systemTeal])
@@ -3324,6 +3434,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // for 2 consecutive polls (~6 s) before its session stops being live
     private var missCounts: [String: Int] = [:]
     private let usage = UsageTracker()  // touched only on scanQueue
+    private let sysMon = SystemMonitor()  // touched only on scanQueue
     private let listController = SessionListController()
     private var frame = 0
     private var claudeWasLive = false
@@ -3848,9 +3959,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let g5 = self.usage.window(hours: 5)
             let g7d = self.usage.window(hours: 7 * 24)
             let peak = self.usage.peak5hTokens()
+            let sys = self.sysMon.sample()
             DispatchQueue.main.async {
                 self.scanInFlight = false
                 self.listController.gaugeData = (t5: g5, t7d: g7d, peak5h: peak)
+                self.listController.sysStats = sys
                 // Track fullscreen-space changes: full-width bar when the menu bar is hidden
                 if !self.expanded, !self.animating {
                     if self.window.frame != self.collapsedFrame() {
@@ -4865,7 +4978,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Bump the leading VERSION comment whenever this changes so the app knows
     /// to rewrite an out-of-date copy on launch.
     private static let notchHookScript = """
-    # notch-hook v5
+    # notch-hook v6
     import sys, json, os, time, fnmatch
     try: d = json.load(sys.stdin)
     except Exception: sys.exit(0)
@@ -4904,12 +5017,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     # file read for the ask-card timeout.
     SAFE_TOOLS = ('Read', 'Glob', 'Grep', 'LS', 'TodoWrite', 'TodoRead', 'Task',
                   'NotebookRead', 'BashOutput', 'TaskList', 'TaskGet', 'TaskCreate',
-                  'TaskUpdate', 'TaskOutput', 'ExitPlanMode', 'AskUserQuestion',
-                  'ToolSearch', 'ListMcpResources', 'ReadMcpResource')
+                  'TaskUpdate', 'TaskOutput', 'TaskStop', 'ExitPlanMode', 'AskUserQuestion',
+                  'ToolSearch', 'ListMcpResources', 'ReadMcpResource', 'Agent',
+                  'Monitor', 'SendMessage', 'Skill', 'SlashCommand')
 
     def would_auto_allow(tool, tin, mode, cwd):
-        if mode == 'bypassPermissions' or tool in SAFE_TOOLS: return True
-        if mode == 'acceptEdits' and tool in ('Edit', 'Write', 'MultiEdit', 'NotebookEdit'):
+        # Gate ONLY when we positively know the CLI would prompt: explicit
+        # default/acceptEdits mode. Any bypass variant, plan mode, or an
+        # unknown/missing mode -> stand aside (the CLI knows better than us;
+        # gating here caused false-positive cards for bypass users).
+        norm = str(mode or '').lower().replace('_', '').replace('-', '')
+        if 'bypass' in norm or norm == 'plan': return True
+        if norm not in ('default', 'acceptedits'): return True
+        if tool in SAFE_TOOLS: return True
+        if norm == 'acceptedits' and tool in ('Edit', 'Write', 'MultiEdit', 'NotebookEdit'):
             return True
         rules = []
         paths = [os.path.join(home, '.claude/settings.json')]
@@ -4945,7 +5066,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         tin = d.get('tool_input') or {}
         if not isinstance(tin, dict): tin = {}
         cwd = d.get('cwd') or ''
-        if would_auto_allow(tool, tin, d.get('permission_mode') or 'default', cwd):
+        # pass the mode RAW: a missing/empty mode must read as "unknown -> do
+        # not gate", never be coerced to 'default' (that coercion produced
+        # false-positive cards for background agents that omit the field)
+        if would_auto_allow(tool, tin, d.get('permission_mode'), cwd):
             sys.exit(0)
         tuid = str(d.get('tool_use_id') or '')
         try: os.remove(apath)  # never consume an answer meant for a past call
@@ -4998,7 +5122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refreshHookScriptIfNeeded() {
         guard hookInstalled() else { return }
         let onDisk = try? String(contentsOf: hookScriptURL, encoding: .utf8)
-        if onDisk?.contains("# notch-hook v5") != true {
+        if onDisk?.contains("# notch-hook v6") != true {
             try? Self.notchHookScript.write(to: hookScriptURL, atomically: true, encoding: .utf8)
         }
         if !hookRegistered(event: "PreToolUse") { mergeHookSettings() }
