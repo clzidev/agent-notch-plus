@@ -6,7 +6,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.28"
+let appVersion = "2.9.29"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -33,6 +33,10 @@ struct AgentAsk {
 func sanitizedSessionID(_ s: String) -> String {
     String(s.map { $0.isLetter || $0.isNumber ? $0 : Character("_") })
 }
+
+/// Brand accent (darkstrategy-style neon mint, #00ff9f) used across the
+/// terminal, browsers and settings.
+let neonMint = NSColor(calibratedRed: 0, green: 1.0, blue: 0.62, alpha: 1)
 
 /// Current git branch of a directory ("" outside a repo). Reads .git/HEAD —
 /// a ~30-byte file, cheap enough to read on every poll.
@@ -128,6 +132,9 @@ enum L10n {
         "ia_thinking": ["thinking…", "pensando…"],
         "ia_insert": ["Insert", "Insertar"],
         "ia_copy": ["Copy", "Copiar"],
+        "ia_keys": ["↑↓ choose · ⏎ insert · esc close", "↑↓ elegir · ⏎ insertar · esc cerrar"],
+        "ia_keys_one": ["⏎ insert · esc close", "⏎ insertar · esc cerrar"],
+        "ia_keys_esc": ["esc close", "esc cerrar"],
         "agent_one": ["agent", "agente"],
         "agents": ["agents", "agentes"],
         "g_active": ["active", "activas"],
@@ -2456,7 +2463,7 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
         widthAnchor.constraint(greaterThanOrEqualToConstant: 200).isActive = true
         // mini title bar: current folder in green, hairline underneath
         headerLabel.font = .monospacedSystemFont(ofSize: 10, weight: .semibold)
-        headerLabel.textColor = .systemGreen
+        headerLabel.textColor = neonMint
         headerLabel.lineBreakMode = .byTruncatingHead
         headerLabel.translatesAutoresizingMaskIntoConstraints = false
         let headerRule = NSView()
@@ -2549,7 +2556,7 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
 
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
         let rv = RoundedRowView()
-        rv.accent = .systemGreen
+        rv.accent = neonMint
         return rv
     }
 
@@ -2675,7 +2682,7 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
         // path bar
         let up = NSButton(title: "▲", target: self, action: #selector(goUp))
         up.isBordered = false
-        up.contentTintColor = .systemGreen
+        up.contentTintColor = neonMint
         up.translatesAutoresizingMaskIntoConstraints = false
         pathLabel.textColor = .secondaryLabelColor
         pathLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
@@ -2802,7 +2809,7 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
             .foregroundColor: NSColor.tertiaryLabelColor,
             .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)]
         let hot: [NSAttributedString.Key: Any] = [
-            .foregroundColor: NSColor.systemGreen,
+            .foregroundColor: neonMint,
             .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold)]
         if dir.path == "/" {
             crumb.append(NSAttributedString(string: "/", attributes: hot))
@@ -3006,7 +3013,7 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
 
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
         let rv = RoundedRowView()
-        rv.accent = .systemGreen
+        rv.accent = neonMint
         return rv
     }
 
@@ -3120,7 +3127,7 @@ final class TermPane: NSView {
         header.layer?.addSublayer(hairline)
         // scanner streak: a soft green light that sweeps along the hairline
         // while this pane owns the keyboard
-        let streak = NSColor(calibratedRed: 0.2, green: 0.95, blue: 0.45, alpha: 0.55)
+        let streak = neonMint.withAlphaComponent(0.55)
         sweep.colors = [NSColor.clear.cgColor, streak.cgColor, NSColor.clear.cgColor]
         sweep.startPoint = CGPoint(x: 0, y: 0.5)
         sweep.endPoint = CGPoint(x: 1, y: 0.5)
@@ -3164,13 +3171,13 @@ final class TermPane: NSView {
     }
 
     private func applyActive() {
-        let green = NSColor(calibratedRed: 0.1, green: 0.95, blue: 0.35, alpha: 1)
+        let green = neonMint
         CATransaction.begin()
         CATransaction.setAnimationDuration(0.25)
         if isActive {
-            headerGrad.colors = [NSColor(calibratedRed: 0.05, green: 0.15, blue: 0.08, alpha: 1).cgColor,
-                                 NSColor(calibratedRed: 0.03, green: 0.07, blue: 0.04, alpha: 1).cgColor]
-            titleLabel.textColor = NSColor(calibratedRed: 0.45, green: 0.95, blue: 0.55, alpha: 1)
+            headerGrad.colors = [NSColor(calibratedRed: 0.02, green: 0.14, blue: 0.09, alpha: 1).cgColor,
+                                 NSColor(calibratedRed: 0.01, green: 0.06, blue: 0.04, alpha: 1).cgColor]
+            titleLabel.textColor = NSColor(calibratedRed: 0.45, green: 1.0, blue: 0.75, alpha: 1)
             // soft glow behind the title text
             titleLabel.layer?.shadowColor = green.cgColor
             titleLabel.layer?.shadowOpacity = 0.55
@@ -3223,85 +3230,171 @@ final class TermPane: NSView {
     }
 }
 
-/// Floating /ia suggestion card, overlaid on the notch terminal: shows the
-/// Ollama-generated command; "Insert" types it into the asking pane's input
-/// line WITHOUT running it — the user presses ⏎ to run or edits/deletes it
-/// like text they typed themselves.
+/// Floating /ia suggestion card, overlaid on the notch terminal. Fully
+/// keyboard-driven (a local monitor in AppDelegate feeds it): ↑↓ pick between
+/// up to 3 alternative commands, ⏎ inserts the selected one into the asking
+/// pane WITHOUT running it, esc closes. Mouse still works (rows clickable,
+/// Insert/Copy buttons).
 final class IACard: NSView {
     var onInsert: ((String) -> Void)?
     var onClose: (() -> Void)?
     private let title = NSTextField(labelWithString: "")
-    private let body = NSTextField(wrappingLabelWithString: "")
+    private let hint = NSTextField(labelWithString: "")
     private let insertBtn = FirstMouseButton(title: "", target: nil, action: nil)
     private let copyBtn = FirstMouseButton(title: "", target: nil, action: nil)
-    private(set) var command = ""
+    private var rowViews: [NSView] = []
+    private var rowLabels: [NSTextField] = []
+    private var options: [String] = []
+    private var selected = 0
+    var optionCount: Int { options.count }
+    var selectedCommand: String? { options.indices.contains(selected) ? options[selected] : nil }
+
+    private static let headH: CGFloat = 30
+    private static let rowH: CGFloat = 26
+    private static let footH: CGFloat = 40
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
-        layer?.backgroundColor = NSColor(white: 0.05, alpha: 0.97).cgColor
-        layer?.cornerRadius = 10
+        layer?.backgroundColor = NSColor(calibratedRed: 0.02, green: 0.03, blue: 0.035, alpha: 0.97).cgColor
+        layer?.cornerRadius = 12
         layer?.borderWidth = 1
-        layer?.borderColor = NSColor.systemGreen.withAlphaComponent(0.7).cgColor
-        title.font = .systemFont(ofSize: 11, weight: .semibold)
-        title.textColor = .systemGreen
-        title.frame = NSRect(x: 12, y: frame.height - 24, width: frame.width - 60, height: 16)
+        layer?.borderColor = neonMint.withAlphaComponent(0.7).cgColor
+        layer?.shadowColor = neonMint.cgColor
+        layer?.shadowOpacity = 0.25
+        layer?.shadowRadius = 14
+        layer?.shadowOffset = .zero
+        title.font = .monospacedSystemFont(ofSize: 11, weight: .semibold)
+        title.textColor = neonMint
         title.autoresizingMask = [.width, .minYMargin]
-        body.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        body.textColor = NSColor(white: 0.92, alpha: 1)
-        body.frame = NSRect(x: 12, y: 38, width: frame.width - 24, height: frame.height - 66)
-        body.autoresizingMask = [.width, .height]
-        body.maximumNumberOfLines = 2
-        body.lineBreakMode = .byTruncatingTail
-        body.isSelectable = true
         let close = FirstMouseButton(title: "✕", target: self, action: #selector(closeTapped))
         close.isBordered = false
         close.font = .systemFont(ofSize: 11, weight: .bold)
         close.contentTintColor = NSColor(white: 0.6, alpha: 1)
-        close.frame = NSRect(x: frame.width - 30, y: frame.height - 26, width: 20, height: 18)
         close.autoresizingMask = [.minXMargin, .minYMargin]
+        close.frame = NSRect(x: frame.width - 30, y: frame.height - 26, width: 20, height: 18)
+        hint.font = .monospacedSystemFont(ofSize: 9, weight: .regular)
+        hint.textColor = NSColor(white: 0.45, alpha: 1)
+        hint.stringValue = L("ia_keys")
+        hint.autoresizingMask = [.width, .maxYMargin]
         insertBtn.target = self
         insertBtn.action = #selector(insertTapped)
         insertBtn.bezelStyle = .rounded
-        insertBtn.title = "▸ " + L("ia_insert")
-        insertBtn.frame = NSRect(x: frame.width - 196, y: 8, width: 104, height: 24)
-        insertBtn.autoresizingMask = [.minXMargin]
+        insertBtn.title = "⏎ " + L("ia_insert")
+        insertBtn.autoresizingMask = [.minXMargin, .maxYMargin]
         copyBtn.target = self
         copyBtn.action = #selector(copyTapped)
         copyBtn.bezelStyle = .rounded
         copyBtn.title = L("ia_copy")
-        copyBtn.frame = NSRect(x: frame.width - 86, y: 8, width: 74, height: 24)
-        copyBtn.autoresizingMask = [.minXMargin]
-        for v in [title, body, close, insertBtn, copyBtn] { addSubview(v) }
+        copyBtn.autoresizingMask = [.minXMargin, .maxYMargin]
+        for v in [title, close, hint, insertBtn, copyBtn] { addSubview(v) }
+        relayoutChrome()
     }
     required init?(coder: NSCoder) { nil }
 
+    private func relayoutChrome() {
+        title.frame = NSRect(x: 14, y: frame.height - 24, width: frame.width - 60, height: 16)
+        hint.frame = NSRect(x: 14, y: 12, width: frame.width - 220, height: 14)
+        insertBtn.frame = NSRect(x: frame.width - 200, y: 8, width: 110, height: 24)
+        copyBtn.frame = NSRect(x: frame.width - 86, y: 8, width: 74, height: 24)
+    }
+
+    /// Resize keeping the TOP edge fixed (y grows downward from the notch).
+    private func setContentRows(_ texts: [String], selectable: Bool) {
+        rowViews.forEach { $0.removeFromSuperview() }
+        rowViews = []
+        rowLabels = []
+        let newH = Self.headH + CGFloat(texts.count) * Self.rowH + Self.footH
+        var f = frame
+        f.origin.y -= newH - f.height
+        f.size.height = newH
+        frame = f
+        for (i, text) in texts.enumerated() {
+            let row = FirstMouseButton(title: "", target: self, action: #selector(rowTapped(_:)))
+            row.isBordered = false
+            row.wantsLayer = true
+            row.layer?.cornerRadius = 6
+            row.tag = i
+            row.frame = NSRect(x: 10, y: frame.height - Self.headH - CGFloat(i + 1) * Self.rowH + 2,
+                               width: frame.width - 20, height: Self.rowH - 4)
+            row.autoresizingMask = [.width, .minYMargin]
+            let l = NSTextField(labelWithString: text)
+            l.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+            l.lineBreakMode = .byTruncatingTail
+            l.frame = NSRect(x: 10, y: 3, width: row.frame.width - 20, height: 16)
+            l.autoresizingMask = [.width]
+            row.addSubview(l)
+            addSubview(row)
+            rowViews.append(row)
+            rowLabels.append(l)
+        }
+        _ = selectable
+        restyleRows()
+    }
+
+    private func restyleRows() {
+        for (i, row) in rowViews.enumerated() {
+            let isSel = i == selected && !options.isEmpty
+            row.layer?.backgroundColor = isSel ? neonMint.withAlphaComponent(0.16).cgColor
+                                               : NSColor.clear.cgColor
+            rowLabels[i].textColor = isSel ? .white : NSColor(white: 0.8, alpha: 1)
+            if isSel, options.count > 1 {
+                rowLabels[i].stringValue = "▸ " + options[i]
+            } else if !options.isEmpty {
+                rowLabels[i].stringValue = "  " + options[i]
+            }
+        }
+    }
+
+    func moveSelection(_ delta: Int) {
+        guard !options.isEmpty else { return }
+        selected = max(0, min(options.count - 1, selected + delta))
+        restyleRows()
+    }
+
     func showThinking(_ query: String) {
         title.stringValue = "🤖 /ia — " + L("ia_thinking")
-        body.stringValue = query
-        command = ""
+        options = []
+        selected = 0
+        setContentRows([query], selectable: false)
+        rowLabels.first?.textColor = NSColor(white: 0.6, alpha: 1)
         insertBtn.isHidden = true
         copyBtn.isHidden = true
+        hint.stringValue = L("ia_keys_esc")
     }
-    func showCommand(_ cmd: String) {
+
+    func showOptions(_ cmds: [String]) {
         title.stringValue = "🤖 /ia"
-        body.stringValue = cmd
-        command = cmd
+        options = cmds
+        selected = 0
+        setContentRows(cmds, selectable: true)
         insertBtn.isHidden = false
         copyBtn.isHidden = false
+        hint.stringValue = cmds.count > 1 ? L("ia_keys") : L("ia_keys_one")
     }
+
     func showError(_ msg: String) {
         title.stringValue = "🤖 /ia"
-        body.stringValue = msg
-        command = ""
+        options = []
+        selected = 0
+        setContentRows([msg], selectable: false)
+        rowLabels.first?.textColor = NSColor(calibratedRed: 1, green: 0.55, blue: 0.5, alpha: 1)
         insertBtn.isHidden = true
         copyBtn.isHidden = true
+        hint.stringValue = L("ia_keys_esc")
     }
-    @objc private func insertTapped() { if !command.isEmpty { onInsert?(command) } }
+
+    @objc private func rowTapped(_ b: NSButton) {
+        guard options.indices.contains(b.tag) else { return }
+        selected = b.tag
+        restyleRows()
+        onInsert?(options[b.tag])
+    }
+    @objc private func insertTapped() { if let c = selectedCommand { onInsert?(c) } }
     @objc private func copyTapped() {
-        guard !command.isEmpty else { return }
+        guard let c = selectedCommand else { return }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(command, forType: .string)
+        NSPasteboard.general.setString(c, forType: .string)
     }
     @objc private func closeTapped() { onClose?() }
 }
@@ -3310,7 +3403,19 @@ final class IACard: NSView {
 /// lift so the rounded pane tiles read as floating on glass, not on void.
 final class BackdropView: NSView {
     private let grad = CAGradientLayer()
+    private let dots = CALayer()
     private let notchGlow = CAGradientLayer()
+
+    /// darkstrategy-style dot grid: a faint mint point every 50px.
+    static let dotPattern: NSColor = {
+        let img = NSImage(size: NSSize(width: 50, height: 50), flipped: false) { _ in
+            neonMint.withAlphaComponent(0.05).setFill()
+            NSBezierPath(ovalIn: NSRect(x: 1, y: 1, width: 2, height: 2)).fill()
+            return true
+        }
+        return NSColor(patternImage: img)
+    }()
+
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
@@ -3319,10 +3424,12 @@ final class BackdropView: NSView {
         grad.startPoint = CGPoint(x: 0.5, y: 1)
         grad.endPoint = CGPoint(x: 0.5, y: 0)
         layer?.insertSublayer(grad, at: 0)
+        dots.backgroundColor = Self.dotPattern.cgColor
+        layer?.insertSublayer(dots, above: grad)
         // faint light spilling down from the notch, breathing very slowly —
         // the terminal literally hangs from it, so it glows from it too
         notchGlow.type = .radial
-        notchGlow.colors = [NSColor(calibratedRed: 0.25, green: 0.85, blue: 0.45, alpha: 0.09).cgColor,
+        notchGlow.colors = [neonMint.withAlphaComponent(0.09).cgColor,
                             NSColor.clear.cgColor]
         notchGlow.startPoint = CGPoint(x: 0.5, y: 1)
         notchGlow.endPoint = CGPoint(x: 1.0, y: 0.0)
@@ -3342,6 +3449,7 @@ final class BackdropView: NSView {
         CATransaction.setDisableActions(true)
         let b = layer?.bounds ?? .zero
         grad.frame = b
+        dots.frame = b
         let w = b.width * 0.55
         notchGlow.frame = CGRect(x: b.midX - w / 2, y: b.maxY - 80, width: w, height: 80)
         CATransaction.commit()
@@ -4128,7 +4236,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let body: [String: Any] = [
             "model": model, "stream": false,
-            "system": "You are a shell command generator for macOS zsh. Reply with EXACTLY ONE shell command that does what the user asks. No markdown, no backticks, no explanations, no comments.",
+            "system": "You are a shell command generator for macOS zsh. Reply with 1 to 3 alternative one-line shell commands that accomplish the user's request, one per line, best first. No markdown, no backticks, no numbering, no explanations, no comments.",
             "prompt": query,
         ]
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
@@ -4143,51 +4251,99 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     card.showError(L("ollama_down"))
                     return
                 }
-                let cmd = Self.sanitizeIACommand(resp)
-                cmd.isEmpty ? card.showError(L("ollama_down")) : card.showCommand(cmd)
+                let cmds = Self.sanitizeIACommands(resp)
+                cmds.isEmpty ? card.showError(L("ollama_down")) : card.showOptions(cmds)
             }
         }.resume()
     }
 
-    /// Model output → one clean command line: strip fences/backticks and keep
-    /// the first non-empty line.
-    static func sanitizeIACommand(_ raw: String) -> String {
-        let lines = raw.replacingOccurrences(of: "\r", with: "\n")
+    /// Model output → up to 3 clean command lines: strip fences, backticks,
+    /// bullets and numbering.
+    static func sanitizeIACommands(_ raw: String) -> [String] {
+        raw.replacingOccurrences(of: "\r", with: "\n")
             .split(separator: "\n")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .map { line -> String in
+                var s = line.trimmingCharacters(in: .whitespaces)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "`"))
+                // "1. cmd", "2) cmd", "- cmd", "* cmd" → "cmd"
+                while let f = s.first, "0123456789.-*) ".contains(f), s.count > 2,
+                      !s.hasPrefix("./"), !s.hasPrefix("*.") {
+                    let dropped = String(s.dropFirst()).trimmingCharacters(in: .whitespaces)
+                    if f.isNumber || f == "." || f == ")" || f == "-" || f == "*" { s = dropped } else { break }
+                }
+                return s.trimmingCharacters(in: .whitespaces)
+            }
             .filter { !$0.isEmpty && !$0.hasPrefix("```") }
-        return (lines.first ?? "")
-            .trimmingCharacters(in: CharacterSet(charactersIn: "`"))
-            .trimmingCharacters(in: .whitespaces)
+            .prefix(3)
+            .map { String($0) }
+    }
+
+    private var iaKeyMonitor: Any?
+
+    /// While the /ia card is up, esc/⏎/↑↓ belong to it (everything else still
+    /// reaches the shell). Removed the moment the card closes.
+    private func installIAKeyMonitor() {
+        guard iaKeyMonitor == nil else { return }
+        iaKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            guard let self, let card = self.iaCard, e.window === self.termWindow else { return e }
+            switch e.keyCode {
+            case 53:  // esc
+                self.closeIACard()
+                return nil
+            case 36, 76:  // ⏎ / intro numérico
+                if let cmd = card.selectedCommand {
+                    self.insertIACommand(cmd)
+                    return nil
+                }
+                return e
+            case 126:  // ↑
+                guard card.optionCount > 0 else { return e }
+                card.moveSelection(-1)
+                return nil
+            case 125:  // ↓
+                guard card.optionCount > 0 else { return e }
+                card.moveSelection(1)
+                return nil
+            default:
+                return e
+            }
+        }
+    }
+
+    private func removeIAKeyMonitor() {
+        if let m = iaKeyMonitor { NSEvent.removeMonitor(m) }
+        iaKeyMonitor = nil
+    }
+
+    /// Type the chosen command into the asking pane WITHOUT "\r": it lands on
+    /// the input line as if typed — ⏎ runs it, ⌫ deletes it.
+    private func insertIACommand(_ cmd: String) {
+        let target = termPanes.first { $0.paneID == iaTargetPane }?.term ?? focusedTerminal
+        target?.send(txt: cmd)
+        closeIACard()
+        if let t = target { termWindow?.makeFirstResponder(t) }
     }
 
     private func showIACard() -> IACard? {
         guard let container = termWindow?.contentView else { return nil }
         if let card = iaCard, card.superview === container { return card }
         iaCard?.removeFromSuperview()
-        let w = min(560, container.bounds.width - 60)
+        let w = min(720, container.bounds.width - 60)
         let h: CGFloat = 96
         let card = IACard(frame: NSRect(x: (container.bounds.width - w) / 2,
                                         y: container.bounds.height - 22 - h - 8,
                                         width: w, height: h))
         card.autoresizingMask = [.minXMargin, .maxXMargin, .minYMargin]
         card.onClose = { [weak self] in self?.closeIACard() }
-        card.onInsert = { [weak self] cmd in
-            guard let self else { return }
-            // send WITHOUT "\\r": the command lands on the input line as if
-            // typed — ⏎ runs it, ⌫ deletes it (same pattern as file drops)
-            let target = self.termPanes.first { $0.paneID == self.iaTargetPane }?.term
-                ?? self.focusedTerminal
-            target?.send(txt: cmd)
-            self.closeIACard()
-            if let t = target { self.termWindow?.makeFirstResponder(t) }
-        }
+        card.onInsert = { [weak self] cmd in self?.insertIACommand(cmd) }
         container.addSubview(card)
         iaCard = card
+        installIAKeyMonitor()
         return card
     }
 
     private func closeIACard() {
+        removeIAKeyMonitor()
         iaCard?.removeFromSuperview()
         iaCard = nil
     }
@@ -4387,7 +4543,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         term.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         term.nativeBackgroundColor = .black
         term.nativeForegroundColor = NSColor(white: 0.92, alpha: 1)
-        term.caretColor = NSColor(red: 0.1, green: 0.95, blue: 0.35, alpha: 1)  // matrix green
+        term.caretColor = neonMint  // neon mint, darkstrategy-style
         term.processDelegate = self
         let pane = TermPane(term: term)
         pane.onClose = { [weak self] p in self?.forceClosePane(p) }
@@ -4598,6 +4754,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         termPanes.removeAll()
         fileBrowser = nil
         quickFolders = nil
+        removeIAKeyMonitor()
         iaCard = nil  // its superview is being discarded with the window
         termWindow?.orderOut(nil)
         termWindow = nil
@@ -4877,7 +5034,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
         w.title = L("settings_title")
         w.isReleasedWhenClosed = false
-        w.contentView = stack
+        // darkstrategy skin: forced dark appearance, near-black gradient with
+        // the faint mint dot grid behind the controls
+        w.appearance = NSAppearance(named: .darkAqua)
+        w.titlebarAppearsTransparent = true
+        w.backgroundColor = NSColor(calibratedRed: 0.016, green: 0.02, blue: 0.024, alpha: 1)
+        let backdrop = BackdropView(frame: .zero)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        backdrop.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: backdrop.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: backdrop.bottomAnchor),
+            stack.leadingAnchor.constraint(equalTo: backdrop.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: backdrop.trailingAnchor),
+        ])
+        w.contentView = backdrop
         let fit = stack.fittingSize
         w.setContentSize(NSSize(width: fit.width + 8, height: fit.height))
         // always above the notch panel AND the terminal, on the notch's screen
