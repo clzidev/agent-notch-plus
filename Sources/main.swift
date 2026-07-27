@@ -225,19 +225,56 @@ final class ProcessDiscovery {
     private static let psTimeout: TimeInterval = 2.0
     private static let lsofTimeout: TimeInterval = 2.0
 
+    // pid → last cumulative CPU time sample, for instantaneous %cpu. ps's
+    // %cpu column is the LIFETIME average: a claude that worked hard for hours
+    // reads >=8 forever and its row shows "Working…" eternally. The delta
+    // between polls is the real current load.
+    private var lastCpuTime: [String: (secs: Double, at: Date)] = [:]
+
+    /// "1:02.33", "12:34:56" or "1-02:03:04" (ps time=) → seconds.
+    private func cpuSeconds(_ s: String) -> Double {
+        var days = 0.0, rest = s
+        if let dash = s.firstIndex(of: "-") {
+            days = Double(s[..<dash]) ?? 0
+            rest = String(s[s.index(after: dash)...])
+        }
+        var secs = 0.0
+        for p in rest.split(separator: ":") {
+            secs = secs * 60 + (Double(p.replacingOccurrences(of: ",", with: ".")) ?? 0)
+        }
+        return days * 86400 + secs
+    }
+
     func liveTranscripts() -> [Snapshot] {
-        guard let psOut = run("/bin/ps", ["-Ao", "pid=,ppid=,tty=,%cpu=,command="], timeout: Self.psTimeout) else { return [] }
+        guard let psOut = run("/bin/ps", ["-Ao", "pid=,ppid=,tty=,%cpu=,time=,command="], timeout: Self.psTimeout) else { return [] }
         var candidates: [(pid: String, tty: String, cpu: Double, kind: AgentKind)] = []
+        let now = Date()
+        var seenPids = Set<String>()
         for line in psOut.split(whereSeparator: \.isNewline) {
             let parts = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                .split(maxSplits: 4, whereSeparator: \.isWhitespace)
-            guard parts.count == 5 else { continue }
+                .split(maxSplits: 5, whereSeparator: \.isWhitespace)
+            guard parts.count == 6 else { continue }
             let pid = String(parts[0]), tty = String(parts[2])
-            let cpu = Double(String(parts[3]).replacingOccurrences(of: ",", with: ".")) ?? 0
-            let command = String(parts[4]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let avgCpu = Double(String(parts[3]).replacingOccurrences(of: ",", with: ".")) ?? 0
+            let cpuTime = cpuSeconds(String(parts[4]))
+            let command = String(parts[5]).trimmingCharacters(in: .whitespacesAndNewlines)
             guard tty != "??", !command.isEmpty else { continue }  // agent must be terminal-attached
-            if isClaude(command) { candidates.append((pid, tty, cpu, .claude)) }
-            else if isCodex(command) { candidates.append((pid, tty, cpu, .codex)) }
+            let kind: AgentKind
+            if isClaude(command) { kind = .claude }
+            else if isCodex(command) { kind = .codex }
+            else { continue }
+            // instantaneous %cpu from the cputime delta; the lifetime average
+            // only serves as the first-sample fallback
+            var cpu = avgCpu
+            if let prev = lastCpuTime[pid], now.timeIntervalSince(prev.at) > 0.5 {
+                cpu = max(0, cpuTime - prev.secs) / now.timeIntervalSince(prev.at) * 100
+            }
+            lastCpuTime[pid] = (cpuTime, now)
+            seenPids.insert(pid)
+            candidates.append((pid, tty, cpu, kind))
+        }
+        for gone in lastCpuTime.keys where !seenPids.contains(gone) {
+            lastCpuTime.removeValue(forKey: gone)
         }
         let chunks = lsofChunks(pids: candidates.map(\.pid))
         var out: [Snapshot] = []
@@ -453,8 +490,13 @@ final class SessionScanner {
     /// Together they are the sole source of truth for isRunning.
     func scan(live: Set<String>, claudeCwdCounts: [String: Int],
               cpuByPath: [String: Double] = [:], cpuByCwd: [String: Double] = [:]) -> [AgentSession] {
-        if tailCache.count > 600 { tailCache.removeAll() }        // unbounded-growth guard
-        if codexMetaCache.count > 600 { codexMetaCache.removeAll() }
+        // unbounded-growth guard: prune the oldest half instead of a full
+        // flush — a flush re-read every transcript at once (I/O spike)
+        if tailCache.count > 600 {
+            let keep = tailCache.sorted { $0.value.mtime > $1.value.mtime }.prefix(300)
+            tailCache = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
+        }
+        if codexMetaCache.count > 600 { codexMetaCache.removeAll() }  // tiny entries, flush is fine
         let recent: (AgentSession) -> Bool = { $0.isLive || Date().timeIntervalSince($0.lastModified) < 6 * 3600 }
         var sessions = scanClaude(live: live, cwdCounts: claudeCwdCounts,
                                   cpuByPath: cpuByPath, cpuByCwd: cpuByCwd).filter(recent)
@@ -2572,7 +2614,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         CATransaction.commit()
     }
 
+    // main-thread flag: when a scan outlives the 3 s timer (slow lsof under
+    // load), skip the next firing instead of queueing scans that then land in
+    // a burst with stale data
+    private var scanInFlight = false
+
     private func rescan() {
+        if scanInFlight { return }
+        scanInFlight = true
         scanQueue.async { [weak self] in
             guard let self else { return }
             // Process discovery is the authoritative liveness signal. Keys are
@@ -2613,6 +2662,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let result = self.scanner.scan(live: live, claudeCwdCounts: cwdCounts,
                                            cpuByPath: cpuByPath, cpuByCwd: cpuByCwd)
             DispatchQueue.main.async {
+                self.scanInFlight = false
                 // Track fullscreen-space changes: full-width bar when the menu bar is hidden
                 if !self.expanded, !self.animating {
                     if self.window.frame != self.collapsedFrame() {
@@ -2632,14 +2682,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let codexLive = result.contains { $0.kind == .codex && $0.anyLive }
                 let claudeBusyRaw = result.contains { $0.kind == .claude && $0.anyBusy }
                 let codexBusyRaw = result.contains { $0.kind == .codex && $0.anyBusy }
-                // debounce raw busy: on immediately, off only after 3 quiet
-                // polls (~9 s) — one dip in CPU no longer flips the state
+                // debounce raw busy: on immediately, off after 2 quiet polls
+                // (~6 s) — the delta-based cpu signal is reliable enough that
+                // the old 3-poll wait just added latency
                 if claudeBusyRaw { self.claudeBusyStable = true; self.claudeQuietPolls = 0 }
                 else if self.claudeBusyStable { self.claudeQuietPolls += 1
-                    if self.claudeQuietPolls >= 3 { self.claudeBusyStable = false } }
+                    if self.claudeQuietPolls >= 2 { self.claudeBusyStable = false } }
                 if codexBusyRaw { self.codexBusyStable = true; self.codexQuietPolls = 0 }
                 else if self.codexBusyStable { self.codexQuietPolls += 1
-                    if self.codexQuietPolls >= 3 { self.codexBusyStable = false } }
+                    if self.codexQuietPolls >= 2 { self.codexBusyStable = false } }
                 let claudeBusy = self.claudeBusyStable
                 let codexBusy = self.codexBusyStable
                 // sounds (settings): once per episode. An agent "arms" its
