@@ -7,7 +7,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.32"
+let appVersion = "2.9.33"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -137,6 +137,10 @@ enum L10n {
         "cant_reply_info": [
             "This agent runs in an EXTERNAL terminal (Warp, Ghostty, iTerm…). To reply from the notch, run `claude` inside the notch terminal (⌃⌥Space) — replies go straight to it.",
             "Este agente corre en una terminal EXTERNA (Warp, Ghostty, iTerm…). Para responder desde el notch, corré `claude` dentro de la terminal del notch (⌃⌥Espacio) — la respuesta va directo."],
+        "tab_general": ["General", "General"],
+        "tab_terminal": ["Terminal", "Terminal"],
+        "tab_ai": ["AI & Agents", "IA y Agentes"],
+        "tab_mascots": ["Mascots", "Mascotas"],
         "term_font": ["Terminal font:", "Tipografía terminal:"],
         "font_retro": ["IBM VGA (retro '80s)", "IBM VGA (retro años 80)"],
         "term_colors": ["Terminal colors:", "Colores terminal:"],
@@ -5278,40 +5282,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let saveRow = NSStackView(views: [NSView(), saveBtn])
         saveRow.orientation = .horizontal
 
-        let stack = NSStackView(views: [
+        // Tabbed layout — the flat list outgrew every laptop screen. Save
+        // lives OUTSIDE the tabs, always visible at the bottom.
+        func group(_ views: [NSView]) -> NSStackView {
+            let s = NSStackView(views: views)
+            s.orientation = .vertical
+            s.alignment = .leading
+            s.spacing = 18
+            s.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+            s.translatesAutoresizingMaskIntoConstraints = false
+            return s
+        }
+        let generalTab = group([
             hint,
             row(L("language"), [langPopup]),
-            row(L("codex_pet"), [petPopup]),
             row(L("zoom_pct"), [zoomField, zoomPctLabel]),
             row(L("panel_hotkey"), [panelPopup]),
+            row(L("panel_alpha"), [panelAlphaField, paPct]),
+            row(L("sounds_title"), [soundCol]),
+            row(L("startup"), [loginCheck]),
+            row(L("menubar_mode"), [menubarCheck]),
+            row(L("project"), [linkBtn, versionLbl]),
+        ])
+        let terminalTab = group([
             row(L("term_hotkey"), [hotkeyPopup]),
             row(L("term_keys"), [splitPop, smallLabel(L("key_split")), filesPop, smallLabel(L("key_files")),
                                  foldersPop, smallLabel(L("key_folders"))]),
             row(L("term_dir"), [termDirLbl, button(L("choose_dir"), #selector(chooseTermDir)),
                                 button(L("clear_dir"), #selector(clearTermDir))]),
-            row(L("ollama_model"), [ollamaPopup]),
-            row(L("actions_title"), [button(L("actions_edit"), #selector(editActions))]),
             row(L("term_font"), [fontPopup, fontSize, smallLabel("pt")]),
             row(L("term_colors"), [smallLabel(L("term_fg_lbl")), fgWell,
                                    smallLabel(L("term_bg_lbl")), bgWell]),
             row(L("term_size"), [termSizeField, termSizePctLabel]),
-            row(L("panel_alpha"), [panelAlphaField, paPct]),
             row(L("term_alpha"), [termAlphaField, taPct]),
+            row(L("actions_title"), [button(L("actions_edit"), #selector(editActions))]),
+        ])
+        let aiTab = group([
+            row(L("replies_title"), [hookBtn]),
+            repliesHelp,
+            row(L("ollama_model"), [ollamaPopup]),
+        ])
+        let mascotsTab = group([
+            row(L("codex_pet"), [petPopup]),
             row(L("mascots"), [button(L("gif_gallery"), #selector(showGifGallery))]),
             row(L("preview"), [smallLabel("Claude"), MascotBarPreview(kind: .claude),
                                smallLabel("Codex"), MascotBarPreview(kind: .codex)]),
-            row(L("replies_title"), [hookBtn]),
-            repliesHelp,
-            row(L("startup"), [loginCheck]),
-            row(L("menubar_mode"), [menubarCheck]),
-            row(L("sounds_title"), [soundCol]),
-            row(L("project"), [linkBtn, versionLbl]),
-            saveRow,
         ])
+
+        let tabs = NSTabView()
+        tabs.translatesAutoresizingMaskIntoConstraints = false
+        for (title, view) in [(L("tab_general"), generalTab), (L("tab_terminal"), terminalTab),
+                              (L("tab_ai"), aiTab), (L("tab_mascots"), mascotsTab)] {
+            let item = NSTabViewItem(identifier: title)
+            item.label = title
+            item.view = view
+            tabs.addTabViewItem(item)
+        }
+        let tallest = [generalTab, terminalTab, aiTab, mascotsTab]
+            .map { $0.fittingSize.height }.max() ?? 400
+        let widest = [generalTab, terminalTab, aiTab, mascotsTab]
+            .map { $0.fittingSize.width }.max() ?? 600
+
+        let stack = NSStackView(views: [tabs, saveRow])
         stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 20
-        stack.edgeInsets = NSEdgeInsets(top: 32, left: 32, bottom: 32, right: 32)
+        stack.alignment = .centerX
+        stack.spacing = 14
+        stack.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 18, right: 20)
 
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 660, height: 460),
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
@@ -5330,6 +5366,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             stack.bottomAnchor.constraint(equalTo: backdrop.bottomAnchor),
             stack.leadingAnchor.constraint(equalTo: backdrop.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: backdrop.trailingAnchor),
+            tabs.widthAnchor.constraint(equalToConstant: widest + 24),
+            tabs.heightAnchor.constraint(equalToConstant: tallest + 46),
         ])
         w.contentView = backdrop
         let fit = stack.fittingSize
@@ -5341,7 +5379,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         positionOnNotchScreen(w)
         settingsWindow = w
         w.makeKeyAndOrderFront(nil)
-        saveRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -64).isActive = true
+        saveRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
     }
 
     /// Center a utility window on the screen that owns the notch, not
