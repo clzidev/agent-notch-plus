@@ -7,7 +7,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.40"
+let appVersion = "2.9.41"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -5608,7 +5608,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                               (L("tab_ai"), aiTab), (L("tab_mascots"), mascotsTab)] {
             let item = NSTabViewItem(identifier: title)
             item.label = title
-            item.view = view
+            // the group uses autolayout but NSTabView places item views by
+            // frame — without an anchor the whole group floats and every
+            // control resize (popups, labels) shifted the layout around.
+            // Pin it top-left inside a frame-managed holder instead.
+            let holder = NSView()
+            holder.addSubview(view)
+            NSLayoutConstraint.activate([
+                view.topAnchor.constraint(equalTo: holder.topAnchor),
+                view.leadingAnchor.constraint(equalTo: holder.leadingAnchor),
+                view.trailingAnchor.constraint(lessThanOrEqualTo: holder.trailingAnchor),
+                view.bottomAnchor.constraint(lessThanOrEqualTo: holder.bottomAnchor),
+            ])
+            item.view = holder
             tabs.addTabViewItem(item)
         }
         let tallest = [generalTab, terminalTab, aiTab, mascotsTab]
