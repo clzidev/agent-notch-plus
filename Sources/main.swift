@@ -7,7 +7,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.34"
+let appVersion = "2.9.35"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -4410,10 +4410,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         req.timeoutInterval = 60  // first request loads the model — slow
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let expLang = L10n.lang == "es" ? "Spanish" : "English"
+        // structured outputs: the JSON schema is ENFORCED by Ollama, so the
+        // model cannot skip the explanations no matter how it feels today
+        let optionsSchema: [String: Any] = [
+            "type": "object",
+            "properties": ["options": [
+                "type": "array", "minItems": 1, "maxItems": 3,
+                "items": ["type": "object",
+                          "properties": ["cmd": ["type": "string"],
+                                         "desc": ["type": "string"]],
+                          "required": ["cmd", "desc"]],
+            ]],
+            "required": ["options"],
+        ]
         let body: [String: Any] = [
             "model": model, "stream": false,
-            "system": "You are a shell command generator for macOS zsh. Reply with 1 to 3 alternative one-line shell commands that accomplish the user's request, one per line, best first. After each command append ' ||| ' followed by a very brief \(expLang) explanation (max 10 words) of what that exact command does. No markdown, no backticks, no numbering, nothing else.",
+            "system": "You generate macOS zsh shell commands. Return 1 to 3 alternative one-line commands that accomplish the user's request, best first. cmd = the exact command, no backticks. desc = a very brief \(expLang) explanation (max 10 words) of what that exact command does.",
             "prompt": query,
+            "format": optionsSchema,
         ]
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         URLSession.shared.dataTask(with: req) { [weak self] data, _, err in
@@ -4434,9 +4448,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Model output → up to 3 clean (command, short description) pairs.
-    /// Lines come as "cmd ||| what it does"; fences, backticks, bullets and
-    /// numbering are stripped from the command side.
+    /// Primary path: the structured-output JSON {"options":[{cmd,desc}…]}.
+    /// Fallback: "cmd ||| desc" lines (older Ollama without schema support),
+    /// with fences, backticks, bullets and numbering stripped.
     static func sanitizeIACommands(_ raw: String) -> [(cmd: String, desc: String)] {
+        if let data = raw.data(using: .utf8),
+           let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let opts = o["options"] as? [[String: Any]] {
+            let parsed = opts.compactMap { opt -> (cmd: String, desc: String)? in
+                guard let cmd = (opt["cmd"] as? String)?
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "` "))
+                    .trimmingCharacters(in: .whitespacesAndNewlines), !cmd.isEmpty else { return nil }
+                let desc = (opt["desc"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                return (cmd, desc)
+            }
+            if !parsed.isEmpty { return Array(parsed.prefix(3)) }
+        }
+        return sanitizeIALines(raw)
+    }
+
+    private static func sanitizeIALines(_ raw: String) -> [(cmd: String, desc: String)] {
         raw.replacingOccurrences(of: "\r", with: "\n")
             .split(separator: "\n")
             .compactMap { line -> (cmd: String, desc: String)? in
