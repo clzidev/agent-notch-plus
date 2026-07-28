@@ -1,0 +1,3 @@
+PxPlus IBM VGA8 — from "The Ultimate Oldschool PC Font Pack" v2.x by VileR (int10h.org/oldschool-pc-fonts).
+License: CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/).
+Mirrored from github.com/pocketfood/Fontpkg-PxPlus_IBM_VGA8.

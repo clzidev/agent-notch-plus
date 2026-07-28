@@ -22,6 +22,8 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp build/AgentNotchPlus-bin "$APP/Contents/MacOS/AgentNotchPlus"
 rm -f build/AgentNotchPlus-bin
 cp -R pets "$APP/Contents/Resources/pets"
+mkdir -p "$APP/Contents/Resources/fonts"
+cp scripts/fonts/*.ttf scripts/fonts/LICENSE.txt "$APP/Contents/Resources/fonts/" 2>/dev/null || true
 cp scripts/Info.plist "$APP/Contents/Info.plist"
 cp scripts/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 codesign --force --deep -s - "$APP" 2>/dev/null || true

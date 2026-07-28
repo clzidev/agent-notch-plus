@@ -1,12 +1,13 @@
 import AppKit
 import ApplicationServices
 import Carbon.HIToolbox
+import CoreText
 import Quartz
 import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.30"
+let appVersion = "2.9.31"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -37,6 +38,22 @@ func sanitizedSessionID(_ s: String) -> String {
 /// Brand accent (darkstrategy-style neon mint, #00ff9f) used across the
 /// terminal, browsers and settings.
 let neonMint = NSColor(calibratedRed: 0, green: 1.0, blue: 0.62, alpha: 1)
+
+/// "RRGGBB" ↔ NSColor for the terminal color configs.
+func colorFromHex(_ hex: String) -> NSColor? {
+    let h = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+        .replacingOccurrences(of: "#", with: "")
+    guard h.count == 6, let v = UInt32(h, radix: 16) else { return nil }
+    return NSColor(calibratedRed: CGFloat((v >> 16) & 0xFF) / 255,
+                   green: CGFloat((v >> 8) & 0xFF) / 255,
+                   blue: CGFloat(v & 0xFF) / 255, alpha: 1)
+}
+
+func hexFromColor(_ c: NSColor) -> String {
+    let s = c.usingColorSpace(.sRGB) ?? c
+    return String(format: "%02X%02X%02X", Int(round(s.redComponent * 255)),
+                  Int(round(s.greenComponent * 255)), Int(round(s.blueComponent * 255)))
+}
 
 /// Current git branch of a directory ("" outside a repo). Reads .git/HEAD —
 /// a ~30-byte file, cheap enough to read on every poll.
@@ -120,6 +137,11 @@ enum L10n {
         "cant_reply_info": [
             "This agent runs in an EXTERNAL terminal (Warp, Ghostty, iTerm…). To reply from the notch, run `claude` inside the notch terminal (⌃⌥Space) — replies go straight to it.",
             "Este agente corre en una terminal EXTERNA (Warp, Ghostty, iTerm…). Para responder desde el notch, corré `claude` dentro de la terminal del notch (⌃⌥Espacio) — la respuesta va directo."],
+        "term_font": ["Terminal font:", "Tipografía terminal:"],
+        "font_retro": ["IBM VGA (retro '80s)", "IBM VGA (retro años 80)"],
+        "term_colors": ["Terminal colors:", "Colores terminal:"],
+        "term_fg_lbl": ["text", "texto"],
+        "term_bg_lbl": ["background", "fondo"],
         "menubar_mode": ["Menu bar mode:", "Modo barra de menú:"],
         "menubar_check": ["Live in the menu bar instead of the notch (requires restart)",
                           "Vivir en la barra de menú en vez del notch (requiere reiniciar)"],
@@ -3732,6 +3754,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private weak var menubarCheckRef: NSButton?
     private var pendTermDir = ""
     private weak var ollamaModelPopupRef: NSPopUpButton?
+    private weak var fontPopupRef: NSPopUpButton?
+    private weak var fontSizeRef: NSTextField?
+    private weak var fgWellRef: NSColorWell?
+    private weak var bgWellRef: NSColorWell?
     private var termDirLabel: NSTextField?
     private var pendTermSizeField: NSTextField?
     private var pendPanelAlphaField: NSTextField?
@@ -3796,6 +3822,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // restart): the app lives in an NSStatusItem and the panel drops from
         // it; the notch indicator/bar windows are never shown
         menubarMode = FileManager.default.fileExists(atPath: configURL("menubar-mode").path)
+        registerBundledFonts()  // the retro IBM VGA face ships inside the app
         readSoundPrefs()
         readZoomPref()
         refreshHookScriptIfNeeded()  // apply hook-script fixes without re-toggling
@@ -4670,10 +4697,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc fileprivate func addTerminalPane() {
         guard let split = termSplit, termViews.count < 3 else { return }
         let term = DropTerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
-        term.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        term.nativeBackgroundColor = .black
-        term.nativeForegroundColor = NSColor(white: 0.92, alpha: 1)
-        term.caretColor = neonMint  // neon mint, darkstrategy-style
+        term.font = terminalFont()
+        term.nativeBackgroundColor = terminalBG()
+        term.nativeForegroundColor = terminalFG()
+        term.caretColor = terminalFG()
         term.processDelegate = self
         let pane = TermPane(term: term)
         pane.onClose = { [weak self] p in self?.forceClosePane(p) }
@@ -4851,6 +4878,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         layer.add(fade, forKey: "curtainFade")
         CATransaction.commit()
     }
+
+    // MARK: - Terminal typography & colors (configurable)
+
+    static let retroFontFamily = "PxPlus IBM VGA8"
+
+    /// Register bundled .ttf fonts (app Resources/fonts, or scripts/fonts when
+    /// running from the repo) into this process only.
+    private func registerBundledFonts() {
+        var dirs: [URL] = []
+        if let r = Bundle.main.resourceURL { dirs.append(r.appendingPathComponent("fonts")) }
+        dirs.append(URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("scripts/fonts"))
+        for dir in dirs {
+            guard let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { continue }
+            for f in files where ["ttf", "otf"].contains(f.pathExtension.lowercased()) {
+                CTFontManagerRegisterFontsForURL(f as CFURL, .process, nil)
+            }
+        }
+    }
+
+    private func cfgString(_ name: String) -> String {
+        (try? String(contentsOf: configURL(name), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    /// The configured terminal font. Default: the classic '80s IBM VGA face at
+    /// 16pt (its native-looking size); any other family defaults to 12pt.
+    func terminalFont() -> NSFont {
+        let fam = cfgString("term-font")
+        let sizeCfg = Double(cfgString("term-font-size"))
+        if fam.isEmpty || fam == Self.retroFontFamily {
+            let size = CGFloat(sizeCfg ?? 16)
+            if let f = NSFont(name: Self.retroFontFamily, size: size) { return f }
+            return .monospacedSystemFont(ofSize: CGFloat(sizeCfg ?? 12), weight: .regular)
+        }
+        let size = CGFloat(sizeCfg ?? 12)
+        return NSFont(name: fam, size: size) ?? .monospacedSystemFont(ofSize: size, weight: .regular)
+    }
+
+    /// Text/background colors. Defaults: neon mint on black.
+    func terminalFG() -> NSColor { colorFromHex(cfgString("term-fg")) ?? neonMint }
+    func terminalBG() -> NSColor { colorFromHex(cfgString("term-bg")) ?? .black }
 
     /// Per-pane ✕: SIGKILL that pane's shell — works even when the shell is
     /// stuck on a dead ssh and won't take `exit` — then drop just that pane.
@@ -5055,6 +5124,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         termDirLbl.widthAnchor.constraint(lessThanOrEqualToConstant: 260).isActive = true
         termDirLabel = termDirLbl
 
+        // terminal typography: the retro IBM VGA face first, then every
+        // fixed-pitch family installed on the machine
+        let fontPopup = NSPopUpButton()
+        fontPopup.addItem(withTitle: L("font_retro"))
+        for fam in NSFontManager.shared.availableFontFamilies.sorted()
+        where fam != Self.retroFontFamily && !fam.hasPrefix(".") {
+            if let f = NSFont(name: fam, size: 12), f.isFixedPitch {
+                fontPopup.addItem(withTitle: fam)
+            }
+        }
+        let savedFont = cfgString("term-font")
+        if !savedFont.isEmpty, savedFont != Self.retroFontFamily,
+           fontPopup.itemTitles.contains(savedFont) {
+            fontPopup.selectItem(withTitle: savedFont)
+        } else {
+            fontPopup.selectItem(at: 0)
+        }
+        fontPopupRef = fontPopup
+        let fontSize = NSTextField(string: cfgString("term-font-size"))
+        fontSize.placeholderString = "auto"
+        fontSize.widthAnchor.constraint(equalToConstant: 52).isActive = true
+        fontSizeRef = fontSize
+
+        let fgWell = NSColorWell()
+        fgWell.color = terminalFG()
+        fgWell.widthAnchor.constraint(equalToConstant: 44).isActive = true
+        fgWell.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        fgWellRef = fgWell
+        let bgWell = NSColorWell()
+        bgWell.color = terminalBG()
+        bgWell.widthAnchor.constraint(equalToConstant: 44).isActive = true
+        bgWell.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        bgWellRef = bgWell
+
         // /ia model picker: starts disabled with the saved value, then GET
         // /api/tags fills it in — stays disabled (and is never saved) when
         // Ollama isn't running
@@ -5141,6 +5244,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 button(L("clear_dir"), #selector(clearTermDir))]),
             row(L("ollama_model"), [ollamaPopup]),
             row(L("actions_title"), [button(L("actions_edit"), #selector(editActions))]),
+            row(L("term_font"), [fontPopup, fontSize, smallLabel("pt")]),
+            row(L("term_colors"), [smallLabel(L("term_fg_lbl")), fgWell,
+                                   smallLabel(L("term_bg_lbl")), bgWell]),
             row(L("term_size"), [termSizeField, termSizePctLabel]),
             row(L("panel_alpha"), [panelAlphaField, paPct]),
             row(L("term_alpha"), [termAlphaField, taPct]),
@@ -5183,6 +5289,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         w.setContentSize(NSSize(width: fit.width + 8, height: fit.height))
         // always above the notch panel AND the terminal, on the notch's screen
         w.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 2)
+        // the color picker must float above the settings window, not under it
+        NSColorPanel.shared.level = NSWindow.Level(rawValue: w.level.rawValue + 1)
         positionOnNotchScreen(w)
         settingsWindow = w
         w.makeKeyAndOrderFront(nil)
@@ -5229,6 +5337,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if let c = menubarCheckRef {
             writeConfig("menubar-mode", c.state == .on ? "1" : "")  // empty deletes the flag
+        }
+        if let p = fontPopupRef {
+            writeConfig("term-font", p.indexOfSelectedItem == 0 ? "" : (p.titleOfSelectedItem ?? ""))
+        }
+        if let f = fontSizeRef {
+            let v = f.stringValue.trimmingCharacters(in: .whitespaces)
+            writeConfig("term-font-size", Double(v) != nil ? v : "")
+        }
+        if let w = fgWellRef { writeConfig("term-fg", hexFromColor(w.color)) }
+        if let w = bgWellRef { writeConfig("term-bg", hexFromColor(w.color)) }
+        // apply typography/colors to terminals that are already open
+        let tf = terminalFont()
+        let fg = terminalFG()
+        let bg = terminalBG()
+        for t in termViews {
+            t.font = tf
+            t.nativeBackgroundColor = bg
+            t.nativeForegroundColor = fg
+            t.caretColor = fg
         }
         let tsz = Int(min(95, max(20, Double(pendTermSizeField?.stringValue ?? "") ?? 50)))
         writeConfig("term-size", String(tsz))
