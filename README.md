@@ -1,6 +1,21 @@
 # Agent Notch Plus
 
+**🇬🇧 English** | [🇪🇸 Español](README.es.md)
+
 Your AI agents, living next to the MacBook notch. **v2.9.39**
+
+[![Latest release](https://img.shields.io/github/v/release/clzidev/agent-notch-plus?label=release&color=00c98f)](https://github.com/clzidev/agent-notch-plus/releases/latest)
+[![Download DMG](https://img.shields.io/badge/⬇_Download-AgentNotchPlus.dmg-00c98f)](https://github.com/clzidev/agent-notch-plus/releases/latest/download/AgentNotchPlus.dmg)
+
+## 📦 Download
+
+No need to build anything — grab the ready-made installer:
+
+1. **[Download AgentNotchPlus.dmg](https://github.com/clzidev/agent-notch-plus/releases/latest/download/AgentNotchPlus.dmg)** (universal: Apple Silicon + Intel, macOS 12+)
+2. Open the DMG and drag **AgentNotchPlus** to **Applications**
+3. First launch: **right-click → Open** (the app is ad-hoc signed, not notarized), or allow it in System Settings → Privacy & Security
+
+Every version is published on the [Releases page](https://github.com/clzidev/agent-notch-plus/releases) with bilingual notes (EN/ES). Prefer building from source? See [Build & run](#build--run).
 
 > Fork of [realfishsam/agent-notch](https://github.com/realfishsam/agent-notch) — all credit for the original concept, design and implementation goes to its author. This fork adds a global keyboard shortcut, hover-to-open, and a settings panel with custom animated-GIF mascots. See [What this fork adds](#what-this-fork-adds).
 
