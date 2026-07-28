@@ -7,7 +7,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.36"
+let appVersion = "2.9.39"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -111,6 +111,8 @@ enum L10n {
         "g_cores": ["cores", "núcleos"],
         "g_free": ["free", "libre"],
         "g_disk": ["disk", "disco"],
+        "clean_tip": ["Clear cards with no live terminal/agent",
+                      "Limpiar tarjetas sin terminal/agente abierto"],
         "tip_sys_cpu": ["Whole-machine CPU usage right now (all cores).",
                         "Uso de CPU de toda la máquina ahora (todos los núcleos)."],
         "tip_sys_ram": ["Memory in use (active + wired + compressed) vs installed RAM.",
@@ -839,6 +841,8 @@ func fmtGB(_ bytes: Double) -> String {
 // MARK: - Session scanning
 
 final class SessionScanner {
+    // set by the 🧹 button: hide sessions with no live process older than this
+    var pruneBefore: Date?
     private let fm = FileManager.default
     private let home = FileManager.default.homeDirectoryForCurrentUser
     // transcript tails are re-read every 3 s poll — cache by mtime so only
@@ -867,7 +871,13 @@ final class SessionScanner {
             tailCache = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
         }
         if codexMetaCache.count > 600 { codexMetaCache.removeAll() }  // tiny entries, flush is fine
-        let recent: (AgentSession) -> Bool = { $0.isLive || Date().timeIntervalSince($0.lastModified) < 6 * 3600 }
+        // 🧹 cutoff: sessions with no live process last touched before it stay
+        // hidden — new activity (fresh mtime) brings a session right back
+        let cutoff = pruneBefore
+        let recent: (AgentSession) -> Bool = {
+            $0.isLive || (Date().timeIntervalSince($0.lastModified) < 6 * 3600
+                          && ($0.lastModified > (cutoff ?? .distantPast)))
+        }
         var sessions = scanClaude(live: live, cwdCounts: claudeCwdCounts,
                                   cpuByPath: cpuByPath, cpuByCwd: cpuByCwd).filter(recent)
             + groupCodex(scanCodex(live: live, cpuByPath: cpuByPath).filter(recent))
@@ -1225,6 +1235,7 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     var onLayoutChange: (() -> Void)?
     var onSettings: (() -> Void)?
     var onTerminal: (() -> Void)?
+    var onCleanup: (() -> Void)?
     var asks: [AgentAsk] = [] { didSet { rebuildAsks() } }
     // usage windows for the header chip + gauges (5h, 7d, weekly 5h peak)
     var gaugeData: (t5: UsageTracker.Totals, t7d: UsageTracker.Totals, peak5h: Int)?
@@ -1368,7 +1379,7 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     /// colored status counters and the quick buttons on the right.
     private func headerBar() -> NSView {
         func hbtn(_ title: String, _ action: Selector) -> NSButton {
-            let b = NSButton(title: title, target: self, action: action)
+            let b = FirstMouseButton(title: title, target: self, action: action)
             b.isBordered = false
             b.contentTintColor = .secondaryLabelColor
             b.font = .systemFont(ofSize: 15)
@@ -1394,6 +1405,10 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
             d.toolTip = L("tip_dot_working")
             views.append(d)
         }
+        let clean = hbtn("🧹", #selector(hdrCleanup))
+        clean.font = .systemFont(ofSize: 12)
+        clean.toolTip = L("clean_tip")
+        views.append(clean)
         views.append(hbtn("⌨︎", #selector(hdrTerminal)))
         views.append(hbtn("⚙︎", #selector(hdrSettings)))
         let bar = NSStackView(views: views)
@@ -1405,6 +1420,7 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     }
     @objc private func hdrSettings() { onSettings?() }
     @objc private func hdrTerminal() { onTerminal?() }
+    @objc private func hdrCleanup() { onCleanup?() }
 
     /// Capsule chip ("⚡ 12.3M", model names…).
     private func chip(_ text: String, color: NSColor = .labelColor) -> NSView {
@@ -1512,9 +1528,12 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         let c3 = cluster(rd, L("g_disk"), fmtGB(s.diskTotal - s.diskFree),
                          L("g_free"), fmtGB(s.diskFree))
         c3.toolTip = L("tip_sys_disk")
-        let row = NSStackView(views: [c1, c2, c3])
+        // app version, tiny and dim, always in sight next to the vitals
+        let ver = label("v\(appVersion)", size: 8, color: NSColor(white: 0.4, alpha: 1), bold: false)
+        let row = NSStackView(views: [c1, c2, c3, ver])
         row.orientation = .horizontal
         row.distribution = .equalSpacing
+        row.alignment = .bottom
         row.spacing = 8
         row.edgeInsets = NSEdgeInsets(top: 0, left: 4, bottom: 4, right: 12)
         row.translatesAutoresizingMaskIntoConstraints = false
@@ -1714,7 +1733,7 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         // pointing at our own (possibly empty) notch terminal
         let focusTitle = ask.canReply || ask.appName.isEmpty
             ? L("focus_term") : "\(L("go_to")) \(ask.appName)"
-        let focus = NSButton(title: focusTitle, target: self, action: #selector(focusAskButton(_:)))
+        let focus = FirstMouseButton(title: focusTitle, target: self, action: #selector(focusAskButton(_:)))
         focus.bezelStyle = .rounded
         focus.identifier = NSUserInterfaceItemIdentifier(ask.sessionID)
         var views: [NSView] = []
@@ -1727,7 +1746,7 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
             field.delegate = self
             field.identifier = NSUserInterfaceItemIdentifier(ask.sessionID)
             replyFields[ask.sessionID] = (field, ask)
-            let send = NSButton(title: L("send"), target: self, action: #selector(replyButton(_:)))
+            let send = FirstMouseButton(title: L("send"), target: self, action: #selector(replyButton(_:)))
             send.bezelStyle = .rounded
             send.identifier = NSUserInterfaceItemIdentifier(ask.sessionID)
             field.widthAnchor.constraint(equalToConstant: contentWidth - 190).isActive = true
@@ -3312,6 +3331,19 @@ final class TermPane: NSView {
         CATransaction.begin()
         CATransaction.setAnimationDuration(0.25)
         if isActive {
+            // the whole pane edge glows softly, pulsing like a heartbeat —
+            // with 3-4 splits you spot the keyboard owner from the corner
+            // of your eye without reading titles
+            layer?.borderWidth = 1.5
+            layer?.borderColor = green.withAlphaComponent(0.45).cgColor
+            let pulse = CABasicAnimation(keyPath: "borderColor")
+            pulse.fromValue = green.withAlphaComponent(0.12).cgColor
+            pulse.toValue = green.withAlphaComponent(0.5).cgColor
+            pulse.duration = 1.2
+            pulse.autoreverses = true
+            pulse.repeatCount = .infinity
+            pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            layer?.add(pulse, forKey: "edgePulse")
             headerGrad.colors = [NSColor(calibratedRed: 0.02, green: 0.14, blue: 0.09, alpha: 1).cgColor,
                                  NSColor(calibratedRed: 0.01, green: 0.06, blue: 0.04, alpha: 1).cgColor]
             titleLabel.textColor = NSColor(calibratedRed: 0.45, green: 1.0, blue: 0.75, alpha: 1)
@@ -3341,6 +3373,9 @@ final class TermPane: NSView {
             run.repeatCount = .infinity
             sweep.add(run, forKey: "run")
         } else {
+            layer?.borderWidth = 0
+            layer?.borderColor = nil
+            layer?.removeAnimation(forKey: "edgePulse")
             headerGrad.colors = [NSColor(white: 0.11, alpha: 1).cgColor,
                                  NSColor(white: 0.07, alpha: 1).cgColor]
             titleLabel.textColor = NSColor(white: 0.55, alpha: 1)
@@ -3805,6 +3840,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var termWindow: NSPanel?
     private var termSplit: NSSplitView?
     private var termViews: [LocalProcessTerminalView] = []
+    // last pane that owned the keyboard — re-shown terminals restore focus
+    // here instead of always jumping back to the leftmost pane
+    private weak var lastFocusedTerm: LocalProcessTerminalView?
     private var termPanes: [TermPane] = []
     private var fileBrowser: FileBrowserPane?
     private var quickFolders: QuickFoldersPane?
@@ -3935,6 +3973,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         notchView.onQuit = { [weak self] in self?.confirmQuit() }
         listController.onSettings = { [weak self] in self?.showSettings() }
         listController.onTerminal = { [weak self] in self?.toggleTerminal() }
+        listController.onCleanup = { [weak self] in self?.cleanupStale() }
         listController.onReply = { [weak self] ask, text in self?.replyToAsk(ask, text: text) }
         listController.onFocusAsk = { [weak self] ask in self?.focusTerminalFor(ask) }
         listController.onPermission = { [weak self] ask, decision in self?.answerAsk(ask, decision: decision) }
@@ -4635,6 +4674,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if frame % 2 == 1, termWindow?.isVisible == true, termPanes.count > 0 {
             let fr = termWindow?.firstResponder
             for pane in termPanes { pane.setActive(pane.term === fr) }
+            // remember the focus owner while it's live — hide/show restores it
+            if let t = fr as? LocalProcessTerminalView, termViews.contains(t) {
+                lastFocusedTerm = t
+            }
         }
         // repaint only while something on screen actually animates — an
         // idle/empty indicator repainting 8×/s is pure wasted CPU
@@ -4809,7 +4852,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         term.processDelegate = self
         let pane = TermPane(term: term)
         pane.onClose = { [weak self] p in self?.forceClosePane(p) }
-        split.addArrangedSubview(pane)
+        // open next to the pane that has the keyboard, not always at the far
+        // right — splitting from the middle pane grows the split right there
+        let focused = termWindow?.firstResponder as? LocalProcessTerminalView
+        let insertAt = termPanes.firstIndex { $0.term === focused }.map { $0 + 1 } ?? termPanes.count
+        split.insertArrangedSubview(pane, at: insertAt)
         split.adjustSubviews()
         // minimal prompt (project + git branch + blinking green block cursor)
         // via our own ZDOTDIR; the user's ~/.zshrc is still sourced first
@@ -4833,8 +4880,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         term.startProcess(executable: shell, args: ["-l"],
                           environment: env.map { "\($0.key)=\($0.value)" })
         pane.setTitle(URL(fileURLWithPath: startDir).lastPathComponent)
-        termViews.append(term)
-        termPanes.append(pane)
+        // keep the arrays in visual (left→right) order, matching the split
+        termViews.insert(term, at: insertAt)
+        termPanes.insert(pane, at: insertAt)
         termWindow?.makeFirstResponder(term)
         // the caret view exists once the terminal took focus — dress it then
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self, weak term] in
@@ -4850,8 +4898,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let rc = """
         # Agent Notch Plus terminal profile (regenerated on each terminal open)
+        _notch_zdot="$ZDOTDIR"
         export ZDOTDIR="$HOME"
         [ -f "$HOME/.zshrc" ] && source "$HOME/.zshrc"
+        # history must exist for the ghost suggestions below. macOS /etc/zshrc
+        # sets HISTFILE=${ZDOTDIR:-$HOME}/.zsh_history, and our ZDOTDIR points
+        # at our own config dir — an empty file nobody else writes. Redirect
+        # that (or unset) to the real ~/.zsh_history; a user-chosen path stays.
+        if [[ -z "$HISTFILE" || "$HISTFILE" == "$_notch_zdot/.zsh_history" ]]; then
+          HISTFILE="$HOME/.zsh_history"
+        fi
+        (( HISTSIZE >= 5000 )) || HISTSIZE=5000
+        (( SAVEHIST >= 5000 )) || SAVEHIST=5000
+        setopt SHARE_HISTORY
         autoload -Uz vcs_info
         zstyle ':vcs_info:*' enable git
         zstyle ':vcs_info:git:*' formats ' %F{cyan}%b%f'
@@ -4885,11 +4944,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         zle -N _agent_notch_cd
         bindkey '\\e[24;5~' _agent_notch_cd
         RPROMPT=''
+        # ── Warp/fish-style ghost suggestion ──────────────────────────────
+        # While you type, the newest history entry starting with the buffer
+        # shows in dim gray after the cursor; → (or End) completes it. If the
+        # user already loads zsh-autosuggestions, theirs wins — stay out.
+        if ! typeset -f _zsh_autosuggest_start >/dev/null; then
+          _notch_sugg_refresh() {
+            emulate -L zsh
+            setopt EXTENDED_GLOB
+            local hit prefix
+            region_highlight=("${(@)region_highlight:#* memo=notch-sugg}")
+            POSTDISPLAY=""
+            if [[ -n "$BUFFER" && "$CURSOR" -eq "${#BUFFER}" ]]; then
+              prefix="${BUFFER//(#m)[\\\\*?[\\]<>()|^~#]/\\\\$MATCH}"
+              hit="${history[(r)${prefix}*]}"
+              if [[ -n "$hit" && "$hit" != "$BUFFER" ]]; then
+                POSTDISPLAY="${hit#$BUFFER}"
+                region_highlight+=("${#BUFFER} $(( ${#BUFFER} + ${#POSTDISPLAY} )) fg=8 memo=notch-sugg")
+              fi
+            fi
+          }
+          autoload -Uz add-zle-hook-widget
+          add-zle-hook-widget line-pre-redraw _notch_sugg_refresh
+          _notch_sugg_accept() {
+            if [[ -n "$POSTDISPLAY" && "$CURSOR" -eq "${#BUFFER}" ]]; then
+              BUFFER="$BUFFER$POSTDISPLAY"
+              POSTDISPLAY=""
+              region_highlight=("${(@)region_highlight:#* memo=notch-sugg}")
+              CURSOR="${#BUFFER}"
+            else
+              zle .forward-char
+            fi
+          }
+          zle -N _notch_sugg_accept
+          bindkey '^[[C' _notch_sugg_accept  # → (normal cursor mode)
+          bindkey '^[OC' _notch_sugg_accept  # → (application cursor mode)
+        fi
         # "/ia <ask>": intercept the line BEFORE zsh runs it — hand the query
         # to the app (which asks the local Ollama), clear the buffer, keep it
         # out of history. Defined last so it wins over any user plugin that
         # rebinds accept-line.
         _notch_accept_line() {
+          # drop any ghost suggestion so ↩ doesn't print it into scrollback
+          POSTDISPLAY=""
+          region_highlight=("${(@)region_highlight:#* memo=notch-sugg}")
           if [[ "$BUFFER" == "/ia "* ]]; then
             print -r -- "$NOTCH_PANE"$'\\n'"${BUFFER#/ia }" > "$HOME/.config/agent-notch/ia-query"
             BUFFER=""
@@ -4937,8 +5035,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         // give a terminal pane focus so typing and ⌘-keys work right after a
-        // re-show (without this the re-shown panel had no first responder)
-        if let t = termViews.first { panel.makeFirstResponder(t) }
+        // re-show — the pane that owned the keyboard when the terminal was
+        // hidden, not blindly the leftmost one
+        if let t = restorableFocusTerm() { panel.makeFirstResponder(t) }
         // force the first layout pass NOW: AppKit resets the layer's
         // anchorPoint on it, which used to flip the very first curtain
         // animation upside down (it unrolled bottom-up)
@@ -4948,7 +5047,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func hideTerminal(_ panel: NSWindow) {
+        // capture the focus owner before orderOut resets the responder chain
+        if let t = panel.firstResponder as? LocalProcessTerminalView, termViews.contains(t) {
+            lastFocusedTerm = t
+        }
         curtain(panel, open: false) { panel.orderOut(nil) }
+    }
+
+    /// The pane focus should return to on re-show: the last one that owned the
+    /// keyboard, as long as it's still alive — otherwise the first pane.
+    private func restorableFocusTerm() -> LocalProcessTerminalView? {
+        if let t = lastFocusedTerm, termViews.contains(t) { return t }
+        return termViews.first
     }
 
     /// Curtain animation: unroll down from the notch with a tiny spring settle
@@ -6095,6 +6205,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         try? FileManager.default.removeItem(at: asksDir.appendingPathComponent("\(safe).json"))
     }
 
+    /// 🧹 header button: sweep every leftover that has no live terminal/agent
+    /// behind it — ask cards whose agent process is gone, and session rows
+    /// that already finished. Live sessions and their questions are untouched.
+    private func cleanupStale() {
+        let alive: (String) -> Bool = { [weak self] cwd in
+            guard let pid = self?.pidByCwd[cwd], pid > 0 else { return false }
+            return kill(pid, 0) == 0
+        }
+        for ask in asks.filter({ !alive($0.cwd) }) { clearAsk(ask) }
+        // hide finished sessions from now on; fresh activity resurfaces them
+        scanner.pruneBefore = Date()
+        listController.sessions = listController.sessions.filter { $0.anyLive }
+        render()
+    }
+
     // MARK: - Saved actions (frequent shell commands, run from the notch)
 
     private var actionsURL: URL { configURL("actions") }
@@ -6163,12 +6288,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func focusTerminalFor(_ ask: AgentAsk) {
-        // session inside the notch terminal → SHOW it (never toggle-hide)
+        // session inside the notch terminal → SHOW it (never toggle-hide),
+        // with the keyboard on the pane whose session actually asked
         if ask.canReply {
             if let w = termWindow {
                 if !w.isVisible { showTerminal(w) }
                 NSApp.activate(ignoringOtherApps: true)
                 w.makeKeyAndOrderFront(nil)
+                if let t = termViews.first(where: { ($0.process?.shellPid).flatMap(pidCwd) == ask.cwd }) {
+                    w.makeFirstResponder(t)
+                }
             } else {
                 toggleTerminal()
             }
@@ -6222,7 +6351,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 f.origin.y = s.maxY - self.barHeight - f.height
                 term.setFrame(f, display: true)
                 term.orderFrontRegardless()
-                if let t = self.termViews.first { term.makeFirstResponder(t) }
+                if let t = self.restorableFocusTerm() { term.makeFirstResponder(t) }
             }
             // re-register the global hotkeys in case they were dropped
             self.registerPanelHotkey()
