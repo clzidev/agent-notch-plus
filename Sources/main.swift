@@ -7,7 +7,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.39"
+let appVersion = "2.9.40"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -212,6 +212,8 @@ enum L10n {
         "term_size": ["Terminal size (% of screen):", "Tamaño de la terminal (% de pantalla):"],
         "panel_alpha": ["Panel opacity (%):", "Opacidad del panel (%):"],
         "term_alpha": ["Terminal opacity (%):", "Opacidad de la terminal (%):"],
+        "term_bg_image": ["Background image:", "Imagen de fondo:"],
+        "img_none": ["none", "ninguna"],
         "pane_close": ["Force close this pane (kills its shell, even a dead ssh)",
                        "Forzar cierre de este panel (mata su shell, aunque sea un ssh muerto)"],
         "choose_dir": ["Choose…", "Elegir…"],
@@ -3856,6 +3858,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var loginCheckRef: NSButton?
     private weak var menubarCheckRef: NSButton?
     private var pendTermDir = ""
+    private var pendTermBGImage = ""
+    private var termBGImageLabel: NSTextField?
+    // wallpaper layer of the notch terminal (behind the panes)
+    private weak var termBGView: NSView?
     private weak var ollamaModelPopupRef: NSPopUpButton?
     private weak var fontPopupRef: NSPopUpButton?
     private weak var fontSizeRef: NSTextField?
@@ -4818,6 +4824,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         container.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
         container.layer?.borderColor = NSColor(white: 0.24, alpha: 1).cgColor
         container.layer?.borderWidth = 1
+        // optional wallpaper: a jpg/png (config "term-bg-image") pinned behind
+        // the panes, aspect-filled and clipped to the same rounded corners
+        let bgImage = NSView(frame: container.bounds)
+        bgImage.autoresizingMask = [.width, .height]
+        bgImage.wantsLayer = true
+        bgImage.layer?.contentsGravity = .resizeAspectFill
+        bgImage.layer?.masksToBounds = true
+        bgImage.layer?.cornerRadius = 16
+        bgImage.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        bgImage.isHidden = true
+        container.addSubview(bgImage)
+        termBGView = bgImage
         let stripH: CGFloat = 22
         let strip = TermDragStrip(frame: NSRect(x: 0, y: th - stripH, width: tw, height: stripH))
         strip.autoresizingMask = [.width, .minYMargin]
@@ -4837,6 +4855,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.contentView = container
         termWindow = panel
         termSplit = split
+        applyTerminalBackgroundStyle()
         addTerminalPane()
         showTerminal(panel)
     }
@@ -4846,7 +4865,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let split = termSplit, termViews.count < 3 else { return }
         let term = DropTerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
         term.font = terminalFont()
-        term.nativeBackgroundColor = terminalBG()
+        term.nativeBackgroundColor = terminalPaneBG()
+        term.layer?.backgroundColor = terminalBGImage() == nil ? terminalBG().cgColor
+                                                               : NSColor.clear.cgColor
         term.nativeForegroundColor = terminalFG()
         term.caretColor = terminalFG()
         term.processDelegate = self
@@ -5183,6 +5204,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func terminalFG() -> NSColor { colorFromHex(cfgString("term-fg")) ?? neonMint }
     func terminalBG() -> NSColor { colorFromHex(cfgString("term-bg")) ?? .black }
 
+    /// Optional terminal wallpaper (config "term-bg-image", a jpg/png path).
+    func terminalBGImage() -> NSImage? {
+        let p = cfgString("term-bg-image")
+        return p.isEmpty ? nil : NSImage(contentsOfFile: p)
+    }
+
+    /// The color the panes actually paint with. With a wallpaper, the
+    /// term-alpha % moves from the window onto this color, so the picture
+    /// shows through the terminal background while text stays crisp.
+    func terminalPaneBG() -> NSColor {
+        terminalBGImage() == nil ? terminalBG()
+            : terminalBG().withAlphaComponent(cfgAlpha("term-alpha"))
+    }
+
+    /// One policy for wallpaper + opacity: no image → the whole window fades
+    /// (classic behavior); image set → the window stays solid, the image sits
+    /// behind at full strength and term-alpha dims the terminal OVER it.
+    private func applyTerminalBackgroundStyle() {
+        let img = terminalBGImage()
+        termBGView?.layer?.contents = img
+        termBGView?.isHidden = img == nil
+        termWindow?.alphaValue = img == nil ? cfgAlpha("term-alpha") : 1
+        let bg = terminalPaneBG()
+        for t in termViews {
+            t.nativeBackgroundColor = bg
+            // SwiftTerm fills cells with the (possibly translucent) color; the
+            // backing layer must not stay opaque black or the image is blocked
+            t.layer?.backgroundColor = img == nil ? terminalBG().cgColor : NSColor.clear.cgColor
+        }
+    }
+
     /// Per-pane ✕: SIGKILL that pane's shell — works even when the shell is
     /// stuck on a dead ssh and won't take `exit` — then drop just that pane.
     private func forceClosePane(_ pane: TermPane) {
@@ -5386,6 +5438,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         termDirLbl.widthAnchor.constraint(lessThanOrEqualToConstant: 260).isActive = true
         termDirLabel = termDirLbl
 
+        pendTermBGImage = cfgString("term-bg-image")
+        let termBGImgLbl = NSTextField(labelWithString: pendTermBGImage.isEmpty
+            ? L("img_none") : (pendTermBGImage as NSString).lastPathComponent)
+        termBGImgLbl.textColor = .secondaryLabelColor
+        termBGImgLbl.lineBreakMode = .byTruncatingMiddle
+        termBGImgLbl.widthAnchor.constraint(lessThanOrEqualToConstant: 200).isActive = true
+        termBGImageLabel = termBGImgLbl
+
         // terminal typography: the retro IBM VGA face first, then every
         // fixed-pitch family installed on the machine
         let fontPopup = NSPopUpButton()
@@ -5524,6 +5584,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             row(L("term_font"), [fontPopup, fontSize, smallLabel("pt")]),
             row(L("term_colors"), [smallLabel(L("term_fg_lbl")), fgWell,
                                    smallLabel(L("term_bg_lbl")), bgWell]),
+            row(L("term_bg_image"), [termBGImgLbl, button(L("choose_dir"), #selector(chooseTermBGImage)),
+                                     button(L("clear_dir"), #selector(clearTermBGImage))]),
             row(L("term_size"), [termSizeField, termSizePctLabel]),
             row(L("term_alpha"), [termAlphaField, taPct]),
             row(L("actions_title"), [button(L("actions_edit"), #selector(editActions))]),
@@ -5643,13 +5705,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if let w = fgWellRef { writeConfig("term-fg", hexFromColor(w.color)) }
         if let w = bgWellRef { writeConfig("term-bg", hexFromColor(w.color)) }
-        // apply typography/colors to terminals that are already open
+        writeConfig("term-bg-image", pendTermBGImage)
+        // apply typography/colors to terminals that are already open (the
+        // background color is applied below, once the new alphas are on disk)
         let tf = terminalFont()
         let fg = terminalFG()
-        let bg = terminalBG()
         for t in termViews {
             t.font = tf
-            t.nativeBackgroundColor = bg
             t.nativeForegroundColor = fg
             t.caretColor = fg
         }
@@ -5665,7 +5727,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let ta = Int(min(100, max(30, Double(pendTermAlphaField?.stringValue ?? "") ?? 100)))
         writeConfig("term-alpha", String(ta))
         window.alphaValue = CGFloat(pa) / 100
-        applyTerminalAlpha(CGFloat(ta) / 100)
+        applyTerminalBackgroundStyle()
         if #available(macOS 13.0, *), let check = loginCheckRef, check.isEnabled {
             if check.state == .on {
                 if Bundle.main.bundleIdentifier == nil {
@@ -5970,6 +6032,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         termDirLabel?.stringValue = "/"
     }
 
+    @objc private func chooseTermBGImage() {
+        guard let w = settingsWindow else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.png, .jpeg]
+        panel.beginSheetModal(for: w) { [weak self] resp in
+            guard let self, resp == .OK, let url = panel.url else { return }
+            self.pendTermBGImage = url.path
+            self.termBGImageLabel?.stringValue = url.lastPathComponent
+        }
+    }
+
+    @objc private func clearTermBGImage() {
+        pendTermBGImage = ""
+        termBGImageLabel?.stringValue = L("img_none")
+    }
+
     private func readSoundPrefs() {
         soundDone = FileManager.default.fileExists(atPath: configURL("sound-done").path)
         soundAttention = FileManager.default.fileExists(atPath: configURL("sound-attention").path)
@@ -5993,12 +6073,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let v = (try? String(contentsOf: configURL(name), encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return CGFloat(min(100, max(30, Double(v ?? "") ?? 100))) / 100
-    }
-
-    /// Window-level alpha: everything in the terminal — background, text,
-    /// panes, header — goes translucent together.
-    private func applyTerminalAlpha(_ a: CGFloat) {
-        termWindow?.alphaValue = a
     }
 
     // MARK: - Hotkeys (all configurable)
