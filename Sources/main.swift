@@ -7,7 +7,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.35"
+let appVersion = "2.9.36"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -3382,6 +3382,7 @@ final class IACard: NSView {
     private var rowViews: [NSView] = []
     private var rowLabels: [NSTextField] = []
     private var descLabels: [NSTextField] = []
+    private let thinkingStreak = CAGradientLayer()  // sweeping light while Ollama thinks
     private var options: [(cmd: String, desc: String)] = []
     private var selected = 0
     var optionCount: Int { options.count }
@@ -3425,9 +3426,49 @@ final class IACard: NSView {
         copyBtn.title = L("ia_copy")
         copyBtn.autoresizingMask = [.minXMargin, .maxYMargin]
         for v in [title, close, hint, insertBtn, copyBtn] { addSubview(v) }
+        thinkingStreak.colors = [NSColor.clear.cgColor,
+                                 neonMint.withAlphaComponent(0.8).cgColor,
+                                 NSColor.clear.cgColor]
+        thinkingStreak.startPoint = CGPoint(x: 0, y: 0.5)
+        thinkingStreak.endPoint = CGPoint(x: 1, y: 0.5)
+        thinkingStreak.isHidden = true
+        layer?.addSublayer(thinkingStreak)
         relayoutChrome()
     }
     required init?(coder: NSCoder) { nil }
+
+    /// While Ollama works: the title breathes and a light streak sweeps under
+    /// it — you SEE it thinking instead of staring at a static card.
+    private func startThinkingFX() {
+        title.wantsLayer = true
+        let p = CABasicAnimation(keyPath: "opacity")
+        p.fromValue = 1.0
+        p.toValue = 0.3
+        p.duration = 0.55
+        p.autoreverses = true
+        p.repeatCount = .infinity
+        p.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        title.layer?.add(p, forKey: "think")
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        thinkingStreak.isHidden = false
+        thinkingStreak.bounds = CGRect(x: 0, y: 0, width: frame.width * 0.3, height: 2)
+        thinkingStreak.position = CGPoint(x: 0, y: frame.height - 31)
+        CATransaction.commit()
+        let run = CABasicAnimation(keyPath: "position.x")
+        run.fromValue = -frame.width * 0.2
+        run.toValue = frame.width * 1.2
+        run.duration = 1.3
+        run.repeatCount = .infinity
+        run.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        thinkingStreak.add(run, forKey: "run")
+    }
+
+    private func stopThinkingFX() {
+        title.layer?.removeAnimation(forKey: "think")
+        thinkingStreak.removeAnimation(forKey: "run")
+        thinkingStreak.isHidden = true
+    }
 
     private func relayoutChrome() {
         title.frame = NSRect(x: 14, y: frame.height - 24, width: frame.width - 60, height: 16)
@@ -3444,7 +3485,7 @@ final class IACard: NSView {
         rowLabels = []
         descLabels = []
         let hasDesc = rows.contains { !$0.desc.isEmpty }
-        let rowH: CGFloat = hasDesc ? 42 : 26
+        let rowH: CGFloat = hasDesc ? 58 : 26  // room for a two-line sentence
         let newH = Self.headH + CGFloat(rows.count) * rowH + Self.footH
         var f = frame
         f.origin.y -= newH - f.height
@@ -3465,11 +3506,14 @@ final class IACard: NSView {
             l.frame = NSRect(x: 10, y: row.frame.height - 19, width: row.frame.width - 20, height: 16)
             l.autoresizingMask = [.width]
             row.addSubview(l)
-            let d = NSTextField(labelWithString: entry.desc)
+            let d = NSTextField(wrappingLabelWithString: entry.desc)
             d.font = .systemFont(ofSize: 10)
             d.textColor = NSColor(white: 0.55, alpha: 1)  // dimmer, still readable
+            d.maximumNumberOfLines = 2
             d.lineBreakMode = .byTruncatingTail
-            d.frame = NSRect(x: 24, y: 3, width: row.frame.width - 34, height: 13)
+            d.isEditable = false
+            d.isSelectable = false
+            d.frame = NSRect(x: 24, y: 3, width: row.frame.width - 34, height: 30)
             d.autoresizingMask = [.width]
             d.isHidden = entry.desc.isEmpty
             row.addSubview(d)
@@ -3512,9 +3556,11 @@ final class IACard: NSView {
         insertBtn.isHidden = true
         copyBtn.isHidden = true
         hint.stringValue = L("ia_keys_esc")
+        startThinkingFX()
     }
 
     func showOptions(_ cmds: [(cmd: String, desc: String)]) {
+        stopThinkingFX()
         title.stringValue = "🤖 /ia"
         options = cmds
         selected = 0
@@ -3525,6 +3571,7 @@ final class IACard: NSView {
     }
 
     func showError(_ msg: String) {
+        stopThinkingFX()
         title.stringValue = "🤖 /ia"
         options = []
         selected = 0
@@ -4425,7 +4472,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ]
         let body: [String: Any] = [
             "model": model, "stream": false,
-            "system": "You generate macOS zsh shell commands. Return 1 to 3 alternative one-line commands that accomplish the user's request, best first. cmd = the exact command, no backticks. desc = a very brief \(expLang) explanation (max 10 words) of what that exact command does.",
+            "system": "You generate macOS zsh shell commands. Return 1 to 3 alternative one-line commands that accomplish the user's request, best first. cmd = the exact command, no backticks. desc = a clear \(expLang) explanation in one full sentence (15 to 25 words) of what that exact command does and how it differs from the other options.",
             "prompt": query,
             "format": optionsSchema,
         ]
