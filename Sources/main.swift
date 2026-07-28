@@ -7,7 +7,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.33"
+let appVersion = "2.9.34"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -3381,13 +3381,13 @@ final class IACard: NSView {
     private let copyBtn = FirstMouseButton(title: "", target: nil, action: nil)
     private var rowViews: [NSView] = []
     private var rowLabels: [NSTextField] = []
-    private var options: [String] = []
+    private var descLabels: [NSTextField] = []
+    private var options: [(cmd: String, desc: String)] = []
     private var selected = 0
     var optionCount: Int { options.count }
-    var selectedCommand: String? { options.indices.contains(selected) ? options[selected] : nil }
+    var selectedCommand: String? { options.indices.contains(selected) ? options[selected].cmd : nil }
 
     private static let headH: CGFloat = 30
-    private static let rowH: CGFloat = 26
     private static let footH: CGFloat = 40
 
     override init(frame: NSRect) {
@@ -3437,35 +3437,47 @@ final class IACard: NSView {
     }
 
     /// Resize keeping the TOP edge fixed (y grows downward from the notch).
-    private func setContentRows(_ texts: [String], selectable: Bool) {
+    /// Each row is command + an optional dimmer one-line description under it.
+    private func setContentRows(_ rows: [(text: String, desc: String)]) {
         rowViews.forEach { $0.removeFromSuperview() }
         rowViews = []
         rowLabels = []
-        let newH = Self.headH + CGFloat(texts.count) * Self.rowH + Self.footH
+        descLabels = []
+        let hasDesc = rows.contains { !$0.desc.isEmpty }
+        let rowH: CGFloat = hasDesc ? 42 : 26
+        let newH = Self.headH + CGFloat(rows.count) * rowH + Self.footH
         var f = frame
         f.origin.y -= newH - f.height
         f.size.height = newH
         frame = f
-        for (i, text) in texts.enumerated() {
+        for (i, entry) in rows.enumerated() {
             let row = FirstMouseButton(title: "", target: self, action: #selector(rowTapped(_:)))
             row.isBordered = false
             row.wantsLayer = true
             row.layer?.cornerRadius = 6
             row.tag = i
-            row.frame = NSRect(x: 10, y: frame.height - Self.headH - CGFloat(i + 1) * Self.rowH + 2,
-                               width: frame.width - 20, height: Self.rowH - 4)
+            row.frame = NSRect(x: 10, y: frame.height - Self.headH - CGFloat(i + 1) * rowH + 2,
+                               width: frame.width - 20, height: rowH - 4)
             row.autoresizingMask = [.width, .minYMargin]
-            let l = NSTextField(labelWithString: text)
+            let l = NSTextField(labelWithString: entry.text)
             l.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
             l.lineBreakMode = .byTruncatingTail
-            l.frame = NSRect(x: 10, y: 3, width: row.frame.width - 20, height: 16)
+            l.frame = NSRect(x: 10, y: row.frame.height - 19, width: row.frame.width - 20, height: 16)
             l.autoresizingMask = [.width]
             row.addSubview(l)
+            let d = NSTextField(labelWithString: entry.desc)
+            d.font = .systemFont(ofSize: 10)
+            d.textColor = NSColor(white: 0.55, alpha: 1)  // dimmer, still readable
+            d.lineBreakMode = .byTruncatingTail
+            d.frame = NSRect(x: 24, y: 3, width: row.frame.width - 34, height: 13)
+            d.autoresizingMask = [.width]
+            d.isHidden = entry.desc.isEmpty
+            row.addSubview(d)
             addSubview(row)
             rowViews.append(row)
             rowLabels.append(l)
+            descLabels.append(d)
         }
-        _ = selectable
         restyleRows()
     }
 
@@ -3475,10 +3487,12 @@ final class IACard: NSView {
             row.layer?.backgroundColor = isSel ? neonMint.withAlphaComponent(0.16).cgColor
                                                : NSColor.clear.cgColor
             rowLabels[i].textColor = isSel ? .white : NSColor(white: 0.8, alpha: 1)
+            descLabels[i].textColor = isSel ? NSColor(white: 0.72, alpha: 1)
+                                            : NSColor(white: 0.55, alpha: 1)
             if isSel, options.count > 1 {
-                rowLabels[i].stringValue = "▸ " + options[i]
+                rowLabels[i].stringValue = "▸ " + options[i].cmd
             } else if !options.isEmpty {
-                rowLabels[i].stringValue = "  " + options[i]
+                rowLabels[i].stringValue = "  " + options[i].cmd
             }
         }
     }
@@ -3493,18 +3507,18 @@ final class IACard: NSView {
         title.stringValue = "🤖 /ia — " + L("ia_thinking")
         options = []
         selected = 0
-        setContentRows([query], selectable: false)
+        setContentRows([(query, "")])
         rowLabels.first?.textColor = NSColor(white: 0.6, alpha: 1)
         insertBtn.isHidden = true
         copyBtn.isHidden = true
         hint.stringValue = L("ia_keys_esc")
     }
 
-    func showOptions(_ cmds: [String]) {
+    func showOptions(_ cmds: [(cmd: String, desc: String)]) {
         title.stringValue = "🤖 /ia"
         options = cmds
         selected = 0
-        setContentRows(cmds, selectable: true)
+        setContentRows(cmds.map { ($0.cmd, $0.desc) })
         insertBtn.isHidden = false
         copyBtn.isHidden = false
         hint.stringValue = cmds.count > 1 ? L("ia_keys") : L("ia_keys_one")
@@ -3514,7 +3528,7 @@ final class IACard: NSView {
         title.stringValue = "🤖 /ia"
         options = []
         selected = 0
-        setContentRows([msg], selectable: false)
+        setContentRows([(msg, "")])
         rowLabels.first?.textColor = NSColor(calibratedRed: 1, green: 0.55, blue: 0.5, alpha: 1)
         insertBtn.isHidden = true
         copyBtn.isHidden = true
@@ -3525,7 +3539,7 @@ final class IACard: NSView {
         guard options.indices.contains(b.tag) else { return }
         selected = b.tag
         restyleRows()
-        onInsert?(options[b.tag])
+        onInsert?(options[b.tag].cmd)
     }
     @objc private func insertTapped() { if let c = selectedCommand { onInsert?(c) } }
     @objc private func copyTapped() {
@@ -4395,9 +4409,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         req.httpMethod = "POST"
         req.timeoutInterval = 60  // first request loads the model — slow
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let expLang = L10n.lang == "es" ? "Spanish" : "English"
         let body: [String: Any] = [
             "model": model, "stream": false,
-            "system": "You are a shell command generator for macOS zsh. Reply with 1 to 3 alternative one-line shell commands that accomplish the user's request, one per line, best first. No markdown, no backticks, no numbering, no explanations, no comments.",
+            "system": "You are a shell command generator for macOS zsh. Reply with 1 to 3 alternative one-line shell commands that accomplish the user's request, one per line, best first. After each command append ' ||| ' followed by a very brief \(expLang) explanation (max 10 words) of what that exact command does. No markdown, no backticks, no numbering, nothing else.",
             "prompt": query,
         ]
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
@@ -4418,25 +4433,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }.resume()
     }
 
-    /// Model output → up to 3 clean command lines: strip fences, backticks,
-    /// bullets and numbering.
-    static func sanitizeIACommands(_ raw: String) -> [String] {
+    /// Model output → up to 3 clean (command, short description) pairs.
+    /// Lines come as "cmd ||| what it does"; fences, backticks, bullets and
+    /// numbering are stripped from the command side.
+    static func sanitizeIACommands(_ raw: String) -> [(cmd: String, desc: String)] {
         raw.replacingOccurrences(of: "\r", with: "\n")
             .split(separator: "\n")
-            .map { line -> String in
-                var s = line.trimmingCharacters(in: .whitespaces)
+            .compactMap { line -> (cmd: String, desc: String)? in
+                var s = String(line).trimmingCharacters(in: .whitespaces)
                     .trimmingCharacters(in: CharacterSet(charactersIn: "`"))
-                // "1. cmd", "2) cmd", "- cmd", "* cmd" → "cmd"
-                while let f = s.first, "0123456789.-*) ".contains(f), s.count > 2,
-                      !s.hasPrefix("./"), !s.hasPrefix("*.") {
-                    let dropped = String(s.dropFirst()).trimmingCharacters(in: .whitespaces)
-                    if f.isNumber || f == "." || f == ")" || f == "-" || f == "*" { s = dropped } else { break }
+                guard !s.isEmpty, !s.hasPrefix("```") else { return nil }
+                var desc = ""
+                if let r = s.range(of: "|||") {
+                    desc = String(s[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+                    s = String(s[..<r.lowerBound]).trimmingCharacters(in: .whitespaces)
                 }
-                return s.trimmingCharacters(in: .whitespaces)
+                // "1. cmd", "2) cmd", "- cmd", "* cmd" → "cmd"
+                while let f = s.first, s.count > 2, !s.hasPrefix("./"), !s.hasPrefix("*."),
+                      f.isNumber || f == "." || f == ")" || f == "-" || f == "*" {
+                    s = String(s.dropFirst()).trimmingCharacters(in: .whitespaces)
+                }
+                s = s.trimmingCharacters(in: CharacterSet(charactersIn: "`"))
+                    .trimmingCharacters(in: .whitespaces)
+                return s.isEmpty ? nil : (s, desc)
             }
-            .filter { !$0.isEmpty && !$0.hasPrefix("```") }
             .prefix(3)
-            .map { String($0) }
+            .map { $0 }
     }
 
     private var iaKeyMonitor: Any?
