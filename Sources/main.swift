@@ -7,7 +7,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.31"
+let appVersion = "2.9.32"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -4731,6 +4731,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         termViews.append(term)
         termPanes.append(pane)
         termWindow?.makeFirstResponder(term)
+        // the caret view exists once the terminal took focus — dress it then
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self, weak term] in
+            if let term { self?.styleCaret(term) }
+        }
     }
 
     /// Writes the notch terminal's zsh profile: source the user's zshrc, then
@@ -4760,7 +4764,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         # pane title: current folder at the prompt, the running command while
         # one runs (so a hung `ssh host` pane is easy to spot and ✕-close)
-        precmd() { _notch_prompt; print -Pn '\\e[1 q'; print -Pn '\\e]0;%1~\\a' }
+        # steady block cursor: the app animates the neon fade itself
+        precmd() { _notch_prompt; print -Pn '\\e[2 q'; print -Pn '\\e]0;%1~\\a' }
         preexec() { printf '\\e]0;%s\\a' "$1" }
         # Silent cd driven by the quick-folders pane: the app writes the
         # target to cd-target and sends ESC[24;5~ (a sequence no keyboard
@@ -4904,17 +4909,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// The configured terminal font. Default: the classic '80s IBM VGA face at
-    /// 16pt (its native-looking size); any other family defaults to 12pt.
+    /// 16pt, stretched 1.25× vertically — real VGA text mode drew 8px glyphs
+    /// in tall cells, so without the stretch the letters look squashed. Any
+    /// other family defaults to 12pt, untouched.
     func terminalFont() -> NSFont {
         let fam = cfgString("term-font")
         let sizeCfg = Double(cfgString("term-font-size"))
         if fam.isEmpty || fam == Self.retroFontFamily {
             let size = CGFloat(sizeCfg ?? 16)
-            if let f = NSFont(name: Self.retroFontFamily, size: size) { return f }
+            if let f = NSFont(name: Self.retroFontFamily, size: size) {
+                var t = AffineTransform(scale: size)
+                t.scale(x: 1.0, y: 1.25)
+                return NSFont(descriptor: f.fontDescriptor, textTransform: t) ?? f
+            }
             return .monospacedSystemFont(ofSize: CGFloat(sizeCfg ?? 12), weight: .regular)
         }
         let size = CGFloat(sizeCfg ?? 12)
         return NSFont(name: fam, size: size) ?? .monospacedSystemFont(ofSize: size, weight: .regular)
+    }
+
+    /// Matrix caret: find SwiftTerm's (internal) caret view by class name and
+    /// dress it — mint gradient, neon glow, and a smooth breathe in/out
+    /// (the shell uses a steady block, so nothing fights this animation).
+    func styleCaret(_ term: LocalProcessTerminalView) {
+        guard let caret = term.subviews.first(where: {
+            String(describing: type(of: $0)).contains("CaretView")
+        }) else { return }
+        caret.wantsLayer = true
+        guard let lyr = caret.layer else { return }
+        let fg = terminalFG()
+        lyr.masksToBounds = false
+        lyr.shadowColor = fg.cgColor
+        lyr.shadowOpacity = 0.85
+        lyr.shadowRadius = 6
+        lyr.shadowOffset = .zero
+        lyr.sublayers?.filter { $0.name == "notchCaretGrad" }.forEach { $0.removeFromSuperlayer() }
+        let g = CAGradientLayer()
+        g.name = "notchCaretGrad"
+        g.colors = [fg.withAlphaComponent(0.95).cgColor,
+                    fg.withAlphaComponent(0.55).cgColor,
+                    fg.withAlphaComponent(0.9).cgColor]
+        g.startPoint = CGPoint(x: 0.5, y: 1)
+        g.endPoint = CGPoint(x: 0.5, y: 0)
+        g.frame = caret.bounds
+        g.cornerRadius = 1.5
+        lyr.addSublayer(g)
+        let breathe = CABasicAnimation(keyPath: "opacity")
+        breathe.fromValue = 1.0
+        breathe.toValue = 0.12
+        breathe.duration = 0.75
+        breathe.autoreverses = true
+        breathe.repeatCount = .infinity
+        breathe.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        lyr.add(breathe, forKey: "matrixBlink")
     }
 
     /// Text/background colors. Defaults: neon mint on black.
@@ -5356,6 +5403,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             t.nativeBackgroundColor = bg
             t.nativeForegroundColor = fg
             t.caretColor = fg
+        }
+        // re-dress the caret with the (possibly) new color and cell size
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self else { return }
+            for t in self.termViews { self.styleCaret(t) }
         }
         let tsz = Int(min(95, max(20, Double(pendTermSizeField?.stringValue ?? "") ?? 50)))
         writeConfig("term-size", String(tsz))
