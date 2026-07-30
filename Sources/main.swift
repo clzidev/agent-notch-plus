@@ -7,7 +7,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.44"
+let appVersion = "2.9.45"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -2670,7 +2670,7 @@ final class SSHHostsPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
         table.addTableColumn(NSTableColumn(identifier: .init("host")))
         table.headerView = nil
         table.backgroundColor = .black
-        table.rowHeight = 26
+        table.rowHeight = 34  // two lines: alias + dim user@host detail
         table.style = .plain
         table.dataSource = self
         table.delegate = self
@@ -2734,30 +2734,38 @@ final class SSHHostsPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
         icon.image = NSImage(systemSymbolName: "network", accessibilityDescription: "ssh")
         icon.contentTintColor = neonMint.withAlphaComponent(0.8)
         icon.translatesAutoresizingMaskIntoConstraints = false
-        let text = NSMutableAttributedString(
-            string: e.alias,
-            attributes: [.foregroundColor: NSColor(white: 0.92, alpha: 1),
-                         .font: NSFont.monospacedSystemFont(ofSize: 11.5, weight: .medium)])
-        if !e.detail.isEmpty {
-            text.append(NSAttributedString(
-                string: "  \(e.detail)",
-                attributes: [.foregroundColor: NSColor(white: 0.45, alpha: 1),
-                             .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)]))
-        }
-        let name = NSTextField(labelWithString: "")
-        name.attributedStringValue = text
+        // one label per line — a single attributed label wrapped and rows
+        // bled into each other; separate single-line labels truncate cleanly
+        let name = NSTextField(labelWithString: e.alias)
+        name.textColor = NSColor(white: 0.92, alpha: 1)
+        name.font = .monospacedSystemFont(ofSize: 11.5, weight: .medium)
         name.lineBreakMode = .byTruncatingTail
-        name.translatesAutoresizingMaskIntoConstraints = false
+        name.usesSingleLineMode = true
+        name.setContentCompressionResistancePriority(.init(249), for: .horizontal)
+        let col = NSStackView(views: [name])
+        if !e.detail.isEmpty {
+            let detail = NSTextField(labelWithString: e.detail)
+            detail.textColor = NSColor(white: 0.45, alpha: 1)
+            detail.font = .monospacedSystemFont(ofSize: 9, weight: .regular)
+            detail.lineBreakMode = .byTruncatingTail
+            detail.usesSingleLineMode = true
+            detail.setContentCompressionResistancePriority(.init(249), for: .horizontal)
+            col.addArrangedSubview(detail)
+        }
+        col.orientation = .vertical
+        col.alignment = .leading
+        col.spacing = 1
+        col.translatesAutoresizingMaskIntoConstraints = false
         cell.addSubview(icon)
-        cell.addSubview(name)
+        cell.addSubview(col)
         NSLayoutConstraint.activate([
             icon.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
             icon.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
             icon.widthAnchor.constraint(equalToConstant: 15),
             icon.heightAnchor.constraint(equalToConstant: 15),
-            name.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 7),
-            name.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
-            name.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            col.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 7),
+            col.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
+            col.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
         ])
         return cell
     }
