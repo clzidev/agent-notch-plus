@@ -7,7 +7,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.41"
+let appVersion = "2.9.44"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -108,17 +108,8 @@ enum L10n {
         "go_to": ["Go to", "Ir a"],
         "side_places": ["PLACES", "LUGARES"],
         "side_favs": ["FAVORITES", "FAVORITOS"],
-        "g_cores": ["cores", "núcleos"],
-        "g_free": ["free", "libre"],
-        "g_disk": ["disk", "disco"],
         "clean_tip": ["Clear cards with no live terminal/agent",
                       "Limpiar tarjetas sin terminal/agente abierto"],
-        "tip_sys_cpu": ["Whole-machine CPU usage right now (all cores).",
-                        "Uso de CPU de toda la máquina ahora (todos los núcleos)."],
-        "tip_sys_ram": ["Memory in use (active + wired + compressed) vs installed RAM.",
-                        "Memoria en uso (activa + fija + comprimida) contra la RAM instalada."],
-        "tip_sys_disk": ["Startup disk: space used and freely available.",
-                         "Disco de arranque: espacio usado y disponible."],
         "asking": ["Needs your answer", "Necesita tu respuesta"],
         "reply_ph": ["Type your reply and press ↩", "Escribí tu respuesta y ↩"],
         "send": ["Send", "Enviar"],
@@ -167,17 +158,18 @@ enum L10n {
         "ia_keys_esc": ["esc close", "esc cerrar"],
         "agent_one": ["agent", "agente"],
         "agents": ["agents", "agentes"],
-        "g_active": ["active", "activas"],
-        "g_total": ["total", "total"],
-        "tip_gauge_usage": [
-            "Tokens processed in the last 5 hours (ring: vs your busiest 5h window of the week). 7d = weekly total.",
-            "Tokens procesados en las últimas 5 horas (anillo: contra tu pico de 5h de la semana). 7d = total semanal."],
-        "tip_gauge_cost": [
-            "≈ APPROXIMATE cost at API prices, computed from your token usage. If you're on a subscription (Pro/Max) this is NOT what you pay — it's the equivalent value of your usage.",
-            "≈ Costo APROXIMADO a precios de API, calculado desde tus tokens. Si usás un abono (Pro/Max) NO es lo que pagás — es el valor equivalente de tu uso."],
-        "tip_gauge_sessions": [
-            "Agent sessions working right now / total detected sessions.",
-            "Sesiones de agentes trabajando ahora / total de sesiones detectadas."],
+        "g_session": ["session", "sesión"],
+        "g_week": ["7 days", "7 días"],
+        "plan_resets": ["Resets:", "Se restablece:"],
+        "tip_plan_session": [
+            "OFFICIAL plan usage (same as claude.ai): current 5h session.",
+            "Uso OFICIAL del plan (igual que claude.ai): sesión actual de 5 h."],
+        "tip_plan_week": [
+            "OFFICIAL plan usage (same as claude.ai): weekly limit, all models.",
+            "Uso OFICIAL del plan (igual que claude.ai): límite semanal, todos los modelos."],
+        "tip_plan_model": [
+            "OFFICIAL plan usage (same as claude.ai): weekly limit for this model.",
+            "Uso OFICIAL del plan (igual que claude.ai): límite semanal de este modelo."],
         "tip_chip_tokens": [
             "Total tokens (input + output) across all sessions in the last 5 hours.",
             "Tokens totales (entrada + salida) de todas las sesiones en las últimas 5 horas."],
@@ -206,6 +198,9 @@ enum L10n {
         "key_split": ["split", "dividir"],
         "key_files": ["files", "archivos"],
         "key_folders": ["folders", "carpetas"],
+        "key_ssh": ["ssh", "ssh"],
+        "ssh_empty": ["No hosts found in ~/.ssh/config",
+                      "Sin conexiones en ~/.ssh/config"],
         "terminal": ["Notch terminal", "Terminal del notch"],
         "term_hotkey": ["Terminal shortcut:", "Atajo de terminal:"],
         "term_dir": ["Terminal start folder:", "Carpeta inicial de la terminal:"],
@@ -766,6 +761,118 @@ final class UsageTracker {
     }
 }
 
+// MARK: - Official plan usage (the numbers claude.ai shows in Settings > Usage)
+
+/// One limit row from the OAuth usage endpoint: current session, weekly all
+/// models, or a weekly per-model cap ("Fable").
+struct PlanLimit {
+    let kind: String       // session | weekly_all | weekly_scoped
+    let label: String      // display name for scoped limits ("Fable")
+    let percent: Double    // 0-100 as reported by Anthropic
+    let resetsAt: Date?
+    let severity: String   // normal | warning | exceeded…
+}
+
+/// Fetches https://api.anthropic.com/api/oauth/usage with Claude Code's own
+/// OAuth token (Keychain, falling back to ~/.claude/.credentials.json), so the
+/// gauges show the SAME percentages as claude.ai instead of local estimates.
+/// Refreshes every 5 min in the background; failures keep the last good data.
+final class PlanUsageFetcher {
+    private(set) var limits: [PlanLimit] = []
+    var onUpdate: (() -> Void)?          // called on the main queue when data changed
+    private var lastFetch = Date.distantPast
+    private var inFlight = false
+
+    private func token() -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = Pipe()
+        var raw: Data? = nil
+        if (try? p.run()) != nil {
+            raw = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            if p.terminationStatus != 0 { raw = nil }
+        }
+        if raw == nil {
+            raw = try? Data(contentsOf: FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".claude/.credentials.json"))
+        }
+        guard let d = raw,
+              let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              let oauth = o["claudeAiOauth"] as? [String: Any],
+              let tok = oauth["accessToken"] as? String, !tok.isEmpty else { return nil }
+        return tok
+    }
+
+    /// Cheap to call on every 3 s poll — only actually hits the network every
+    /// 5 minutes (or 1 min after a failure).
+    func refreshIfStale() {
+        guard !inFlight else { return }
+        let age = Date().timeIntervalSince(lastFetch)
+        guard age > (limits.isEmpty ? 60 : 300) else { return }
+        guard let tok = token() else { return }
+        inFlight = true
+        lastFetch = Date()
+        var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
+        req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
+        req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        req.timeoutInterval = 15
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
+            guard let self else { return }
+            defer { self.inFlight = false }
+            guard let data,
+                  (resp as? HTTPURLResponse)?.statusCode == 200,
+                  let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let rows = o["limits"] as? [[String: Any]] else { return }
+            let iso = ISO8601DateFormatter()
+            iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let isoPlain = ISO8601DateFormatter()
+            let parsed: [PlanLimit] = rows.compactMap { r in
+                guard let kind = r["kind"] as? String else { return nil }
+                let pct = (r["percent"] as? Double) ?? Double(r["percent"] as? Int ?? 0)
+                var reset: Date? = nil
+                if let s = r["resets_at"] as? String {
+                    reset = iso.date(from: s) ?? isoPlain.date(from: s)
+                }
+                let scopeName = ((r["scope"] as? [String: Any])?["model"] as? [String: Any])?["display_name"] as? String
+                return PlanLimit(kind: kind, label: scopeName ?? "",
+                                 percent: pct, resetsAt: reset,
+                                 severity: (r["severity"] as? String) ?? "normal")
+            }
+            guard !parsed.isEmpty else { return }
+            DispatchQueue.main.async {
+                self.limits = parsed
+                self.onUpdate?()
+            }
+        }.resume()
+    }
+}
+
+/// "3h 57m" when the reset is near, "dom 12:00 a.m." when it's days away.
+func fmtReset(_ d: Date) -> String {
+    let secs = d.timeIntervalSinceNow
+    if secs <= 0 { return "—" }
+    if secs < 24 * 3600 {
+        let h = Int(secs) / 3600, m = (Int(secs) % 3600) / 60
+        return h > 0 ? "\(h)h \(m)m" : "\(m)m"
+    }
+    let f = DateFormatter()
+    f.locale = Locale(identifier: L10n.lang == "es" ? "es" : "en_US")
+    f.setLocalizedDateFormatFromTemplate("EEE j")
+    return f.string(from: d)
+}
+
+/// Full localized "sunday, aug 2, 12:00 a.m." for tooltips.
+func fmtResetLong(_ d: Date) -> String {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: L10n.lang == "es" ? "es" : "en_US")
+    f.setLocalizedDateFormatFromTemplate("EEEE d MMM jmm")
+    return f.string(from: d)
+}
+
 /// "12.3k" / "1.2M" — compact token counts for the panel.
 func fmtTokens(_ n: Int) -> String {
     switch n {
@@ -773,71 +880,6 @@ func fmtTokens(_ n: Int) -> String {
     case ..<1_000_000: return String(format: "%.1fk", Double(n) / 1000)
     default: return String(format: "%.1fM", Double(n) / 1_000_000)
     }
-}
-
-// MARK: - System stats (CPU / RAM / disk for the notch panel)
-
-struct SysStats {
-    var cpu: Double = 0        // 0-100, whole machine
-    var cores = ProcessInfo.processInfo.activeProcessorCount
-    var memUsed: Double = 0    // bytes
-    var memTotal = Double(ProcessInfo.processInfo.physicalMemory)
-    var diskFree: Double = 0   // bytes
-    var diskTotal: Double = 0
-}
-
-/// Whole-machine snapshot: CPU from host tick deltas between polls (the same
-/// honest-delta approach as the per-process monitor), memory from the VM
-/// statistics, disk from the root volume. One sample per 3 s poll — free.
-final class SystemMonitor {
-    private var lastTicks: (user: UInt64, sys: UInt64, idle: UInt64, nice: UInt64)?
-
-    func sample() -> SysStats {
-        var s = SysStats()
-        var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info_data_t>.size
-                                           / MemoryLayout<integer_t>.size)
-        var info = host_cpu_load_info_data_t()
-        let kr = withUnsafeMutablePointer(to: &info) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, $0, &count)
-            }
-        }
-        if kr == KERN_SUCCESS {
-            let t = (user: UInt64(info.cpu_ticks.0), sys: UInt64(info.cpu_ticks.1),
-                     idle: UInt64(info.cpu_ticks.2), nice: UInt64(info.cpu_ticks.3))
-            if let l = lastTicks {
-                let busy = (t.user &- l.user) &+ (t.sys &- l.sys) &+ (t.nice &- l.nice)
-                let total = busy &+ (t.idle &- l.idle)
-                if total > 0 { s.cpu = Double(busy) / Double(total) * 100 }
-            }
-            lastTicks = t
-        }
-        var vmCount = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size
-                                             / MemoryLayout<integer_t>.size)
-        var vm = vm_statistics64_data_t()
-        let kr2 = withUnsafeMutablePointer(to: &vm) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: Int(vmCount)) {
-                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &vmCount)
-            }
-        }
-        if kr2 == KERN_SUCCESS {
-            let page = Double(vm_kernel_page_size)
-            s.memUsed = (Double(vm.active_count) + Double(vm.wire_count)
-                         + Double(vm.compressor_page_count)) * page
-        }
-        if let vals = try? URL(fileURLWithPath: "/").resourceValues(
-            forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeTotalCapacityKey]) {
-            s.diskFree = Double(vals.volumeAvailableCapacityForImportantUsage ?? 0)
-            s.diskTotal = Double(vals.volumeTotalCapacity ?? 0)
-        }
-        return s
-    }
-}
-
-/// "12.5G" / "980G" — compact byte counts for the panel.
-func fmtGB(_ bytes: Double) -> String {
-    let g = bytes / 1_000_000_000
-    return g >= 100 ? String(format: "%.0fG", g) : String(format: "%.1fG", g)
 }
 
 // MARK: - Session scanning
@@ -1241,7 +1283,7 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     var asks: [AgentAsk] = [] { didSet { rebuildAsks() } }
     // usage windows for the header chip + gauges (5h, 7d, weekly 5h peak)
     var gaugeData: (t5: UsageTracker.Totals, t7d: UsageTracker.Totals, peak5h: Int)?
-    var sysStats: SysStats?  // machine CPU/RAM/disk for the system gauges
+    var planLimits: [PlanLimit] = []  // official claude.ai plan percentages
     private var pendingGaugeAnimation = false
     /// Called right before the panel is shown — the next rebuild's gauges
     /// animate their fill once.
@@ -1330,13 +1372,10 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         sessionStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         icons.removeAll()
         sessionStack.addArrangedSubview(headerBar())
-        if let gauges = gaugesRow() {
-            sessionStack.addArrangedSubview(gauges)
+        if let plan = planRow() {
+            sessionStack.addArrangedSubview(plan)
         }
-        if let sys = sysRow() {
-            sessionStack.addArrangedSubview(sys)
-        }
-        if gaugeData != nil || sysStats != nil { sessionStack.addArrangedSubview(hairline()) }
+        if !planLimits.isEmpty { sessionStack.addArrangedSubview(hairline()) }
         pendingGaugeAnimation = false
         if !actions.isEmpty { sessionStack.addArrangedSubview(actionsBar()) }
         if sessions.isEmpty {
@@ -1389,7 +1428,9 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         }
         let title = label("\(sessions.count) \(sessions.count == 1 ? L("agent_one") : L("agents"))",
                           size: 13, color: .labelColor, bold: true)
-        var views: [NSView] = [title, NSView()]
+        // app version, tiny and dim, tucked next to the title
+        let ver = label("v\(appVersion)", size: 8, color: NSColor(white: 0.4, alpha: 1), bold: false)
+        var views: [NSView] = [title, ver, NSView()]
         if let g = gaugeData, g.t5.input + g.t5.output > 0 {
             let c = chip("⚡ " + fmtTokens(g.t5.input + g.t5.output))
             c.toolTip = L("tip_chip_tokens")
@@ -1484,104 +1525,59 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
         return v
     }
 
-    /// Ring + two "label value" lines, the building block of the gauge rows.
-    private func cluster(_ ring: RingGauge, _ l1: String, _ v1: String,
-                         _ l2: String, _ v2: String) -> NSView {
-        ring.animateOnAppear = pendingGaugeAnimation
-        func line(_ tag: String, _ value: String, dim: Bool) -> NSView {
-            let t = label(tag, size: 10, color: dim ? .tertiaryLabelColor : .secondaryLabelColor, bold: false)
-            t.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
-            t.widthAnchor.constraint(equalToConstant: 46).isActive = true
-            let v = label(value, size: 10, color: dim ? .secondaryLabelColor : .labelColor, bold: !dim)
-            v.font = .monospacedSystemFont(ofSize: 10, weight: dim ? .regular : .semibold)
-            let h = NSStackView(views: [t, v])
-            h.orientation = .horizontal
-            h.spacing = 4
-            return h
+    /// OFFICIAL plan usage — the same "Sesión actual / Todos los modelos /
+    /// Fable" percentages claude.ai shows in Settings > Usage: one slim
+    /// progress bar per limit (claude.ai-style) with the reset time at the
+    /// right; hovering shows the full reset date.
+    private func planRow() -> NSView? {
+        guard !planLimits.isEmpty else { return nil }
+        func gradient(_ lim: PlanLimit) -> [NSColor] {
+            if lim.severity == "exceeded" || lim.percent >= 95 { return [.systemOrange, .systemRed] }
+            if lim.severity == "warning" || lim.percent >= 80 { return [.systemYellow, .systemOrange] }
+            return [.systemBlue, .systemTeal]
         }
-        let colL = NSStackView(views: [line(l1, v1, dim: false), line(l2, v2, dim: true)])
-        colL.orientation = .vertical
-        colL.alignment = .leading
-        colL.spacing = 3
-        let h = NSStackView(views: [ring, colL])
-        h.orientation = .horizontal
-        h.spacing = 8
-        return h
-    }
-
-    /// Machine vitals: CPU (delta-based), RAM and disk as smaller rings.
-    private func sysRow() -> NSView? {
-        guard let s = sysStats else { return nil }
-        let rc = RingGauge(symbol: "⚙", symbolColor: .systemOrange,
-                           colors: [.systemOrange, .systemRed], diameter: 36)
-        rc.progress = CGFloat(s.cpu / 100)
-        let c1 = cluster(rc, "CPU", String(format: "%.0f%%", s.cpu),
-                         L("g_cores"), "\(s.cores)")
-        c1.toolTip = L("tip_sys_cpu")
-        let rm = RingGauge(symbol: "≣", symbolColor: .systemBlue,
-                           colors: [.systemBlue, .systemTeal], diameter: 36)
-        rm.progress = s.memTotal > 0 ? CGFloat(s.memUsed / s.memTotal) : 0
-        let c2 = cluster(rm, "RAM", fmtGB(s.memUsed),
-                         L("g_free"), fmtGB(max(0, s.memTotal - s.memUsed)))
-        c2.toolTip = L("tip_sys_ram")
-        let rd = RingGauge(symbol: "◍", symbolColor: .systemPurple,
-                           colors: [.systemPurple, .systemPink], diameter: 36)
-        rd.progress = s.diskTotal > 0 ? CGFloat((s.diskTotal - s.diskFree) / s.diskTotal) : 0
-        let c3 = cluster(rd, L("g_disk"), fmtGB(s.diskTotal - s.diskFree),
-                         L("g_free"), fmtGB(s.diskFree))
-        c3.toolTip = L("tip_sys_disk")
-        // app version, tiny and dim, always in sight next to the vitals
-        let ver = label("v\(appVersion)", size: 8, color: NSColor(white: 0.4, alpha: 1), bold: false)
-        let row = NSStackView(views: [c1, c2, c3, ver])
-        row.orientation = .horizontal
-        row.distribution = .equalSpacing
-        row.alignment = .bottom
-        row.spacing = 8
-        row.edgeInsets = NSEdgeInsets(top: 0, left: 4, bottom: 4, right: 12)
-        row.translatesAutoresizingMaskIntoConstraints = false
-        row.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
-        return row
-    }
-
-    /// The three gradient gauges: 5h usage vs weekly peak, 5h/7d cost share,
-    /// and active/total sessions — all fed by our own tracker, nothing faked.
-    private func gaugesRow() -> NSView? {
-        guard let g = gaugeData else { return nil }
-        let tok5 = g.t5.input + g.t5.output
-        let tok7 = g.t7d.input + g.t7d.output
-        guard tok7 > 0 || !sessions.isEmpty else { return nil }
-        let active = sessions.filter { $0.anyBusy }.count
-
-        let r1 = RingGauge(symbol: "✳", symbolColor: IndicatorView.claudeOrange,
-                           colors: [.systemBlue, .systemTeal])
-        r1.progress = g.peak5h > 0 ? CGFloat(tok5) / CGFloat(g.peak5h) : 0
-        let r2 = RingGauge(symbol: "$", symbolColor: .systemGreen,
-                           colors: [.systemGreen, .systemTeal])
-        r2.progress = g.t7d.cost > 0 ? CGFloat(g.t5.cost / g.t7d.cost) : 0
-        let r3 = RingGauge(symbol: "⬡", symbolColor: IndicatorView.codexTeal,
-                           colors: [.systemPurple, .systemBlue])
-        r3.progress = sessions.isEmpty ? 0 : CGFloat(active) / CGFloat(sessions.count)
-
-        // "≈" marks the money as an API-price estimate — with a subscription
-        // it is NOT what the user pays (the tooltip spells it out)
-        let c1 = cluster(r1, "5h", fmtTokens(tok5), "7d", fmtTokens(tok7))
-        c1.toolTip = L("tip_gauge_usage")
-        let c2 = cluster(r2, "5h", String(format: "≈$%.2f", g.t5.cost),
-                         "7d", String(format: "≈$%.2f", g.t7d.cost))
-        c2.toolTip = L("tip_gauge_cost")
-        let c3 = cluster(r3, L("g_active"), "\(active)", L("g_total"), "\(sessions.count)")
-        c3.toolTip = L("tip_gauge_sessions")
-
-        // equalSpacing (no floating spacer views): the clusters land in their
-        // final spots on the first layout pass instead of drifting left
-        let row = NSStackView(views: [c1, c2, c3])
-        row.orientation = .horizontal
-        row.distribution = .equalSpacing
-        row.spacing = 8
-        row.edgeInsets = NSEdgeInsets(top: 2, left: 4, bottom: 4, right: 12)
-        row.translatesAutoresizingMaskIntoConstraints = false
-        row.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
-        return row
+        let col = NSStackView()
+        col.orientation = .vertical
+        col.alignment = .leading
+        col.spacing = 6
+        col.edgeInsets = NSEdgeInsets(top: 0, left: 4, bottom: 2, right: 12)
+        for lim in planLimits.prefix(3) {
+            let name: String, tip: String
+            switch lim.kind {
+            case "session": name = L("g_session"); tip = L("tip_plan_session")
+            case "weekly_all": name = L("g_week"); tip = L("tip_plan_week")
+            default:
+                name = lim.label.isEmpty ? L("g_week") : lim.label
+                tip = L("tip_plan_model")
+            }
+            let tag = label(name, size: 10, color: .secondaryLabelColor, bold: false)
+            tag.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+            tag.widthAnchor.constraint(equalToConstant: 52).isActive = true
+            let bar = BarGauge(colors: gradient(lim))
+            bar.progress = CGFloat(min(100, max(0, lim.percent)) / 100)
+            bar.animateOnAppear = pendingGaugeAnimation
+            let pct = label(String(format: "%.0f%%", lim.percent), size: 10, color: .labelColor, bold: true)
+            pct.font = .monospacedSystemFont(ofSize: 10, weight: .semibold)
+            pct.alignment = .right
+            pct.widthAnchor.constraint(equalToConstant: 34).isActive = true
+            let reset = label("\u{21BA} " + (lim.resetsAt.map(fmtReset) ?? "\u{2014}"), size: 9,
+                              color: .tertiaryLabelColor, bold: false)
+            reset.font = .monospacedSystemFont(ofSize: 9, weight: .regular)
+            reset.widthAnchor.constraint(equalToConstant: 96).isActive = true
+            let row = NSStackView(views: [tag, bar, pct, reset])
+            row.orientation = .horizontal
+            row.spacing = 8
+            var t = tip
+            if let r = lim.resetsAt { t += "\n" + L("plan_resets") + " " + fmtResetLong(r) }
+            row.toolTip = t
+            col.addArrangedSubview(row)
+            // fixed row width = column width minus the 4+12 edge insets, so
+            // the bar (the only flexible view) stretches to fill the line
+            row.widthAnchor.constraint(equalToConstant: contentWidth - 16).isActive = true
+        }
+        col.translatesAutoresizingMaskIntoConstraints = false
+        col.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
+        return col
     }
 
     /// One small button per saved action — click runs it in the notch terminal.
@@ -2248,80 +2244,51 @@ final class FirstMouseButton: NSButton {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
-/// Gradient progress ring (donut gauge, agentnotch-style): the arc starts at
-/// the lower-left, sweeps over the top and ends lower-right, leaving a gap at
-/// the bottom like a speedometer. The fill animates in the first time the
-/// panel opens; later list rebuilds just set the value. Pure Core Animation.
-final class RingGauge: NSView {
+/// Slim gradient progress bar (claude.ai-style) for the plan gauges: dark
+/// rounded track, gradient fill sized by percent. Pure layers, no timers; the
+/// fill animates in the first time the panel opens.
+final class BarGauge: NSView {
     var progress: CGFloat = 0
     var animateOnAppear = false
-    private let track = CAShapeLayer()
-    private let fillMask = CAShapeLayer()
-    private let grad = CAGradientLayer()
-    private let center = NSTextField(labelWithString: "")
-    private let lineW: CGFloat = 4
+    private let track = CALayer()
+    private let fill = CAGradientLayer()
+    private let barH: CGFloat = 5
 
-    init(symbol: String, symbolColor: NSColor, colors: [NSColor], diameter: CGFloat = 46) {
+    init(colors: [NSColor]) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
-        widthAnchor.constraint(equalToConstant: diameter).isActive = true
-        heightAnchor.constraint(equalToConstant: diameter).isActive = true
+        heightAnchor.constraint(equalToConstant: barH).isActive = true
+        widthAnchor.constraint(greaterThanOrEqualToConstant: 60).isActive = true
         wantsLayer = true
-        for shape in [track, fillMask] {
-            shape.fillColor = NSColor.clear.cgColor
-            shape.lineWidth = lineW
-            shape.lineCap = .round
-        }
-        track.strokeColor = NSColor(white: 0.18, alpha: 1).cgColor
+        track.backgroundColor = NSColor(white: 0.16, alpha: 1).cgColor
+        track.cornerRadius = barH / 2
         layer?.addSublayer(track)
-        grad.colors = colors.map(\.cgColor)
-        grad.startPoint = CGPoint(x: 0, y: 0)
-        grad.endPoint = CGPoint(x: 1, y: 1)
-        fillMask.strokeColor = NSColor.white.cgColor
-        fillMask.strokeEnd = 0
-        grad.mask = fillMask
-        layer?.addSublayer(grad)
-        center.stringValue = symbol
-        center.font = .systemFont(ofSize: 13, weight: .semibold)
-        center.textColor = symbolColor
-        center.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(center)
-        NSLayoutConstraint.activate([
-            center.centerXAnchor.constraint(equalTo: centerXAnchor),
-            center.centerYAnchor.constraint(equalTo: centerYAnchor),
-        ])
+        fill.colors = colors.map(\.cgColor)
+        fill.startPoint = CGPoint(x: 0, y: 0.5)
+        fill.endPoint = CGPoint(x: 1, y: 0.5)
+        fill.cornerRadius = barH / 2
+        fill.anchorPoint = .zero  // grows from the left when animated
+        layer?.addSublayer(fill)
     }
     required init?(coder: NSCoder) { nil }
 
     override func layout() {
         super.layout()
-        guard let host = layer else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        track.frame = host.bounds
-        grad.frame = host.bounds
-        fillMask.frame = host.bounds
-        let c = CGPoint(x: host.bounds.midX, y: host.bounds.midY)
-        let r = min(host.bounds.width, host.bounds.height) / 2 - lineW / 2 - 1
-        let path = CGMutablePath()
-        // 225° → -45° clockwise: lower-left, over the top, to lower-right
-        path.addArc(center: c, radius: r, startAngle: 5 * .pi / 4, endAngle: -.pi / 4, clockwise: true)
-        track.path = path
-        fillMask.path = path
-        fillMask.strokeEnd = max(0.02, min(1, progress))
+        track.frame = bounds
+        let w = bounds.width * max(0.015, min(1, progress))
+        fill.frame = NSRect(x: 0, y: 0, width: w, height: bounds.height)
         CATransaction.commit()
-    }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        guard window != nil, animateOnAppear else { return }
-        animateOnAppear = false
-        let a = CABasicAnimation(keyPath: "strokeEnd")
-        a.fromValue = 0
-        a.toValue = max(0.02, min(1, progress))
-        a.duration = 0.7
-        a.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        fillMask.add(a, forKey: "fill")
+        if animateOnAppear, bounds.width > 0, window != nil {
+            animateOnAppear = false
+            let a = CABasicAnimation(keyPath: "bounds.size.width")
+            a.fromValue = 0
+            a.toValue = w
+            a.duration = 0.7
+            a.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            fill.add(a, forKey: "grow")
+        }
     }
 }
 
@@ -2660,6 +2627,204 @@ final class QuickFoldersPane: NSView, NSTableViewDataSource, NSTableViewDelegate
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
         guard let idx = itemIndex(forRow: row) else { return nil }  // ".." doesn't drag
         return items[idx] as NSURL
+    }
+}
+
+/// ⌘S pane: the SSH connections already configured on this Mac, read from
+/// ~/.ssh/config (Host blocks, following Include directives — the same list
+/// VS Code Remote-SSH shows). Double-click or ↩ types `ssh <host>` into the
+/// focused terminal pane.
+final class SSHHostsPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
+    struct Entry { let alias: String; let detail: String }
+    private var hosts: [Entry] = []
+    private let table = FBTableView()
+    private let headerLabel = NSTextField(labelWithString: "")
+    /// Fired with the host alias when the user picks a connection.
+    var onConnect: ((String) -> Void)?
+
+    init() {
+        super.init(frame: NSRect(x: 0, y: 0, width: 220, height: 300))
+        hosts = Self.parseHosts()
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.black.cgColor
+        widthAnchor.constraint(greaterThanOrEqualToConstant: 200).isActive = true
+        // mini title bar matching the quick-folders pane: "ssh · N"
+        let crumb = NSMutableAttributedString()
+        crumb.append(NSAttributedString(
+            string: "ssh",
+            attributes: [.foregroundColor: neonMint,
+                         .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold)]))
+        crumb.append(NSAttributedString(
+            string: "  ·  \(hosts.count)",
+            attributes: [.foregroundColor: NSColor(white: 0.4, alpha: 1),
+                         .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)]))
+        headerLabel.attributedStringValue = crumb
+        headerLabel.lineBreakMode = .byTruncatingHead
+        headerLabel.translatesAutoresizingMaskIntoConstraints = false
+        let headerRule = NSView()
+        headerRule.wantsLayer = true
+        headerRule.layer?.backgroundColor = NSColor(white: 1, alpha: 0.07).cgColor
+        headerRule.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(headerLabel)
+        addSubview(headerRule)
+        table.addTableColumn(NSTableColumn(identifier: .init("host")))
+        table.headerView = nil
+        table.backgroundColor = .black
+        table.rowHeight = 26
+        table.style = .plain
+        table.dataSource = self
+        table.delegate = self
+        table.target = self
+        table.doubleAction = #selector(connectRow)
+        table.onReturn = { [weak self] in self?.connectRow() }
+        let scroll = NSScrollView()
+        scroll.documentView = table
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(scroll)
+        NSLayoutConstraint.activate([
+            headerLabel.topAnchor.constraint(equalTo: topAnchor, constant: 6),
+            headerLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            headerLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            headerRule.topAnchor.constraint(equalTo: headerLabel.bottomAnchor, constant: 4),
+            headerRule.leadingAnchor.constraint(equalTo: leadingAnchor),
+            headerRule.trailingAnchor.constraint(equalTo: trailingAnchor),
+            headerRule.heightAnchor.constraint(equalToConstant: 1),
+            scroll.topAnchor.constraint(equalTo: headerRule.bottomAnchor, constant: 2),
+            scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+        if hosts.isEmpty {
+            let empty = NSTextField(wrappingLabelWithString: L("ssh_empty"))
+            empty.textColor = NSColor(white: 0.45, alpha: 1)
+            empty.font = .monospacedSystemFont(ofSize: 10.5, weight: .regular)
+            empty.alignment = .center
+            empty.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(empty)
+            NSLayoutConstraint.activate([
+                empty.centerYAnchor.constraint(equalTo: centerYAnchor),
+                empty.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+                empty.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            ])
+        }
+    }
+    required init?(coder: NSCoder) { nil }
+
+    @objc private func connectRow() {
+        let row = table.clickedRow >= 0 ? table.clickedRow : table.selectedRow
+        guard row >= 0, row < hosts.count else { return }
+        onConnect?(hosts[row].alias)
+    }
+
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        let rv = RoundedRowView()
+        rv.accent = neonMint
+        return rv
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { hosts.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard row < hosts.count else { return nil }
+        let e = hosts[row]
+        let cell = NSTableCellView()
+        let icon = NSImageView()
+        icon.image = NSImage(systemSymbolName: "network", accessibilityDescription: "ssh")
+        icon.contentTintColor = neonMint.withAlphaComponent(0.8)
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        let text = NSMutableAttributedString(
+            string: e.alias,
+            attributes: [.foregroundColor: NSColor(white: 0.92, alpha: 1),
+                         .font: NSFont.monospacedSystemFont(ofSize: 11.5, weight: .medium)])
+        if !e.detail.isEmpty {
+            text.append(NSAttributedString(
+                string: "  \(e.detail)",
+                attributes: [.foregroundColor: NSColor(white: 0.45, alpha: 1),
+                             .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)]))
+        }
+        let name = NSTextField(labelWithString: "")
+        name.attributedStringValue = text
+        name.lineBreakMode = .byTruncatingTail
+        name.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(icon)
+        cell.addSubview(name)
+        NSLayoutConstraint.activate([
+            icon.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
+            icon.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 15),
+            icon.heightAnchor.constraint(equalToConstant: 15),
+            name.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 7),
+            name.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
+            name.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+        ])
+        return cell
+    }
+
+    // ── ~/.ssh/config parsing ─────────────────────────────────────────────
+    /// Host aliases in file order, first definition wins (ssh semantics).
+    /// Wildcard patterns (`*`, `?`) and negations are skipped — they're
+    /// defaults, not connections.
+    private static func parseHosts() -> [Entry] {
+        var blocks: [(aliases: [String], opts: [String: String])] = []
+        let cfg = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".ssh/config")
+        parseConfig(at: cfg, depth: 0, into: &blocks)
+        var seen = Set<String>()
+        var out: [Entry] = []
+        for b in blocks {
+            for alias in b.aliases {
+                guard !alias.contains("*"), !alias.contains("?"), !alias.hasPrefix("!"),
+                      seen.insert(alias.lowercased()).inserted else { continue }
+                var detail = b.opts["hostname"] ?? ""
+                if let user = b.opts["user"], !detail.isEmpty { detail = "\(user)@\(detail)" }
+                if let port = b.opts["port"], !detail.isEmpty, port != "22" { detail += ":\(port)" }
+                out.append(Entry(alias: alias, detail: detail == alias ? "" : detail))
+            }
+        }
+        return out
+    }
+
+    private static func parseConfig(at url: URL, depth: Int,
+                                    into blocks: inout [(aliases: [String], opts: [String: String])]) {
+        guard depth < 5, let text = try? String(contentsOf: url, encoding: .utf8) else { return }
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty, !line.hasPrefix("#") else { continue }
+            // "Key value…" — ssh also accepts "Key=value"
+            let parts = line.replacingOccurrences(of: "=", with: " ")
+                .split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+            guard parts.count >= 2, let key = parts.first?.lowercased() else { continue }
+            let values = Array(parts.dropFirst())
+            switch key {
+            case "include":
+                for pattern in values {
+                    let expanded = (pattern as NSString).expandingTildeInPath
+                    let full = expanded.hasPrefix("/") ? expanded
+                        : FileManager.default.homeDirectoryForCurrentUser
+                            .appendingPathComponent(".ssh/\(expanded)").path
+                    for match in globPaths(full) {
+                        parseConfig(at: URL(fileURLWithPath: match), depth: depth + 1, into: &blocks)
+                    }
+                }
+            case "host":
+                blocks.append((aliases: values, opts: [:]))
+            case "match":
+                blocks.append((aliases: [], opts: [:]))  // stop attributing options to the previous Host
+            default:
+                if !blocks.isEmpty, blocks[blocks.count - 1].opts[key] == nil {
+                    blocks[blocks.count - 1].opts[key] = values.joined(separator: " ")
+                }
+            }
+        }
+    }
+
+    private static func globPaths(_ pattern: String) -> [String] {
+        var g = glob_t()
+        defer { globfree(&g) }
+        guard glob(pattern, 0, nil, &g) == 0 else { return [] }
+        return (0..<Int(g.gl_pathc)).compactMap { g.gl_pathv[$0].map { String(cString: $0) } }
     }
 }
 
@@ -3232,11 +3397,79 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
 /// Terminal pane that accepts dragged files/folders: their shell-quoted
 /// paths are typed into the shell, like every serious terminal does.
 final class DropTerminalView: LocalProcessTerminalView {
+    private var downPoint: NSPoint = .zero
+    private var downHadSelection = false
+
     override init(frame: CGRect) {
         super.init(frame: frame)
         registerForDraggedTypes([.fileURL])
     }
     required init?(coder: NSCoder) { super.init(coder: coder) }
+
+    override func mouseDown(with event: NSEvent) {
+        downPoint = convert(event.locationInWindow, from: nil)
+        downHadSelection = selectionActive
+        super.mouseDown(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        super.mouseUp(with: event)
+        moveCursorToClick(event)
+    }
+
+    /// Plain click moves the shell cursor to the clicked cell: the cell
+    /// delta from the caret is replayed as arrow keys, so the shell/editor
+    /// stays in charge and nothing breaks when it refuses the move.
+    private func moveCursorToClick(_ event: NSEvent) {
+        let terminal = getTerminal()
+        // hands off when the app captures the mouse itself (vim mouse=a,
+        // htop…), during selections, or on modified / double clicks
+        guard event.clickCount == 1,
+              event.modifierFlags.intersection([.command, .shift, .option, .control]).isEmpty,
+              terminal.mouseMode == .off,
+              !selectionActive, !downHadSelection,
+              let caret = subviews.first(where: {
+                  String(describing: type(of: $0)).contains("CaretView")
+              }),
+              !caret.isHidden, caret.frame.width > 0, caret.frame.height > 0
+        else { return }
+        let p = convert(event.locationInWindow, from: nil)
+        guard hypot(p.x - downPoint.x, p.y - downPoint.y) < 3 else { return }  // drag, not click
+        // the caret view is exactly one cell — its size doubles as the cell
+        // metric and its center as the cursor position, scroll included
+        let cellW = caret.frame.width, cellH = caret.frame.height
+        var clickCol = Int(floor(p.x / cellW))
+        let clickRow = Int(floor((bounds.height - p.y) / cellH))
+        let caretCol = Int(floor(caret.frame.midX / cellW))
+        let caretRow = Int(floor((bounds.height - caret.frame.midY) / cellH))
+        let app = terminal.applicationCursor
+        func arrows(_ n: Int, fwd: String, back: String) -> String {
+            n == 0 ? "" : String(repeating: n > 0 ? fwd : back, count: min(abs(n), 300))
+        }
+        let seq: String
+        if terminal.isCurrentBufferAlternate {
+            // full-screen apps (vim…): rows are independent lines — move
+            // vertically first, then horizontally
+            seq = arrows(clickRow - caretRow, fwd: app ? "\u{1b}OB" : "\u{1b}[B",
+                                             back: app ? "\u{1b}OA" : "\u{1b}[A")
+                + arrows(clickCol - caretCol, fwd: app ? "\u{1b}OC" : "\u{1b}[C",
+                                              back: app ? "\u{1b}OD" : "\u{1b}[D")
+        } else {
+            // shell prompt: the input is one logical (possibly wrapped) line,
+            // so pure ←/→ walks it. Clicking blank rows is just focus, and
+            // clamping to the clicked line's text end avoids spamming arrows
+            // (and bells) into the void past the end of the input.
+            let lineLen = terminal.getLine(row: clickRow)?
+                .translateToString(trimRight: true).count ?? 0
+            guard lineLen > 0 || clickRow == caretRow else { return }
+            clickCol = min(clickCol, lineLen)
+            let delta = (clickRow - caretRow) * terminal.cols + (clickCol - caretCol)
+            seq = arrows(delta, fwd: app ? "\u{1b}OC" : "\u{1b}[C",
+                                back: app ? "\u{1b}OD" : "\u{1b}[D")
+        }
+        if !seq.isEmpty { send(txt: seq) }
+    }
+
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         guard let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL],
@@ -3734,6 +3967,83 @@ final class TermDragStrip: NSView {
     }
 }
 
+/// Bottom-corner resize grip for the notch terminal: a short arc hugging the
+/// rounded corner, slightly brighter than the window border (and brighter
+/// still on hover), with a real 26×26 grab area — the borderless window's own
+/// resize edge is only a few px wide and hard to hit.
+final class TermCornerGrip: NSView {
+    private let isLeft: Bool
+    private var hovered = false { didSet { needsDisplay = true } }
+    private var startSize = NSSize.zero
+    private var startMouse = NSPoint.zero
+
+    init(isLeft: Bool) {
+        self.isLeft = isLeft
+        super.init(frame: .zero)
+    }
+    required init?(coder: NSCoder) { nil }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds,
+                                       options: [.mouseEnteredAndExited, .cursorUpdate, .activeAlways],
+                                       owner: self))
+        super.updateTrackingAreas()
+    }
+    override func mouseEntered(with event: NSEvent) { hovered = true }
+    override func mouseExited(with event: NSEvent) { hovered = false }
+    override func cursorUpdate(with event: NSEvent) {
+        if #available(macOS 15.0, *) {
+            NSCursor.frameResize(position: isLeft ? .bottomLeft : .bottomRight,
+                                 directions: .all).set()
+        } else {
+            NSCursor.crosshair.set()
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        // quarter arc just inside the container's 16px rounded corner
+        let r: CGFloat = 13
+        let inset: CGFloat = 2.5
+        let p = NSBezierPath()
+        if isLeft {
+            p.appendArc(withCenter: NSPoint(x: inset + r, y: inset + r),
+                        radius: r, startAngle: 180, endAngle: 270)
+        } else {
+            p.appendArc(withCenter: NSPoint(x: bounds.width - inset - r, y: inset + r),
+                        radius: r, startAngle: 270, endAngle: 360)
+        }
+        p.lineWidth = hovered ? 3 : 2
+        p.lineCapStyle = .round
+        (hovered ? NSColor(white: 0.9, alpha: 0.95) : NSColor(white: 0.5, alpha: 0.8)).setStroke()
+        p.stroke()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let w = window else { return }
+        startSize = w.frame.size
+        startMouse = NSEvent.mouseLocation
+    }
+    override func mouseDragged(with event: NSEvent) {
+        guard let w = window else { return }
+        let loc = NSEvent.mouseLocation
+        var f = w.frame
+        // the window re-centers under the notch on every resize, so width
+        // grows symmetrically (×2 keeps the corner under the pointer);
+        // dragging down grows height — the top edge stays glued to the notch
+        let dw = (loc.x - startMouse.x) * (isLeft ? -2 : 2)
+        f.size.width = max(w.minSize.width, startSize.width + dw)
+        f.size.height = max(w.minSize.height, startSize.height - (loc.y - startMouse.y))
+        if let s = w.screen ?? NSScreen.main {
+            f.size.width = min(f.size.width, s.frame.width)
+            f.size.height = min(f.size.height, s.frame.height - 40)
+        }
+        w.setFrame(f, display: true)
+    }
+}
+
 final class NotchView: NSView {
     var expanded = false { didSet { needsDisplay = true } }
     var barHeight: CGFloat = 32
@@ -3802,7 +4112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // for 2 consecutive polls (~6 s) before its session stops being live
     private var missCounts: [String: Int] = [:]
     private let usage = UsageTracker()  // touched only on scanQueue
-    private let sysMon = SystemMonitor()  // touched only on scanQueue
+    private let planUsage = PlanUsageFetcher()  // official plan %, network + keychain off-main
     private let listController = SessionListController()
     private var frame = 0
     private var claudeWasLive = false
@@ -3812,6 +4122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var expanded = false
     private var hotKeyRef: EventHotKeyRef?
     private var hoverTicks = 0
+    private var keyGrabTicks = 0  // mouse resting on the open panel → take key
     private var hoverOpened = false  // opened by hover → auto-close on mouse-leave
     private var zoomed = false       // sticky-open panel grows 25% under the mouse
     private var soundDone = false
@@ -3848,12 +4159,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var termPanes: [TermPane] = []
     private var fileBrowser: FileBrowserPane?
     private var quickFolders: QuickFoldersPane?
+    private var sshHosts: SSHHostsPane?
     // in-terminal ⌘-keys (configurable): split / files pane / quick folders
-    private var keySplit = "d", keyFiles = "f", keyFolders = "e"
+    private var keySplit = "d", keyFiles = "f", keyFolders = "e", keySSH = "s"
     private var panelHotkeyPopupRef: NSPopUpButton?
     private var splitKeyPopupRef: NSPopUpButton?
     private var filesKeyPopupRef: NSPopUpButton?
     private var foldersKeyPopupRef: NSPopUpButton?
+    private var sshKeyPopupRef: NSPopUpButton?
     private var termHotkeyPopupRef: NSPopUpButton?
     private var loginCheckRef: NSButton?
     private weak var menubarCheckRef: NSButton?
@@ -3984,6 +4297,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         listController.onFocusAsk = { [weak self] ask in self?.focusTerminalFor(ask) }
         listController.onPermission = { [weak self] ask, decision in self?.answerAsk(ask, decision: decision) }
         listController.onAction = { [weak self] cmd in self?.runSavedAction(cmd) }
+        planUsage.onUpdate = { [weak self] in
+            guard let self else { return }
+            self.listController.planLimits = self.planUsage.limits
+            // repaint right away if the panel is open; otherwise the next
+            // 3 s poll rebuild picks it up
+            if self.expanded { self.listController.panelWillShow() }
+        }
 
         // Global hotkey ⌃⌥N toggles the panel. Carbon RegisterEventHotKey works
         // without Accessibility/Input-Monitoring permission, unlike key monitors.
@@ -4083,6 +4403,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.setExpanded(false)
             return e
         }
+        // Keys while the panel is open and key (a notification auto-open takes
+        // key, so these work right away): esc dismisses it — same as moving
+        // the mouse outside; "c" = the 🧹 button, sweeping stale asks and
+        // finished sessions. "c" only fires when nothing is being typed — a
+        // "c" in the reply field stays a "c".
+        NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] e in
+            guard let self, self.expanded, e.window === self.window else { return e }
+            if e.keyCode == 53 {  // esc
+                self.hoverOpened = false
+                self.setExpanded(false)
+                return nil
+            }
+            guard e.charactersIgnoringModifiers?.lowercased() == "c",
+                  e.modifierFlags.intersection([.command, .option, .control]).isEmpty,
+                  !(self.window.firstResponder is NSTextView)
+            else { return e }
+            self.cleanupStale()
+            return nil
+        }
         if menubarMode {
             setupStatusItem()
             window.ignoresMouseEvents = true  // shown only while expanded
@@ -4159,9 +4498,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setExpanded(_ on: Bool) {
         guard expanded != on else { return }
         expanded = on
-        zoomed = false
+        // single state: the panel always opens at the big size (the old
+        // hover-to-grow second state is gone)
+        zoomed = on
         if on { readSavedActions() }  // pick up external edits to the actions file
-        listController.zoomFactor = 1
+        listController.zoomFactor = on ? 1 + zoomPct / 100 : 1
         listController.contentWidth = panelContentWidth()
         if on { listController.panelWillShow() }  // gauges animate their fill once
         // Attach the list only while expanded — its Auto Layout content would
@@ -4344,12 +4685,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let g5 = self.usage.window(hours: 5)
             let g7d = self.usage.window(hours: 7 * 24)
             let peak = self.usage.peak5hTokens()
-            let sys = self.sysMon.sample()
+            self.planUsage.refreshIfStale()  // official claude.ai percentages, throttled to 5 min
             DispatchQueue.main.async {
                 self.scanInFlight = false
                 self.pidByCwd = pidMap
                 self.listController.gaugeData = (t5: g5, t7d: g7d, peak5h: peak)
-                self.listController.sysStats = sys
                 // Track fullscreen-space changes: full-width bar when the menu bar is hidden
                 if !self.expanded, !self.animating {
                     if self.window.frame != self.collapsedFrame() {
@@ -4444,6 +4784,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if !expanded { setExpanded(true) }
             NSApp.activate(ignoringOtherApps: true)
             window.makeKeyAndOrderFront(nil)
+            // leave no field focused: esc/"c" must work right away; clicking
+            // the reply field still focuses it on the first click
+            window.makeFirstResponder(nil)
         }
     }
 
@@ -4700,6 +5043,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // the status item (or hotkey)
         if menubarMode { return }
         let loc = NSEvent.mouseLocation
+        // Focus follows the mouse into the open panel: resting on it (~0.25 s)
+        // takes key, so esc/"c" work wherever the pointer is over the notch —
+        // not only after clicking a control. The two-tick wait keeps a mere
+        // pass-through from yanking focus off the app the user is typing in,
+        // and once the window IS key nothing is re-grabbed (a click into the
+        // reply field keeps its focus).
+        if expanded, window.frame.contains(loc) {
+            keyGrabTicks += 1
+            if keyGrabTicks >= 2, !window.isKeyWindow {
+                NSApp.activate(ignoringOtherApps: true)
+                window.makeKeyAndOrderFront(nil)
+                window.makeFirstResponder(nil)  // keys go to the panel, not a field
+            }
+        } else { keyGrabTicks = 0 }
         if !expanded {
             if indicatorScreenRect.insetBy(dx: -4, dy: 0).contains(loc) {
                 hoverTicks += 1
@@ -4719,33 +5076,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else if !window.frame.insetBy(dx: -24, dy: -24).contains(loc) {
                 hoverOpened = false
                 setExpanded(false)
-            } else {
-                setZoomed(window.frame.contains(loc))  // hover-opens zoom too
             }
-        } else {
-            // sticky opens (click/hotkey): hovering grows the panel
-            setZoomed(window.frame.contains(loc))
         }
     }
 
-    /// Grow the open panel 25% while the mouse is over it; shrink back when it
-    /// leaves. Only for sticky opens — hover-opens already auto-dismiss.
-    /// Width available to the panel's text at the current zoom state.
+    /// Width available to the panel's text (the panel always opens zoomed).
     private func panelContentWidth() -> CGFloat {
         let z: CGFloat = zoomed ? 1 + zoomPct / 100 : 1.0
         return max(expandedSize.width, notchWidth + sidePad * 2) * z - 40
-    }
-
-    private func setZoomed(_ on: Bool) {
-        guard expanded, zoomed != on, !animating else { return }
-        zoomed = on
-        listController.contentWidth = panelContentWidth()
-        listController.zoomFactor = on ? 1 + zoomPct / 100 : 1  // rebuilds with scaled text
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.18
-            ctx.timingFunction = CAMediaTimingFunction(name: on ? .easeOut : .easeIn)
-            window.animator().setFrame(expandedFrame(), display: true)
-        }
     }
 
     private func render() {
@@ -4801,6 +5139,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case self.keySplit: self.addTerminalPane(); return true
             case self.keyFiles: self.toggleFileBrowser(); return true
             case self.keyFolders: self.toggleQuickFolders(); return true
+            case self.keySSH: self.toggleSSHHosts(); return true
             default: return false
             }
         }
@@ -4852,6 +5191,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         container.addSubview(split)
         container.addSubview(strip)
         container.addSubview(closeBtn)
+        let gripS: CGFloat = 26
+        let gripL = TermCornerGrip(isLeft: true)
+        gripL.frame = NSRect(x: 0, y: 0, width: gripS, height: gripS)
+        gripL.autoresizingMask = [.maxXMargin, .maxYMargin]
+        let gripR = TermCornerGrip(isLeft: false)
+        gripR.frame = NSRect(x: tw - gripS, y: 0, width: gripS, height: gripS)
+        gripR.autoresizingMask = [.minXMargin, .maxYMargin]
+        container.addSubview(gripL)
+        container.addSubview(gripR)
         panel.contentView = container
         termWindow = panel
         termSplit = split
@@ -5020,6 +5368,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         zle -N accept-line _notch_accept_line
         """
         try? rc.write(to: dir.appendingPathComponent(".zshrc"), atomically: true, encoding: .utf8)
+        // zsh reads .zshenv and .zprofile from $ZDOTDIR — ours only had a
+        // .zshrc, so the user's ~/.zshenv and ~/.zprofile were silently
+        // skipped. ~/.zprofile is where Homebrew's shellenv and ~/.local/bin
+        // (the current Claude Code install) usually land, so without it an
+        // older binary elsewhere on PATH won inside the notch terminal even
+        // though Warp/Terminal picked the new one. Chain to the real files.
+        try? "[ -f \"$HOME/.zshenv\" ] && source \"$HOME/.zshenv\"\n"
+            .write(to: dir.appendingPathComponent(".zshenv"), atomically: true, encoding: .utf8)
+        try? "[ -f \"$HOME/.zprofile\" ] && source \"$HOME/.zprofile\"\n"
+            .write(to: dir.appendingPathComponent(".zprofile"), atomically: true, encoding: .utf8)
         return dir
     }
 
@@ -5267,6 +5625,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         termPanes.removeAll()
         fileBrowser = nil
         quickFolders = nil
+        sshHosts = nil
         removeIAKeyMonitor()
         iaCard = nil  // its superview is being discarded with the window
         termWindow?.orderOut(nil)
@@ -5297,6 +5656,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { [weak split, weak qf] in
             split?.setPosition(230, ofDividerAt: 0)
             qf.map { AppDelegate.slideIn($0) }
+        }
+    }
+
+    /// ⌘S: toggle the SSH-connections pane (hosts from ~/.ssh/config, VS
+    /// Code-style). Picking one types `ssh <host>` into the focused pane.
+    @objc fileprivate func toggleSSHHosts() {
+        guard let split = termSplit else { return }
+        if let sp = sshHosts {
+            sp.removeFromSuperview()
+            sshHosts = nil
+            split.adjustSubviews()
+            return
+        }
+        let sp = SSHHostsPane()
+        sp.onConnect = { [weak self] alias in
+            guard let self, let term = self.focusedTerminal else { return }
+            let safe = alias.replacingOccurrences(of: "'", with: "'\\''")
+            // ^U first: a half-typed line must not corrupt the ssh command
+            term.send(txt: "\u{15}ssh '\(safe)'\r")
+            self.termWindow?.makeFirstResponder(term)
+        }
+        sshHosts = sp
+        split.insertArrangedSubview(sp, at: 0)
+        split.setHoldingPriority(NSLayoutConstraint.Priority(260), forSubviewAt: 0)
+        split.adjustSubviews()
+        DispatchQueue.main.async { [weak split, weak sp] in
+            split?.setPosition(230, ofDividerAt: 0)
+            sp.map { AppDelegate.slideIn($0) }
         }
     }
 
@@ -5409,6 +5796,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         filesKeyPopupRef = filesPop
         let foldersPop = keyPopup(keyFolders)
         foldersKeyPopupRef = foldersPop
+        let sshPop = keyPopup(keySSH)
+        sshKeyPopupRef = sshPop
 
         pendTermDir = (try? String(contentsOf: configURL("term-dir"), encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -5578,7 +5967,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let terminalTab = group([
             row(L("term_hotkey"), [hotkeyPopup]),
             row(L("term_keys"), [splitPop, smallLabel(L("key_split")), filesPop, smallLabel(L("key_files")),
-                                 foldersPop, smallLabel(L("key_folders"))]),
+                                 foldersPop, smallLabel(L("key_folders")), sshPop, smallLabel(L("key_ssh"))]),
             row(L("term_dir"), [termDirLbl, button(L("choose_dir"), #selector(chooseTermDir)),
                                 button(L("clear_dir"), #selector(clearTermDir))]),
             row(L("term_font"), [fontPopup, fontSize, smallLabel("pt")]),
@@ -5697,6 +6086,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         saveKey(splitKeyPopupRef, "key-split")
         saveKey(filesKeyPopupRef, "key-files")
         saveKey(foldersKeyPopupRef, "key-folders")
+        saveKey(sshKeyPopupRef, "key-ssh")
         readTermKeys()
         writeConfig("term-dir", pendTermDir)
         // isEnabled guards the race: Save clicked before /api/tags answered
@@ -6097,7 +6487,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ("ctrl_opt_j", "⌃⌥ J", UInt32(kVK_ANSI_J), UInt32(controlKey | optionKey)),
     ]
 
-    static let termKeyLetters = ["D", "E", "F", "G", "J", "K", "L", "O", "P", "U"]
+    static let termKeyLetters = ["D", "E", "F", "G", "J", "K", "L", "O", "P", "S", "U"]
 
     private func currentPanelHotkeyID() -> String {
         (try? String(contentsOf: configURL("panel-hotkey"), encoding: .utf8))?
@@ -6122,6 +6512,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         keySplit = cfgLetter("key-split", "d")
         keyFiles = cfgLetter("key-files", "f")
         keyFolders = cfgLetter("key-folders", "e")
+        keySSH = cfgLetter("key-ssh", "s")
     }
 
     static let termHotkeyOptions: [(id: String, label: String, key: UInt32, mods: UInt32)] = [
