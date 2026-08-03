@@ -7,7 +7,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.45"
+let appVersion = "2.9.46"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -204,6 +204,8 @@ enum L10n {
         "terminal": ["Notch terminal", "Terminal del notch"],
         "term_hotkey": ["Terminal shortcut:", "Atajo de terminal:"],
         "term_dir": ["Terminal start folder:", "Carpeta inicial de la terminal:"],
+        "files_dir": ["Files start folder (⌘F):", "Carpeta de archivos (⌘F):"],
+        "files_dir_same": ["same as terminal", "igual que la terminal"],
         "term_size": ["Terminal size (% of screen):", "Tamaño de la terminal (% de pantalla):"],
         "panel_alpha": ["Panel opacity (%):", "Opacidad del panel (%):"],
         "term_alpha": ["Terminal opacity (%):", "Opacidad de la terminal (%):"],
@@ -671,11 +673,18 @@ final class UsageTracker {
         return best
     }
 
+    // Rewriting the whole JSON on every 3 s poll was the single biggest CPU
+    // cost in the scan loop (profiled) — batch saves to every 30 s instead.
+    // flush() covers quit; an unsaved tail is simply re-parsed next launch.
+    private var lastSave = Date.distantPast
+    private var dirty = false
+
     func update(paths: [String]) {
-        var changed = false
-        for p in paths where updateOne(p) { changed = true }
-        if changed { save() }
+        for p in paths where updateOne(p) { dirty = true }
+        if dirty, Date().timeIntervalSince(lastSave) > 30 { save() }
     }
+
+    func flush() { if dirty { save() } }
 
     private func updateOne(_ path: String) -> Bool {
         guard let fh = FileHandle(forReadingAtPath: path) else { return false }
@@ -688,33 +697,45 @@ final class UsageTracker {
         var st = files[path] ?? FileState()
         if st.offset > size { st = FileState() }  // truncated/rewritten: start over
         guard size > st.offset else { return false }
-        try? fh.seek(toOffset: st.offset)
-        guard let data = try? fh.read(upToCount: Int(min(size - st.offset, 8_000_000))),
-              // only complete lines; a partially-written trailing line waits
-              // for the next poll
-              let lastNL = data.lastIndex(of: 0x0A) else { return false }
-        let chunk = data[data.startIndex...lastNL]
-        st.offset += UInt64(chunk.count)
+        let startOffset = st.offset
         var inc = Totals()
-        for lineData in chunk.split(separator: 0x0A) {
-            guard let line = String(data: lineData, encoding: .utf8),
-                  line.contains("\"usage\""),
-                  let o = try? JSONSerialization.jsonObject(with: Data(lineData)) as? [String: Any],
-                  let msg = o["message"] as? [String: Any],
-                  let usage = msg["usage"] as? [String: Any] else { continue }
-            let inp = (usage["input_tokens"] as? Int) ?? 0
-            let out = (usage["output_tokens"] as? Int) ?? 0
-            let cRead = (usage["cache_read_input_tokens"] as? Int) ?? 0
-            let cWrite = (usage["cache_creation_input_tokens"] as? Int) ?? 0
-            let p = Self.price((msg["model"] as? String) ?? "")
-            // ↑ shows FRESH input only (typed + cache writes) — counting the
-            // cache reads of every turn inflated it into absurd figures
-            inc.input += inp + cWrite
-            inc.output += out
-            // cache reads ≈0.1× and cache writes ≈1.25× the input price
-            inc.cost += (Double(inp) * p.inp + Double(out) * p.out
-                         + Double(cRead) * p.inp * 0.1 + Double(cWrite) * p.inp * 1.25) / 1_000_000
+        // 2 MB slices, each inside its own pool: a huge first-seen transcript
+        // catches up fully in this call without ever materializing the whole
+        // backlog of lines + JSON objects at once (the old single 8 MB gulp
+        // was behind the ~440 MB footprint peaks)
+        while st.offset < size {
+            let more: Bool = autoreleasepool {
+                try? fh.seek(toOffset: st.offset)
+                guard let data = try? fh.read(upToCount: Int(min(size - st.offset, 2_000_000))),
+                      // only complete lines; a partially-written trailing line
+                      // waits for the next poll
+                      let lastNL = data.lastIndex(of: 0x0A) else { return false }
+                let chunk = data[data.startIndex...lastNL]
+                st.offset += UInt64(chunk.count)
+                for lineData in chunk.split(separator: 0x0A) {
+                    guard let line = String(data: lineData, encoding: .utf8),
+                          line.contains("\"usage\""),
+                          let o = try? JSONSerialization.jsonObject(with: Data(lineData)) as? [String: Any],
+                          let msg = o["message"] as? [String: Any],
+                          let usage = msg["usage"] as? [String: Any] else { continue }
+                    let inp = (usage["input_tokens"] as? Int) ?? 0
+                    let out = (usage["output_tokens"] as? Int) ?? 0
+                    let cRead = (usage["cache_read_input_tokens"] as? Int) ?? 0
+                    let cWrite = (usage["cache_creation_input_tokens"] as? Int) ?? 0
+                    let p = Self.price((msg["model"] as? String) ?? "")
+                    // ↑ shows FRESH input only (typed + cache writes) — counting the
+                    // cache reads of every turn inflated it into absurd figures
+                    inc.input += inp + cWrite
+                    inc.output += out
+                    // cache reads ≈0.1× and cache writes ≈1.25× the input price
+                    inc.cost += (Double(inp) * p.inp + Double(out) * p.out
+                                 + Double(cRead) * p.inp * 0.1 + Double(cWrite) * p.inp * 1.25) / 1_000_000
+                }
+                return true
+            }
+            if !more { break }
         }
+        guard st.offset > startOffset else { return false }
         files[path] = st
         guard inc.input > 0 || inc.output > 0 else { return true }  // offset moved: persist
         st.totals.add(inc)
@@ -726,6 +747,8 @@ final class UsageTracker {
     // MARK: persistence
 
     private func save() {
+        lastSave = Date()
+        dirty = false
         var filesObj: [String: Any] = [:]
         for (p, s) in files {
             filesObj[p] = ["offset": s.offset, "in": s.totals.input,
@@ -1176,8 +1199,10 @@ final class GifAnimation {
         self.aspect = CGFloat(rep.pixelsWide) / CGFloat(max(1, rep.pixelsHigh))
     }
 
+    func frameIndex(_ t: CGFloat) -> Int { Int(Double(t) / delay) % frames }
+
     func draw(in rect: NSRect, t: CGFloat, alpha: CGFloat = 1) {
-        rep.setProperty(.currentFrame, withValue: NSNumber(value: Int(Double(t) / delay) % frames))
+        rep.setProperty(.currentFrame, withValue: NSNumber(value: frameIndex(t)))
         _ = rep.draw(in: rect, from: .zero, operation: .sourceOver, fraction: alpha,
                      respectFlipped: false, hints: nil)
     }
@@ -1413,6 +1438,7 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
                 guard let self, self.view.window != nil else { return }
                 for icon in self.icons { icon.t += 0.12 }
             }
+            animTimer?.tolerance = 0.03
         }
     }
 
@@ -2006,7 +2032,28 @@ enum AgentGlyphState { case inactive, running, idle, done }
 final class IndicatorView: NSView {
     var claudeState: AgentGlyphState = .inactive { didSet { needsDisplay = true } }
     var codexState: AgentGlyphState = .inactive { didSet { needsDisplay = true } }
-    var t: CGFloat = 0 { didSet { needsDisplay = true } }
+    // t advances 8×/s but the mascots' visible frames change slower (walk
+    // 2.5 Hz, shimmer 3 Hz, blob 2 Hz) — repaint only when a frame actually
+    // flips, not on every tick
+    var t: CGFloat = 0 { didSet { if animKey(t) != animKey(oldValue) { needsDisplay = true } } }
+
+    private func animKey(_ t: CGFloat) -> Int {
+        var k = 0
+        func mix(_ v: Int) { k = k &* 31 &+ v }
+        switch claudeState {
+        case .running:
+            if let g = Self.claudeGif { mix(g.frameIndex(t)) }
+            else { mix(Int(t * 2.5)); mix(Int(t * 3)) }
+        case .done: mix(Int(t * 2))
+        default: break
+        }
+        switch codexState {
+        case .running: mix(Self.codexGif?.frameIndex(t) ?? Int(t / 0.12))
+        case .done: mix(Int(t * 2))
+        default: break
+        }
+        return k
+    }
 
     static let claudeOrange = NSColor(red: 0.85, green: 0.47, blue: 0.34, alpha: 1)  // Anthropic coral
     static let codexTeal = NSColor(red: 0.06, green: 0.64, blue: 0.50, alpha: 1)     // OpenAI teal
@@ -2438,6 +2485,7 @@ final class MascotBarPreview: NSView {
             self.t += 0.12
             self.ind.t = self.t
         }
+        timer?.tolerance = 0.03
     }
     required init?(coder: NSCoder) { nil }
     override func viewDidMoveToWindow() {
@@ -4179,6 +4227,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var loginCheckRef: NSButton?
     private weak var menubarCheckRef: NSButton?
     private var pendTermDir = ""
+    private var pendFilesDir = ""
     private var pendTermBGImage = ""
     private var termBGImageLabel: NSTextField?
     // wallpaper layer of the notch terminal (behind the panes)
@@ -4189,6 +4238,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private weak var fgWellRef: NSColorWell?
     private weak var bgWellRef: NSColorWell?
     private var termDirLabel: NSTextField?
+    private var filesDirLabel: NSTextField?
     private var pendTermSizeField: NSTextField?
     private var pendPanelAlphaField: NSTextField?
     private var pendTermAlphaField: NSTextField?
@@ -4243,6 +4293,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let w = max(expandedSize.width, notchWidth + sidePad * 2) * z
         let h = barHeight + max(60, listController.contentHeight) + 10
         return NSRect(x: s.midX - w / 2, y: s.maxY - h, width: w, height: h)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        // usage saves are batched to 30 s — persist the tail before dying
+        scanQueue.sync { self.usage.flush() }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -4492,10 +4547,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         signal(SIGUSR1, SIG_IGN)
         self.sigSource = sig
 
-        Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in self?.tick() }
+        let tickTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in self?.tick() }
+        tickTimer.tolerance = 0.03  // let the OS coalesce wakeups
         rescan()
-        // 3 s poll cadence, matching open-vibe-island's process discovery
-        Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in self?.rescan() }
+        // 3 s poll cadence, matching open-vibe-island's process discovery;
+        // fully idle (no sessions, no asks, panel closed, terminal hidden) it
+        // drops to every other beat — half the ps+lsof spawns for nothing
+        let scanTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.scanBeat += 1
+            let idle = self.listController.sessions.isEmpty && self.asks.isEmpty
+                && !self.expanded && self.termWindow?.isVisible != true
+            if idle && self.scanBeat % 2 == 1 { return }
+            self.rescan()
+        }
+        scanTimer.tolerance = 0.5
     }
 
     /// Screen rect of the indicator — the only collapsed region that should catch clicks
@@ -4618,12 +4684,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // load), skip the next firing instead of queueing scans that then land in
     // a burst with stale data
     private var scanInFlight = false
+    private var scanBeat = 0
 
     private func rescan() {
         if scanInFlight { return }
         scanInFlight = true
         scanQueue.async { [weak self] in
             guard let self else { return }
+            // the pool bounds Foundation garbage (ps/lsof output, JSON) that
+            // otherwise lingers on this utility thread between polls
+            autoreleasepool { self.rescanBody() }
+        }
+    }
+
+    private func rescanBody() {
             // Process discovery is the authoritative liveness signal. Keys are
             // transcript paths, or "cwd#<encoded>#<i>" for claude's cwd fallback.
             var seen = Set<String>()
@@ -4707,8 +4781,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     let r = self.indicatorScreenRect
                     if self.indicatorWindow.frame != r { self.indicatorWindow.setFrame(r, display: true) }
                 }
-                IndicatorView.refreshPetChoice()
-                IndicatorView.refreshCustomGifs()
+                // config re-reads only pick up EXTERNAL edits (the settings
+                // panel refreshes these directly) — every ~30 s is plenty
+                if self.scanBeat % 10 == 0 {
+                    IndicatorView.refreshPetChoice()
+                    IndicatorView.refreshCustomGifs()
+                }
                 self.applyAsks(pendingAsks)
                 self.listController.sessions = result
                 // busy → mascot; alive-but-quiet → nothing (idle, not done);
@@ -4765,7 +4843,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.codexWasLive = codexLive
                 self.render()
             }
-        }
     }
 
     /// Publish freshly-loaded asks to the UI. Permission cards are shown for
@@ -4807,6 +4884,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func quickPollAsks() {
         scanQueue.async { [weak self] in
             guard let self else { return }
+            autoreleasepool { self.quickPollAsksBody() }
+        }
+    }
+
+    private func quickPollAsksBody() {
             let files = (try? FileManager.default.contentsOfDirectory(
                 at: self.asksDir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
             let sig = files.map { f -> String in
@@ -4818,7 +4900,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.askDirSig = sig
             let pending = self.loadAsks(ttyByCwd: [:])
             DispatchQueue.main.async { self.applyAsks(pending) }
-        }
     }
 
     // MARK: - /ia (local Ollama command help)
@@ -5641,6 +5722,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         termSplit = nil
     }
 
+    /// Start folder for the file panes (⌘F browser, ⌘E quick folders):
+    /// config "files-dir", falling back to the terminal's "term-dir" (the two
+    /// were the same setting before v2.9.46), then home.
+    private func filesStartDir() -> String {
+        for name in ["files-dir", "term-dir"] {
+            let dir = (try? String(contentsOf: configURL(name), encoding: .utf8))?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !dir.isEmpty, FileManager.default.fileExists(atPath: dir) { return dir }
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.path
+    }
+
     /// Quick-folders pane (compact single-column browser) on its own ⌘-key.
     @objc fileprivate func toggleQuickFolders() {
         guard let split = termSplit else { return }
@@ -5650,12 +5743,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             split.adjustSubviews()
             return
         }
-        var startDir = (try? String(contentsOf: configURL("term-dir"), encoding: .utf8))?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if startDir.isEmpty || !FileManager.default.fileExists(atPath: startDir) {
-            startDir = FileManager.default.homeDirectoryForCurrentUser.path
-        }
-        let qf = QuickFoldersPane(startDir: URL(fileURLWithPath: startDir))
+        let qf = QuickFoldersPane(startDir: URL(fileURLWithPath: filesStartDir()))
         qf.onNavigate = { [weak self] url in self?.cdTerminal(to: url) }
         quickFolders = qf
         split.insertArrangedSubview(qf, at: 0)
@@ -5721,12 +5809,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             split.adjustSubviews()
             return
         }
-        var startDir = (try? String(contentsOf: configURL("term-dir"), encoding: .utf8))?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if startDir.isEmpty || !FileManager.default.fileExists(atPath: startDir) {
-            startDir = FileManager.default.homeDirectoryForCurrentUser.path
-        }
-        let fb = FileBrowserPane(startDir: URL(fileURLWithPath: startDir))
+        let fb = FileBrowserPane(startDir: URL(fileURLWithPath: filesStartDir()))
         fileBrowser = fb
         split.insertArrangedSubview(fb, at: 0)
         split.setHoldingPriority(NSLayoutConstraint.Priority(260), forSubviewAt: 0)  // keep width; terminals flex
@@ -5834,6 +5917,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         termDirLbl.lineBreakMode = .byTruncatingMiddle
         termDirLbl.widthAnchor.constraint(lessThanOrEqualToConstant: 260).isActive = true
         termDirLabel = termDirLbl
+
+        pendFilesDir = (try? String(contentsOf: configURL("files-dir"), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let filesDirLbl = NSTextField(labelWithString: pendFilesDir.isEmpty
+            ? L("files_dir_same") : pendFilesDir)
+        filesDirLbl.textColor = .secondaryLabelColor
+        filesDirLbl.lineBreakMode = .byTruncatingMiddle
+        filesDirLbl.widthAnchor.constraint(lessThanOrEqualToConstant: 260).isActive = true
+        filesDirLabel = filesDirLbl
 
         pendTermBGImage = cfgString("term-bg-image")
         let termBGImgLbl = NSTextField(labelWithString: pendTermBGImage.isEmpty
@@ -5978,6 +6070,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                  foldersPop, smallLabel(L("key_folders")), sshPop, smallLabel(L("key_ssh"))]),
             row(L("term_dir"), [termDirLbl, button(L("choose_dir"), #selector(chooseTermDir)),
                                 button(L("clear_dir"), #selector(clearTermDir))]),
+            row(L("files_dir"), [filesDirLbl, button(L("choose_dir"), #selector(chooseFilesDir)),
+                                 button(L("clear_dir"), #selector(clearFilesDir))]),
             row(L("term_font"), [fontPopup, fontSize, smallLabel("pt")]),
             row(L("term_colors"), [smallLabel(L("term_fg_lbl")), fgWell,
                                    smallLabel(L("term_bg_lbl")), bgWell]),
@@ -6097,6 +6191,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         saveKey(sshKeyPopupRef, "key-ssh")
         readTermKeys()
         writeConfig("term-dir", pendTermDir)
+        writeConfig("files-dir", pendFilesDir)
         // isEnabled guards the race: Save clicked before /api/tags answered
         // (or with Ollama down) must not clobber the stored model with the
         // placeholder item
@@ -6440,6 +6535,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func clearTermDir() {
         pendTermDir = ""
         termDirLabel?.stringValue = "/"
+    }
+
+    @objc private func chooseFilesDir() {
+        guard let w = settingsWindow else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.beginSheetModal(for: w) { [weak self] resp in
+            guard let self, resp == .OK, let url = panel.url else { return }
+            self.pendFilesDir = url.path
+            self.filesDirLabel?.stringValue = url.path
+        }
+    }
+
+    @objc private func clearFilesDir() {
+        pendFilesDir = ""
+        filesDirLabel?.stringValue = L("files_dir_same")
     }
 
     @objc private func chooseTermBGImage() {
