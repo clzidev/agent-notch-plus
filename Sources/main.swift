@@ -8,7 +8,7 @@ import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.10.6"
+let appVersion = "2.10.7"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -3918,6 +3918,10 @@ final class TermPane: NSView, NSTextFieldDelegate {
     private var customName: String?
     private var renaming = false
     private static let headerH: CGFloat = 20
+    // inner margin around the terminal: a layer's border paints OVER its
+    // content, so without it the focus edge covered the first column. Fixed
+    // (focused or not) so focusing a pane never reflows its text.
+    private static let pad: CGFloat = 5
     var displayIcon: String { iconLabel.stringValue }
     var displayName: String { customName ?? (autoTitle.isEmpty ? "shell" : autoTitle) }
     /// Theme chrome: the accent drives every active-state color (edge,
@@ -3984,9 +3988,10 @@ final class TermPane: NSView, NSTextFieldDelegate {
         header.addSubview(titleLabel)
         header.addSubview(mini)
         header.addSubview(close)
-        term.frame = NSRect(x: 0, y: 0, width: bounds.width, height: bounds.height - Self.headerH)
+        term.frame = NSRect(x: Self.pad, y: Self.pad, width: bounds.width - Self.pad * 2,
+                            height: bounds.height - Self.headerH - Self.pad)
         term.autoresizingMask = [.width, .height]
-        dimmer.frame = term.frame
+        dimmer.frame = NSRect(x: 0, y: 0, width: bounds.width, height: bounds.height - Self.headerH)
         dimmer.autoresizingMask = [.width, .height]
         dimmer.wantsLayer = true
         dimmer.layer?.backgroundColor = NSColor(white: 0, alpha: 0.32).cgColor
@@ -4112,6 +4117,8 @@ final class TermPane: NSView, NSTextFieldDelegate {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         headerGrad.frame = header.bounds
+        // the margin wears the terminal's own background (clear with a wallpaper)
+        layer?.backgroundColor = term.layer?.backgroundColor
         hairline.frame = CGRect(x: 0, y: 0, width: header.bounds.width, height: 1)
         dot.frame = CGRect(x: 7, y: (Self.headerH - 6) / 2, width: 6, height: 6)
         CATransaction.commit()
@@ -6749,6 +6756,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // SwiftTerm fills cells with the (possibly translucent) color; the
             // backing layer must not stay opaque black or the image is blocked
             t.layer?.backgroundColor = img == nil ? terminalBG().cgColor : NSColor.clear.cgColor
+            t.superview?.layer?.backgroundColor = t.layer?.backgroundColor  // pane margin
             applyMetalTransparency(t)
         }
     }
