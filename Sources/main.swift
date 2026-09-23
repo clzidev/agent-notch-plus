@@ -2,12 +2,13 @@ import AppKit
 import ApplicationServices
 import Carbon.HIToolbox
 import CoreText
+import MetalKit
 import Quartz
 import ServiceManagement
 import SwiftTerm
 import UniformTypeIdentifiers
 
-let appVersion = "2.9.46"
+let appVersion = "2.10.6"
 let projectURL = "https://github.com/clzidev/agent-notch-plus"
 
 /// A pending question/permission request from an agent, written by the
@@ -38,6 +39,97 @@ func sanitizedSessionID(_ s: String) -> String {
 /// Brand accent (darkstrategy-style neon mint, #00ff9f) used across the
 /// terminal, browsers and settings.
 let neonMint = NSColor(calibratedRed: 0, green: 1.0, blue: 0.62, alpha: 1)
+
+/// A selectable terminal theme: background, foreground and the 16 ANSI
+/// colors. Picked in Configuración > Terminal via a preview gallery; the id
+/// is stored as config "term-theme" (fg/bg are also written to term-fg /
+/// term-bg so the color wells keep working as fine-tuning on top).
+struct TermTheme {
+    let id: String
+    let name: String
+    let bg: String
+    let fg: String
+    let accent: String  // chrome highlight: window border, active pane header/title/dot/sweep, tabs
+    let icon: String    // the pane's idle title icon (recognized commands still override it)
+    let ansi: [String]  // 16 × "RRGGBB": normal 0-7, bright 8-15
+    var ansiColors: [SwiftTerm.Color] {
+        ansi.map {
+            let v = UInt32($0, radix: 16) ?? 0
+            return SwiftTerm.Color(red: UInt16((v >> 16) & 0xFF) * 257,
+                                   green: UInt16((v >> 8) & 0xFF) * 257,
+                                   blue: UInt16(v & 0xFF) * 257)
+        }
+    }
+}
+
+let termThemes: [TermTheme] = [
+    TermTheme(id: "notch", name: "Notch", bg: "000000", fg: "00FF9E", accent: "00FF9E", icon: "💻",
+              ansi: ["000000", "cd0000", "00cd00", "cdcd00", "3465a4", "cd00cd", "00cdcd", "e5e5e5",
+                     "7f7f7f", "ff0000", "00ff00", "ffff00", "5c9dff", "ff00ff", "00ffff", "ffffff"]),
+    // full Matrix: EVERYTHING is green — the classic falling-code look
+    TermTheme(id: "matrix", name: "Matrix", bg: "000000", fg: "00ff41", accent: "00ff41", icon: "💊",
+              ansi: ["003b00", "00b33c", "00ff41", "65ff8f", "00cc4e", "39ff74", "00e05c", "8dffb0",
+                     "005f00", "4dff85", "65ff8f", "9dffbb", "00e05c", "70ffa1", "b3ffcc", "d5ffe0"]),
+    TermTheme(id: "dracula", name: "Dracula", bg: "282a36", fg: "f8f8f2", accent: "bd93f9", icon: "🧛",
+              ansi: ["21222c", "ff5555", "50fa7b", "f1fa8c", "bd93f9", "ff79c6", "8be9fd", "f8f8f2",
+                     "6272a4", "ff6e6e", "69ff94", "ffffa5", "d6acff", "ff92df", "a4ffff", "ffffff"]),
+    TermTheme(id: "nord", name: "Nord", bg: "2e3440", fg: "d8dee9", accent: "88c0d0", icon: "❄️",
+              ansi: ["3b4252", "bf616a", "a3be8c", "ebcb8b", "81a1c1", "b48ead", "88c0d0", "e5e9f0",
+                     "4c566a", "bf616a", "a3be8c", "ebcb8b", "81a1c1", "b48ead", "8fbcbb", "eceff4"]),
+    TermTheme(id: "solarized-dark", name: "Solarized Dark", bg: "002b36", fg: "839496", accent: "2aa198", icon: "🌒",
+              ansi: ["073642", "dc322f", "859900", "b58900", "268bd2", "d33682", "2aa198", "eee8d5",
+                     "002b36", "cb4b16", "586e75", "657b83", "839496", "6c71c4", "93a1a1", "fdf6e3"]),
+    TermTheme(id: "solarized-light", name: "Solarized Light", bg: "fdf6e3", fg: "657b83", accent: "b58900", icon: "🌞",
+              ansi: ["073642", "dc322f", "859900", "b58900", "268bd2", "d33682", "2aa198", "eee8d5",
+                     "002b36", "cb4b16", "586e75", "657b83", "839496", "6c71c4", "93a1a1", "fdf6e3"]),
+    TermTheme(id: "gruvbox", name: "Gruvbox Dark", bg: "282828", fg: "ebdbb2", accent: "fabd2f", icon: "🌰",
+              ansi: ["282828", "cc241d", "98971a", "d79921", "458588", "b16286", "689d6a", "a89984",
+                     "928374", "fb4934", "b8bb26", "fabd2f", "83a598", "d3869b", "8ec07c", "ebdbb2"]),
+    TermTheme(id: "monokai", name: "Monokai", bg: "272822", fg: "f8f8f2", accent: "a6e22e", icon: "🎨",
+              ansi: ["272822", "f92672", "a6e22e", "f4bf75", "66d9ef", "ae81ff", "a1efe4", "f8f8f2",
+                     "75715e", "f92672", "a6e22e", "f4bf75", "66d9ef", "ae81ff", "a1efe4", "f9f8f5"]),
+    TermTheme(id: "one-dark", name: "One Dark", bg: "282c34", fg: "abb2bf", accent: "61afef", icon: "⚛️",
+              ansi: ["282c34", "e06c75", "98c379", "e5c07b", "61afef", "c678dd", "56b6c2", "abb2bf",
+                     "5c6370", "e06c75", "98c379", "e5c07b", "61afef", "c678dd", "56b6c2", "ffffff"]),
+    TermTheme(id: "tokyo-night", name: "Tokyo Night", bg: "1a1b26", fg: "c0caf5", accent: "7aa2f7", icon: "🌃",
+              ansi: ["15161e", "f7768e", "9ece6a", "e0af68", "7aa2f7", "bb9af7", "7dcfff", "a9b1d6",
+                     "414868", "f7768e", "9ece6a", "e0af68", "7aa2f7", "bb9af7", "7dcfff", "c0caf5"]),
+    TermTheme(id: "catppuccin", name: "Catppuccin Mocha", bg: "1e1e2e", fg: "cdd6f4", accent: "f5c2e7", icon: "🐱",
+              ansi: ["45475a", "f38ba8", "a6e3a1", "f9e2af", "89b4fa", "f5c2e7", "94e2d5", "bac2de",
+                     "585b70", "f38ba8", "a6e3a1", "f9e2af", "89b4fa", "f5c2e7", "94e2d5", "a6adc8"]),
+    TermTheme(id: "github-dark", name: "GitHub Dark", bg: "0d1117", fg: "c9d1d9", accent: "58a6ff", icon: "🐙",
+              ansi: ["484f58", "ff7b72", "3fb950", "d29922", "58a6ff", "bc8cff", "39c5cf", "b1bac4",
+                     "6e7681", "ffa198", "56d364", "e3b341", "79c0ff", "d2a8ff", "56d4dd", "ffffff"]),
+    TermTheme(id: "github-light", name: "GitHub Light", bg: "ffffff", fg: "24292f", accent: "0969da", icon: "🐙",
+              ansi: ["24292f", "cf222e", "116329", "4d2d00", "0969da", "8250df", "1b7c83", "6e7781",
+                     "57606a", "a40e26", "1a7f37", "633c01", "218bff", "a475f9", "3192aa", "8c959f"]),
+    TermTheme(id: "retro-green", name: "Retro CRT Green", bg: "001500", fg: "33ff33", accent: "33ff33", icon: "🖥",
+              ansi: ["001500", "00a000", "00d000", "66ff66", "008000", "00b000", "00e000", "33ff33",
+                     "006000", "44ff44", "66ff66", "99ff99", "00cc44", "44ff88", "88ffaa", "ccffcc"]),
+    TermTheme(id: "retro-amber", name: "Retro CRT Amber", bg: "1c1000", fg: "ffb000", accent: "ffb000", icon: "📟",
+              ansi: ["1c1000", "b06000", "d08000", "ffcc66", "a05000", "c07000", "e09000", "ffb000",
+                     "704000", "ffaa33", "ffcc66", "ffd080", "cc8800", "ffdd99", "ffeebb", "fff5dd"]),
+    TermTheme(id: "synthwave", name: "Synthwave '84", bg: "262335", fg: "f0eff1", accent: "ff7edb", icon: "🌆",
+              ansi: ["2a2139", "fe4450", "72f1b8", "fede5d", "03edf9", "ff7edb", "03edf9", "ffffff",
+                     "63606e", "fe4450", "72f1b8", "fede5d", "03edf9", "ff7edb", "03edf9", "ffffff"]),
+    TermTheme(id: "cyberpunk", name: "Cyberpunk", bg: "000b1e", fg: "0abdc6", accent: "0abdc6", icon: "🤖",
+              ansi: ["123e7c", "ff0055", "00ff9f", "d1f7ff", "0abdc6", "ea00d9", "0abdc6", "d7d7d5",
+                     "1c61c2", "ff0055", "00ff9f", "d1f7ff", "0abdc6", "ea00d9", "0abdc6", "ffffff"]),
+    TermTheme(id: "ubuntu", name: "Ubuntu", bg: "300a24", fg: "eeeeec", accent: "e95420", icon: "🐧",
+              ansi: ["2e3436", "cc0000", "4e9a06", "c4a000", "3465a4", "75507b", "06989a", "d3d7cf",
+                     "555753", "ef2929", "8ae234", "fce94f", "729fcf", "ad7fa8", "34e2e2", "eeeeec"]),
+    TermTheme(id: "ayu", name: "Ayu Dark", bg: "0a0e14", fg: "b3b1ad", accent: "ffb454", icon: "🍂",
+              ansi: ["01060e", "ea6c73", "91b362", "f9af4f", "53bdfa", "fae994", "90e1c6", "c7c7c7",
+                     "686868", "f07178", "c2d94c", "ffb454", "59c2ff", "ffee99", "95e6cb", "ffffff"]),
+    TermTheme(id: "oceanic", name: "Oceanic Next", bg: "1b2b34", fg: "d8dee9", accent: "6699cc", icon: "🌊",
+              ansi: ["29414f", "ec5f67", "99c794", "fac863", "6699cc", "c594c5", "5fb3b3", "d8dee9",
+                     "405860", "ec5f67", "99c794", "fac863", "6699cc", "c594c5", "5fb3b3", "ffffff"]),
+    TermTheme(id: "paper", name: "Paper (Light)", bg: "f7f7f7", fg: "444444", accent: "0f62fe", icon: "📄",
+              ansi: ["eeeeee", "d7301f", "008837", "a06d00", "0f62fe", "8a3ffc", "007d79", "666666",
+                     "999999", "fb4b4b", "24a148", "b28600", "4589ff", "a56eff", "08bdba", "111111"]),
+]
+
+func termTheme(id: String) -> TermTheme { termThemes.first { $0.id == id } ?? termThemes[0] }
 
 /// "RRGGBB" ↔ NSColor for the terminal color configs.
 func colorFromHex(_ hex: String) -> NSColor? {
@@ -195,7 +287,7 @@ enum L10n {
                           "Todos los atajos de abajo son configurables (las teclas ⌘ funcionan dentro de la terminal)."],
         "panel_hotkey": ["Panel shortcut:", "Atajo del panel:"],
         "term_keys": ["Terminal keys:", "Teclas de terminal:"],
-        "key_split": ["split", "dividir"],
+        "key_split": ["split (⇧ = rows)", "dividir (⇧ = filas)"],
         "key_files": ["files", "archivos"],
         "key_folders": ["folders", "carpetas"],
         "key_ssh": ["ssh", "ssh"],
@@ -213,6 +305,23 @@ enum L10n {
         "img_none": ["none", "ninguna"],
         "pane_close": ["Force close this pane (kills its shell, even a dead ssh)",
                        "Forzar cierre de este panel (mata su shell, aunque sea un ssh muerto)"],
+        "pane_min": ["Minimize to the top strip (the shell keeps running)",
+                     "Minimizar a la barra superior (la shell sigue corriendo)"],
+        "pane_restore": ["Click to restore this pane", "Clic para restaurar este panel"],
+        "pane_header_tip": ["Drag to move the pane · double-click to rename",
+                            "Arrastrá para mover el panel · doble clic para renombrar"],
+        "layout_tabs_tip": ["Switch to tabs (one full-screen terminal per tab)",
+                            "Cambiar a pestañas (una terminal a pantalla completa por pestaña)"],
+        "layout_grid_tip": ["Switch to grid (columns & rows)",
+                            "Cambiar a grilla (columnas y filas)"],
+        "term_theme": ["Terminal theme:", "Tema de la terminal:"],
+        "theme_choose": ["Choose theme…", "Elegir tema…"],
+        "theme_title": ["Terminal themes", "Temas de terminal"],
+        "theme_hint": ["Click a theme to apply it instantly — text, background and ANSI palette.",
+                       "Clic en un tema para aplicarlo al instante — texto, fondo y paleta ANSI."],
+        "term_autohide_lbl": ["Auto-hide:", "Auto-ocultar:"],
+        "term_autohide": ["Hide the terminal when it loses focus (shells keep running)",
+                          "Ocultar la terminal al perder el foco (las shells siguen corriendo)"],
         "choose_dir": ["Choose…", "Elegir…"],
         "clear_dir": ["Reset", "Quitar"],
         "project": ["Project:", "Proyecto:"],
@@ -1295,6 +1404,11 @@ final class DitherSeparator: NSView {
 
 final class SessionListController: NSViewController, NSTextFieldDelegate {
     var sessions: [AgentSession] = [] { didSet { rebuildSessions() } }
+    /// The panel is open. While it's closed the session rows are NOT rebuilt
+    /// on every 3 s poll — that whole Auto Layout rebuild on the main thread
+    /// was a periodic hitch (typed text stalling, then landing at once);
+    /// panelWillShow rebuilds with the latest data instead.
+    var isShown = false
     // hover zoom: snippets get extra lines (same font size), so the bigger
     // panel shows MORE text, not bigger text
     var zoomFactor: CGFloat = 1 { didSet { if zoomFactor != oldValue { rebuildAll() } } }
@@ -1394,6 +1508,7 @@ final class SessionListController: NSViewController, NSTextFieldDelegate {
     }
 
     private func rebuildSessions() {
+        guard isShown else { return }
         sessionStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         icons.removeAll()
         sessionStack.addArrangedSubview(headerBar())
@@ -2032,6 +2147,9 @@ enum AgentGlyphState { case inactive, running, idle, done }
 final class IndicatorView: NSView {
     var claudeState: AgentGlyphState = .inactive { didSet { needsDisplay = true } }
     var codexState: AgentGlyphState = .inactive { didSet { needsDisplay = true } }
+    /// An agent is waiting on you (permission / question): the Claude
+    /// mascot hops and glows instead of the panel popping open.
+    var attention = false { didSet { if attention != oldValue { needsDisplay = true } } }
     // t advances 8×/s but the mascots' visible frames change slower (walk
     // 2.5 Hz, shimmer 3 Hz, blob 2 Hz) — repaint only when a frame actually
     // flips, not on every tick
@@ -2040,6 +2158,7 @@ final class IndicatorView: NSView {
     private func animKey(_ t: CGFloat) -> Int {
         var k = 0
         func mix(_ v: Int) { k = k &* 31 &+ v }
+        if attention { mix(Int(t / 0.12)) }  // hop + glow: every tick
         switch claudeState {
         case .running:
             if let g = Self.claudeGif { mix(g.frameIndex(t)) }
@@ -2090,11 +2209,27 @@ final class IndicatorView: NSView {
         var x = bounds.maxX - 6  // right-aligned toward the notch
         // each agent keeps its own slot: mascot while running, green blob when
         // freshly done (cleared once you revisit the terminal)
-        switch claudeState {
-        case .running: x = drawClaudeRunning(ctx, right: x, cy: cy, dim: false) - 6
-        case .idle: x = drawClaudeRunning(ctx, right: x, cy: cy, dim: true) - 6
-        case .done: drawGreenBlob(ctx, right: x, cy: cy); x -= 24
-        case .inactive: break
+        if attention {
+            // waiting on you: bright mascot that hops every ~1.4 s inside a
+            // pulsing coral glow (transparency layer = one glow for the
+            // whole sprite, not one per pixel block)
+            let cycle = t.truncatingRemainder(dividingBy: 1.44)
+            let hop = cycle < 0.48 ? sin(cycle / 0.48 * .pi) * 4 : 0
+            let pulse = 0.5 + 0.5 * sin(t * 4.4)
+            ctx.saveGState()
+            ctx.setShadow(offset: .zero, blur: 5 + 7 * pulse,
+                          color: Self.claudeOrange.withAlphaComponent(0.75 + 0.25 * pulse).cgColor)
+            ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+            x = drawClaudeRunning(ctx, right: x, cy: cy + hop, dim: false) - 6
+            ctx.endTransparencyLayer()
+            ctx.restoreGState()
+        } else {
+            switch claudeState {
+            case .running: x = drawClaudeRunning(ctx, right: x, cy: cy, dim: false) - 6
+            case .idle: x = drawClaudeRunning(ctx, right: x, cy: cy, dim: true) - 6
+            case .done: drawGreenBlob(ctx, right: x, cy: cy); x -= 24
+            case .inactive: break
+            }
         }
         switch codexState {
         case .running: _ = drawCodexPet(ctx, right: x, cy: cy, dim: false)
@@ -2445,11 +2580,11 @@ final class GlowCardView: NSView {
 /// be active (a nonactivating panel often isn't after being re-shown).
 final class KeyPanel: NSPanel {
     override var canBecomeKey: Bool { true }
-    var onCommandKey: ((String) -> Bool)?
+    var onCommandKey: ((String, Bool) -> Bool)?  // (key, shift held)
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if event.modifierFlags.contains(.command),
            let ch = event.charactersIgnoringModifiers?.lowercased(),
-           onCommandKey?(ch) == true {
+           onCommandKey?(ch, event.modifierFlags.contains(.shift)) == true {
             return true
         }
         return super.performKeyEquivalent(with: event)
@@ -2459,6 +2594,146 @@ final class KeyPanel: NSPanel {
 /// Scroll-view document container with top-down coordinates (for the GIF gallery).
 final class FlippedView: NSView {
     override var isFlipped: Bool { true }
+}
+
+/// Theme gallery card: a mini fake terminal (theme background, a prompt line,
+/// colored output and ANSI swatches) with the name below. Click = apply
+/// instantly; the selected one glows mint.
+final class ThemePreviewTile: NSView {
+    let theme: TermTheme
+    var isSelected = false { didSet { needsDisplay = true } }
+    var onPick: ((TermTheme) -> Void)?
+    private let bg: NSColor, fg: NSColor
+
+    var onHover: ((TermTheme) -> Void)?
+
+    init(theme: TermTheme) {
+        self.theme = theme
+        self.bg = colorFromHex(theme.bg) ?? .black
+        self.fg = colorFromHex(theme.fg) ?? .white
+        super.init(frame: NSRect(x: 0, y: 0, width: 150, height: 112))
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: 150).isActive = true
+        heightAnchor.constraint(equalToConstant: 112).isActive = true
+        toolTip = theme.name
+    }
+    required init?(coder: NSCoder) { nil }
+    override func mouseDown(with event: NSEvent) { onPick?(theme) }
+    override func updateTrackingAreas() {
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds,
+                                       options: [.mouseEnteredAndExited, .activeInKeyWindow],
+                                       owner: self))
+        super.updateTrackingAreas()
+    }
+    override func mouseEntered(with event: NSEvent) { onHover?(theme) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let card = NSRect(x: 1, y: 21, width: bounds.width - 2, height: bounds.height - 22)
+        let path = NSBezierPath(roundedRect: card, xRadius: 8, yRadius: 8)
+        bg.setFill()
+        path.fill()
+        path.lineWidth = isSelected ? 2 : 1
+        (isSelected ? neonMint : NSColor(white: 0.5, alpha: 0.5)).setStroke()
+        path.stroke()
+        let mono = NSFont.monospacedSystemFont(ofSize: 9, weight: .medium)
+        func line(_ s: String, _ c: NSColor, _ y: CGFloat) {
+            (s as NSString).draw(at: NSPoint(x: card.minX + 10, y: y),
+                                 withAttributes: [.font: mono, .foregroundColor: c])
+        }
+        let acc = colorFromHex(theme.accent) ?? fg
+        line("\(theme.icon) ❯ make build", fg, card.maxY - 22)
+        line("ok · 0 warnings", colorFromHex(theme.ansi[2]) ?? fg, card.maxY - 36)
+        line("git main*", colorFromHex(theme.ansi[4]) ?? fg, card.maxY - 50)
+        // the accent dot: the color the chrome (border/titles/tabs) will take
+        acc.setFill()
+        NSBezierPath(ovalIn: NSRect(x: card.maxX - 17, y: card.maxY - 16,
+                                    width: 8, height: 8)).fill()
+        var x = card.minX + 10
+        for i in 1...6 {
+            (colorFromHex(theme.ansi[i]) ?? fg).setFill()
+            NSBezierPath(roundedRect: NSRect(x: x, y: card.minY + 8, width: 14, height: 8),
+                         xRadius: 2, yRadius: 2).fill()
+            x += 18
+        }
+        let name = (isSelected ? "✓ " : "") + theme.name
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10, weight: isSelected ? .semibold : .regular),
+            .foregroundColor: isSelected ? neonMint : NSColor.labelColor]
+        let sz = (name as NSString).size(withAttributes: attrs)
+        (name as NSString).draw(at: NSPoint(x: (bounds.width - sz.width) / 2, y: 3),
+                                withAttributes: attrs)
+    }
+}
+
+/// Large live mock inside the theme gallery: the full terminal chrome — tab
+/// strip, themed pane header (icon, title, focus dot), colored output and
+/// block cursor — redrawn for whichever theme the mouse hovers or picks, so
+/// you see exactly how it will look without touching the real terminal.
+final class ThemeBigPreview: NSView {
+    var theme: TermTheme { didSet { needsDisplay = true } }
+
+    init(theme: TermTheme) {
+        self.theme = theme
+        super.init(frame: NSRect(x: 0, y: 0, width: 630, height: 180))
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: 630).isActive = true
+        heightAnchor.constraint(equalToConstant: 180).isActive = true
+    }
+    required init?(coder: NSCoder) { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let bg = colorFromHex(theme.bg) ?? .black
+        let fg = colorFromHex(theme.fg) ?? .white
+        let acc = colorFromHex(theme.accent) ?? fg
+        func ansi(_ i: Int) -> NSColor { colorFromHex(theme.ansi[i]) ?? fg }
+        let mono = NSFont.monospacedSystemFont(ofSize: 11, weight: .medium)
+        let small = NSFont.monospacedSystemFont(ofSize: 10, weight: .medium)
+        func text(_ s: String, _ c: NSColor, _ f: NSFont, _ x: CGFloat, _ y: CGFloat) {
+            (s as NSString).draw(at: NSPoint(x: x, y: y),
+                                 withAttributes: [.font: f, .foregroundColor: c])
+        }
+        // window: theme background + accent border (same as the real chrome)
+        let card = bounds.insetBy(dx: 1, dy: 1)
+        let path = NSBezierPath(roundedRect: card, xRadius: 10, yRadius: 10)
+        bg.setFill()
+        path.fill()
+        path.lineWidth = 1.5
+        acc.withAlphaComponent(0.5).setStroke()
+        path.stroke()
+        // tab strip: an active themed tab + a dim one
+        let tabY = card.maxY - 26
+        let active = NSBezierPath(roundedRect: NSRect(x: card.minX + 12, y: tabY, width: 130, height: 20),
+                                  xRadius: 6, yRadius: 6)
+        acc.withAlphaComponent(0.16).setFill()
+        active.fill()
+        acc.withAlphaComponent(0.5).setStroke()
+        active.stroke()
+        text("\(theme.icon) zsh", acc.blended(withFraction: 0.4, of: .white) ?? acc, small,
+             card.minX + 22, tabY + 4)
+        text("🤖 claude", NSColor(white: 0.55, alpha: 1), small, card.minX + 156, tabY + 4)
+        // pane header: accent-dark gradient strip, focus dot, icon + title
+        let headY = tabY - 24
+        let head = NSRect(x: card.minX + 10, y: headY, width: card.width - 20, height: 20)
+        (acc.blended(withFraction: 0.88, of: .black) ?? acc).setFill()
+        NSBezierPath(roundedRect: head, xRadius: 5, yRadius: 5).fill()
+        acc.setFill()
+        NSBezierPath(ovalIn: NSRect(x: head.minX + 8, y: head.midY - 3, width: 6, height: 6)).fill()
+        text("\(theme.icon) agent-notch-plus", acc.blended(withFraction: 0.4, of: .white) ?? acc,
+             small, head.minX + 22, head.minY + 3)
+        // shell output in the theme's real palette
+        let x = card.minX + 22
+        text("❯ git status", fg, mono, x, headY - 24)
+        text("main*  2 files changed", ansi(4), mono, x, headY - 42)
+        text("ok · build passed · 2.1s", ansi(2), mono, x, headY - 60)
+        text("warn  deprecated API in main.swift:42", ansi(3), mono, x, headY - 78)
+        text("err   1 test failed", ansi(1), mono, x, headY - 96)
+        // prompt + block cursor
+        text("❯", fg, mono, x, headY - 118)
+        fg.withAlphaComponent(0.9).setFill()
+        NSBezierPath(roundedRect: NSRect(x: x + 16, y: headY - 118, width: 9, height: 14),
+                     xRadius: 1.5, yRadius: 1.5).fill()
+    }
 }
 
 /// Settings preview: a mini black notch bar showing the CURRENT mascot of an
@@ -3455,6 +3730,11 @@ final class FileBrowserPane: NSView, NSTableViewDataSource, NSTableViewDelegate,
 final class DropTerminalView: LocalProcessTerminalView {
     private var downPoint: NSPoint = .zero
     private var downHadSelection = false
+    private var downWasFocused = false
+    private var lastBellAt = Date.distantPast
+    /// The pane took the keyboard (click) — lets the app repaint the focus
+    /// highlight right away instead of on its next tick.
+    var onFocus: (() -> Void)?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -3462,9 +3742,29 @@ final class DropTerminalView: LocalProcessTerminalView {
     }
     required init?(coder: NSCoder) { super.init(coder: coder) }
 
+    /// A burst of BELs (arrow keys a TUI refuses, ^G spam) must not queue a
+    /// machine-gun of system beeps — one per second is signal enough.
+    override func bell(source: Terminal) {
+        guard Date().timeIntervalSince(lastBellAt) > 1 else { return }
+        lastBellAt = Date()
+        super.bell(source: source)
+    }
+
+    /// One click = focused AND typeable: the click that lands while the
+    /// panel isn't key (another app, or the notch panel had focus) isn't
+    /// swallowed as a mere window-activation click anymore.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     override func mouseDown(with event: NSEvent) {
         downPoint = convert(event.locationInWindow, from: nil)
         downHadSelection = selectionActive
+        downWasFocused = window?.firstResponder === self && window?.isKeyWindow == true
+        if let w = window {
+            if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
+            if !w.isKeyWindow { w.makeKeyAndOrderFront(nil) }
+            if w.firstResponder !== self { w.makeFirstResponder(self) }
+        }
+        onFocus?()
         super.mouseDown(with: event)
     }
 
@@ -3481,13 +3781,19 @@ final class DropTerminalView: LocalProcessTerminalView {
         // hands off when the app captures the mouse itself (vim mouse=a,
         // htop…), during selections, or on modified / double clicks
         guard event.clickCount == 1,
+              // the click that hands the pane keyboard focus is just a focus
+              // click — replaying it as arrow keys sprays a TUI with input
+              // (and a burst of bells) the user never asked for
+              downWasFocused,
               event.modifierFlags.intersection([.command, .shift, .option, .control]).isEmpty,
               terminal.mouseMode == .off,
               !selectionActive, !downHadSelection,
               let caret = subviews.first(where: {
                   String(describing: type(of: $0)).contains("CaretView")
               }),
-              !caret.isHidden, caret.frame.width > 0, caret.frame.height > 0
+              // (the Metal renderer hides the caret view, but SwiftTerm keeps
+              // its frame on the cursor cell — good enough as a metric)
+              caret.superview != nil, caret.frame.width > 0, caret.frame.height > 0
         else { return }
         let p = convert(event.locationInWindow, from: nil)
         guard hypot(p.x - downPoint.x, p.y - downPoint.y) < 3 else { return }  // drag, not click
@@ -3537,24 +3843,88 @@ final class DropTerminalView: LocalProcessTerminalView {
     }
 }
 
-/// One ⌘D pane of the notch terminal: a slim header (title + ✕) above its
-/// terminal view. The title tracks the shell's folder / running command, and
-/// the ✕ force-kills THAT shell only — the escape hatch for a dead ssh that
-/// no longer answers `exit`.
-final class TermPane: NSView {
+/// Purely visual overlay: never takes a click (they reach the view below).
+final class ClickThroughView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+/// Slim title bar of a TermPane: the whole strip is a grab handle — drag it
+/// to move the pane around the grid (fed back to the app via closures),
+/// double-click to rename. Buttons and the rename editor keep their own
+/// clicks via hitTest.
+final class PaneHeader: NSView {
+    var onDoubleClick: (() -> Void)?
+    var onClick: (() -> Void)?              // any press: focus this pane
+    var onDragBegan: (() -> Void)?
+    var onDragMoved: ((NSPoint) -> Void)?   // locationInWindow
+    var onDragEnded: (() -> Void)?
+    private var downAt = NSPoint.zero
+    private var dragging = false
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let v = super.hitTest(point)
+        if v is NSButton || v is NSTextView { return v }  // – / ✕ / rename editor
+        if let f = v as? NSTextField, f.isEditable { return f }
+        return v == nil ? nil : self
+    }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) {
+        onClick?()
+        if event.clickCount == 2 { onDoubleClick?(); return }
+        downAt = event.locationInWindow
+        dragging = false
+    }
+    override func mouseDragged(with event: NSEvent) {
+        let p = event.locationInWindow
+        if !dragging {
+            guard hypot(p.x - downAt.x, p.y - downAt.y) > 5 else { return }
+            dragging = true
+            onDragBegan?()
+        }
+        onDragMoved?(p)
+    }
+    override func mouseUp(with event: NSEvent) {
+        if dragging { dragging = false; onDragEnded?() }
+    }
+}
+
+/// One pane of the notch terminal: a slim header (icon + title + – + ✕) above
+/// its terminal view. The title tracks the shell's folder / running command
+/// (double-click gives it a fixed name), the icon tracks the running command,
+/// – parks the pane as a chip in the top strip, and the ✕ force-kills THAT
+/// shell only — the escape hatch for a dead ssh that no longer answers `exit`.
+final class TermPane: NSView, NSTextFieldDelegate {
     let term: DropTerminalView
     // exported as $NOTCH_PANE so /ia answers land in the pane that asked,
     // even if focus moved while Ollama was thinking
     let paneID = UUID().uuidString
     var onClose: ((TermPane) -> Void)?
+    var onMinimize: ((TermPane) -> Void)?
+    var onMoveBegan: ((TermPane) -> Void)?
+    var onMoved: ((TermPane, NSPoint) -> Void)?
+    var onMoveEnded: ((TermPane) -> Void)?
     private let titleLabel = NSTextField(labelWithString: "")
-    private let header = NSView()
+    private let iconLabel = NSTextField(labelWithString: "💻")
+    private let header = PaneHeader()
     private let headerGrad = CAGradientLayer()
     private let hairline = CALayer()
-    private let sweep = CAGradientLayer()  // light streak that scans the hairline of the active pane
     private let dot = CALayer()
+    // dims the panes that DON'T have the keyboard, so the focused one pops
+    private let dimmer = ClickThroughView()
     private var isActive = false
+    private var autoTitle = ""
+    /// User-chosen name (double-click the title): sticks, auto titles stop
+    /// overriding it. Empty rename goes back to auto.
+    private var customName: String?
+    private var renaming = false
     private static let headerH: CGFloat = 20
+    var displayIcon: String { iconLabel.stringValue }
+    var displayName: String { customName ?? (autoTitle.isEmpty ? "shell" : autoTitle) }
+    /// Theme chrome: the accent drives every active-state color (edge,
+    /// header, title, dot); idleIcon is the theme's default title icon
+    /// (recognized commands still override it).
+    var accent: NSColor = neonMint { didSet { applyActive() } }
+    var idleIcon: String = "💻" { didSet { setTitle(autoTitle) } }
 
     init(term: DropTerminalView) {
         self.term = term
@@ -3572,24 +3942,37 @@ final class TermPane: NSView {
         header.layer?.insertSublayer(headerGrad, at: 0)
         hairline.backgroundColor = NSColor(white: 1, alpha: 0.07).cgColor
         header.layer?.addSublayer(hairline)
-        // scanner streak: a soft green light that sweeps along the hairline
-        // while this pane owns the keyboard
-        let streak = neonMint.withAlphaComponent(0.55)
-        sweep.colors = [NSColor.clear.cgColor, streak.cgColor, NSColor.clear.cgColor]
-        sweep.startPoint = CGPoint(x: 0, y: 0.5)
-        sweep.endPoint = CGPoint(x: 1, y: 0.5)
-        sweep.isHidden = true
-        header.layer?.addSublayer(sweep)
-        // focus dot: matrix green + glow on the pane that owns the keyboard
+        // focus dot: lit on the pane that owns the keyboard (static — no
+        // glow/breathing: continuous animations kept the compositor busy)
         dot.cornerRadius = 3
-        dot.shadowOffset = .zero
-        dot.shadowRadius = 3
         header.layer?.addSublayer(dot)
+        header.toolTip = L("pane_header_tip")
+        header.onClick = { [weak self] in
+            guard let self, !self.renaming, let w = self.window else { return }
+            if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
+            if !w.isKeyWindow { w.makeKeyAndOrderFront(nil) }
+            w.makeFirstResponder(self.term)
+            self.term.onFocus?()
+        }
+        header.onDoubleClick = { [weak self] in self?.beginRename() }
+        header.onDragBegan = { [weak self] in self.map { $0.onMoveBegan?($0) } }
+        header.onDragMoved = { [weak self] p in self.map { $0.onMoved?($0, p) } }
+        header.onDragEnded = { [weak self] in self.map { $0.onMoveEnded?($0) } }
+        iconLabel.font = .systemFont(ofSize: 10)
+        iconLabel.frame = NSRect(x: 16, y: 3, width: 18, height: 14)
         titleLabel.wantsLayer = true
         titleLabel.font = .monospacedSystemFont(ofSize: 10, weight: .medium)
         titleLabel.lineBreakMode = .byTruncatingMiddle
-        titleLabel.frame = NSRect(x: 18, y: 3, width: bounds.width - 44, height: 14)
+        titleLabel.frame = NSRect(x: 36, y: 3, width: bounds.width - 36 - 44, height: 14)
         titleLabel.autoresizingMask = [.width]
+        titleLabel.delegate = self
+        let mini = NSButton(title: "–", target: self, action: #selector(minTapped))
+        mini.isBordered = false
+        mini.font = .systemFont(ofSize: 11, weight: .bold)
+        mini.contentTintColor = NSColor(white: 0.55, alpha: 1)
+        mini.frame = NSRect(x: bounds.width - 40, y: 1, width: 18, height: Self.headerH - 2)
+        mini.autoresizingMask = [.minXMargin]
+        mini.toolTip = L("pane_min")
         let close = NSButton(title: "✕", target: self, action: #selector(closeTapped))
         close.isBordered = false
         close.font = .systemFont(ofSize: 10, weight: .bold)
@@ -3597,20 +3980,98 @@ final class TermPane: NSView {
         close.frame = NSRect(x: bounds.width - 22, y: 1, width: 18, height: Self.headerH - 2)
         close.autoresizingMask = [.minXMargin]
         close.toolTip = L("pane_close")
+        header.addSubview(iconLabel)
         header.addSubview(titleLabel)
+        header.addSubview(mini)
         header.addSubview(close)
         term.frame = NSRect(x: 0, y: 0, width: bounds.width, height: bounds.height - Self.headerH)
         term.autoresizingMask = [.width, .height]
+        dimmer.frame = term.frame
+        dimmer.autoresizingMask = [.width, .height]
+        dimmer.wantsLayer = true
+        dimmer.layer?.backgroundColor = NSColor(white: 0, alpha: 0.32).cgColor
         addSubview(term)
+        addSubview(dimmer, positioned: .above, relativeTo: term)
         addSubview(header)
         applyActive()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) not supported") }
     @objc private func closeTapped() { onClose?(self) }
-    func setTitle(_ title: String) { titleLabel.stringValue = title }
+    @objc private func minTapped() {
+        finishRename(commit: true)
+        onMinimize?(self)
+    }
 
-    /// Highlight the pane that owns the keyboard: green-tinted header, bright
-    /// title, glowing dot. Called from the app's tick (cheap, state-guarded).
+    /// Auto title from the shell (folder at the prompt, running command
+    /// while one runs). A user-given name wins for the text; the icon always
+    /// tracks what's actually running.
+    func setTitle(_ title: String) {
+        autoTitle = title
+        iconLabel.stringValue = icon(for: title)
+        if !renaming { titleLabel.stringValue = customName ?? title }
+    }
+
+    /// Emoji for the pane header/chip: recognized commands get their own, a
+    /// plain folder title (idle prompt) keeps the theme's idle icon.
+    private func icon(for title: String) -> String {
+        let first = title.trimmingCharacters(in: .whitespaces)
+            .split(separator: " ").first.map(String.init)?.lowercased() ?? ""
+        let cmd = first.split(separator: "/").last.map(String.init) ?? first
+        switch cmd {
+        case "claude", "codex", "gemini", "aider", "ollama": return "🤖"
+        case "ssh", "mosh", "scp", "sftp": return "🌐"
+        case "vim", "nvim", "vi", "nano", "hx", "emacs": return "📝"
+        case "git", "gh", "lazygit", "tig": return "🔀"
+        case "python", "python3", "ipython", "uv": return "🐍"
+        case "node", "npm", "npx", "pnpm", "yarn", "bun", "deno": return "📦"
+        case "docker", "podman", "kubectl": return "🐳"
+        case "swift", "swiftc", "xcodebuild": return "🐦"
+        case "make", "cmake", "cargo", "go", "gcc", "clang": return "🛠️"
+        case "htop", "top", "btop": return "📊"
+        default: return idleIcon
+        }
+    }
+
+    /// Double-click on the title: rename the pane in place. ⏎ commits (an
+    /// empty name goes back to auto titles), esc cancels.
+    private func beginRename() {
+        guard !renaming, window != nil else { return }
+        renaming = true
+        titleLabel.isEditable = true
+        titleLabel.isSelectable = true
+        titleLabel.drawsBackground = true
+        titleLabel.backgroundColor = NSColor(white: 0, alpha: 0.55)
+        titleLabel.stringValue = customName ?? autoTitle
+        window?.makeFirstResponder(titleLabel)
+        titleLabel.currentEditor()?.selectAll(nil)
+    }
+    func controlTextDidEndEditing(_ obj: Notification) { finishRename(commit: true) }
+    func control(_ control: NSControl, textView: NSTextView,
+                 doCommandBy selector: Selector) -> Bool {
+        if selector == #selector(NSResponder.cancelOperation(_:)) {
+            finishRename(commit: false)
+            return true
+        }
+        return false
+    }
+    private func finishRename(commit: Bool) {
+        guard renaming else { return }
+        renaming = false
+        if commit {
+            let name = titleLabel.stringValue.trimmingCharacters(in: .whitespaces)
+            customName = name.isEmpty ? nil : name
+        }
+        titleLabel.isEditable = false
+        titleLabel.isSelectable = false
+        titleLabel.drawsBackground = false
+        titleLabel.stringValue = customName ?? autoTitle
+        window?.makeFirstResponder(term)
+    }
+
+    /// Highlight the pane that owns the keyboard: solid accent edge, accent
+    /// header, bright title and dot — the others are dimmed. Everything is
+    /// static (no pulses/sweeps): an endless animation makes the compositor
+    /// redraw the whole terminal window every frame. State-guarded, cheap.
     func setActive(_ on: Bool) {
         guard on != isActive else { return }
         isActive = on
@@ -3618,64 +4079,30 @@ final class TermPane: NSView {
     }
 
     private func applyActive() {
-        let green = neonMint
+        let acc = accent
         CATransaction.begin()
-        CATransaction.setAnimationDuration(0.25)
+        CATransaction.setDisableActions(true)
         if isActive {
-            // the whole pane edge glows softly, pulsing like a heartbeat —
-            // with 3-4 splits you spot the keyboard owner from the corner
-            // of your eye without reading titles
-            layer?.borderWidth = 1.5
-            layer?.borderColor = green.withAlphaComponent(0.45).cgColor
-            let pulse = CABasicAnimation(keyPath: "borderColor")
-            pulse.fromValue = green.withAlphaComponent(0.12).cgColor
-            pulse.toValue = green.withAlphaComponent(0.5).cgColor
-            pulse.duration = 1.2
-            pulse.autoreverses = true
-            pulse.repeatCount = .infinity
-            pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            layer?.add(pulse, forKey: "edgePulse")
-            headerGrad.colors = [NSColor(calibratedRed: 0.02, green: 0.14, blue: 0.09, alpha: 1).cgColor,
-                                 NSColor(calibratedRed: 0.01, green: 0.06, blue: 0.04, alpha: 1).cgColor]
-            titleLabel.textColor = NSColor(calibratedRed: 0.45, green: 1.0, blue: 0.75, alpha: 1)
-            // soft glow behind the title text
-            titleLabel.layer?.shadowColor = green.cgColor
-            titleLabel.layer?.shadowOpacity = 0.55
-            titleLabel.layer?.shadowRadius = 5
-            titleLabel.layer?.shadowOffset = .zero
-            dot.backgroundColor = green.cgColor
-            dot.shadowColor = green.cgColor
-            dot.shadowOpacity = 0.9
-            // the dot breathes while this pane has the keyboard
-            let breathe = CABasicAnimation(keyPath: "shadowRadius")
-            breathe.fromValue = 2.5
-            breathe.toValue = 5.5
-            breathe.duration = 1.2
-            breathe.autoreverses = true
-            breathe.repeatCount = .infinity
-            dot.add(breathe, forKey: "breathe")
-            // scanner streak sweeping the hairline, every few seconds
-            sweep.isHidden = false
-            let run = CABasicAnimation(keyPath: "position.x")
-            run.fromValue = -header.bounds.width * 0.3
-            run.toValue = header.bounds.width * 1.3
-            run.duration = 2.8
-            run.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            run.repeatCount = .infinity
-            sweep.add(run, forKey: "run")
+            layer?.borderWidth = 2
+            layer?.borderColor = acc.withAlphaComponent(0.9).cgColor
+            let hi = acc.blended(withFraction: 0.55, of: .black) ?? acc
+            let lo = acc.blended(withFraction: 0.72, of: .black) ?? acc
+            headerGrad.colors = [hi.cgColor, lo.cgColor]
+            hairline.backgroundColor = acc.cgColor
+            titleLabel.textColor = .white
+            titleLabel.font = .monospacedSystemFont(ofSize: 10, weight: .bold)
+            dot.backgroundColor = acc.blended(withFraction: 0.3, of: .white)?.cgColor ?? acc.cgColor
+            dimmer.isHidden = true
         } else {
-            layer?.borderWidth = 0
-            layer?.borderColor = nil
-            layer?.removeAnimation(forKey: "edgePulse")
-            headerGrad.colors = [NSColor(white: 0.11, alpha: 1).cgColor,
-                                 NSColor(white: 0.07, alpha: 1).cgColor]
-            titleLabel.textColor = NSColor(white: 0.55, alpha: 1)
-            titleLabel.layer?.shadowOpacity = 0
-            dot.backgroundColor = NSColor(white: 0.3, alpha: 1).cgColor
-            dot.shadowOpacity = 0
-            dot.removeAnimation(forKey: "breathe")
-            sweep.isHidden = true
-            sweep.removeAnimation(forKey: "run")
+            layer?.borderWidth = 1
+            layer?.borderColor = NSColor(white: 1, alpha: 0.06).cgColor
+            headerGrad.colors = [NSColor(white: 0.10, alpha: 1).cgColor,
+                                 NSColor(white: 0.06, alpha: 1).cgColor]
+            hairline.backgroundColor = NSColor(white: 1, alpha: 0.07).cgColor
+            titleLabel.textColor = NSColor(white: 0.45, alpha: 1)
+            titleLabel.font = .monospacedSystemFont(ofSize: 10, weight: .medium)
+            dot.backgroundColor = NSColor(white: 0.25, alpha: 1).cgColor
+            dimmer.isHidden = false
         }
         CATransaction.commit()
     }
@@ -3686,8 +4113,6 @@ final class TermPane: NSView {
         CATransaction.setDisableActions(true)
         headerGrad.frame = header.bounds
         hairline.frame = CGRect(x: 0, y: 0, width: header.bounds.width, height: 1)
-        sweep.bounds = CGRect(x: 0, y: 0, width: header.bounds.width * 0.35, height: 1.5)
-        sweep.position = CGPoint(x: 0, y: 0.75)
         dot.frame = CGRect(x: 7, y: (Self.headerH - 6) / 2, width: 6, height: 6)
         CATransaction.commit()
     }
@@ -3950,21 +4375,15 @@ final class BackdropView: NSView {
         layer?.insertSublayer(grad, at: 0)
         dots.backgroundColor = Self.dotPattern.cgColor
         layer?.insertSublayer(dots, above: grad)
-        // faint light spilling down from the notch, breathing very slowly —
-        // the terminal literally hangs from it, so it glows from it too
+        // faint light spilling down from the notch — the terminal literally
+        // hangs from it, so it glows from it too. Static: an endless
+        // "breathe" here recomposited the whole window every frame.
         notchGlow.type = .radial
         notchGlow.colors = [neonMint.withAlphaComponent(0.09).cgColor,
                             NSColor.clear.cgColor]
         notchGlow.startPoint = CGPoint(x: 0.5, y: 1)
         notchGlow.endPoint = CGPoint(x: 1.0, y: 0.0)
         layer?.insertSublayer(notchGlow, above: grad)
-        let breathe = CABasicAnimation(keyPath: "opacity")
-        breathe.fromValue = 1.0
-        breathe.toValue = 0.45
-        breathe.duration = 4.0
-        breathe.autoreverses = true
-        breathe.repeatCount = .infinity
-        notchGlow.add(breathe, forKey: "breathe")
     }
     required init?(coder: NSCoder) { nil }
     override func layout() {
@@ -4014,6 +4433,10 @@ final class RoundedRowView: NSTableRowView {
 
 /// Header strip of the notch terminal — visual only. The terminal is part of
 /// the notch: it cannot be moved, it only hangs centered under it.
+/// Which half of a target pane a header-drag is hovering: left/right insert a
+/// new column next to it, top/bottom stack within the target's column.
+enum PaneEdge { case left, right, top, bottom }
+
 final class TermDragStrip: NSView {
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
@@ -4208,6 +4631,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastSoundAt = Date.distantPast
     private var termWindow: NSPanel?
     private var termSplit: NSSplitView?
+    // one inner split per column — panes stack vertically inside, so layouts
+    // like "one full-height shell + a column split in two" are possible
+    private var termColumns: [NSSplitView] = []
+    // panes parked in the top strip as chips (shells keep running)
+    private var minimizedPanes: [TermPane] = []
+    private var paneChips: [(pane: TermPane, chip: NSButton)] = []
+    private weak var termStrip: NSView?
+    // header-drag pane rearranging
+    private var dragPane: TermPane?
+    private var dropTarget: (pane: TermPane, edge: PaneEdge)?
+    private var paneDropIndicator: NSView?
+    // tabs mode: browser-style tabs on top, one full-screen terminal at a
+    // time — toggled with the ❐/▦ strip button, persisted as "term-layout"
+    private var termTabMode = false
+    private weak var tabHost: NSView?
+    private weak var tabBar: NSView?
+    private weak var termModeBtn: NSButton?
+    private weak var activeTabPane: TermPane?
+    private var tabButtons: [(pane: TermPane, btn: NSButton)] = []
     private var termViews: [LocalProcessTerminalView] = []
     // last pane that owned the keyboard — re-shown terminals restore focus
     // here instead of always jumping back to the leftmost pane
@@ -4225,6 +4667,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var sshKeyPopupRef: NSPopUpButton?
     private var termHotkeyPopupRef: NSPopUpButton?
     private var loginCheckRef: NSButton?
+    private var autohideCheckRef: NSButton?
+    private var themeWindow: NSWindow?
+    private var themeTiles: [ThemePreviewTile] = []
+    private var themeNameLabelRef: NSTextField?
     private weak var menubarCheckRef: NSButton?
     private var pendTermDir = ""
     private var pendFilesDir = ""
@@ -4546,6 +4992,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sig.resume()
         signal(SIGUSR1, SIG_IGN)
         self.sigSource = sig
+        // SIGUSR2 toggles the notch terminal (same purpose: scripted checks)
+        let sig2 = DispatchSource.makeSignalSource(signal: SIGUSR2, queue: .main)
+        sig2.setEventHandler { [weak self] in self?.toggleTerminal() }
+        sig2.resume()
+        signal(SIGUSR2, SIG_IGN)
+        self.sigSource2 = sig2
 
         let tickTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in self?.tick() }
         tickTimer.tolerance = 0.03  // let the OS coalesce wakeups
@@ -4575,6 +5027,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // single state: the panel always opens at the big size (the old
         // hover-to-grow second state is gone)
         zoomed = on
+        listController.isShown = on
         if on { readSavedActions() }  // pick up external edits to the actions file
         listController.zoomFactor = on ? 1 + zoomPct / 100 : 1
         listController.contentWidth = panelContentWidth()
@@ -4651,6 +5104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var animating = false
     private var sigSource: DispatchSourceSignal?
+    private var sigSource2: DispatchSourceSignal?
 
     /// Scale + fade the content layer toward/away from the notch (top center).
     private func animatePanelLayer(open: Bool, completion: (() -> Void)? = nil) {
@@ -4862,17 +5316,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let newAsk = shown.contains { a in !asks.contains { $0.sessionID == a.sessionID } }
         asks = shown
         listController.asks = shown
-        if newAsk {
-            // one-time: open the panel and take key so the buttons are one
-            // click away — focus is never re-grabbed after this
-            if soundAttention { playSound("Ping") }
-            if !expanded { setExpanded(true) }
-            NSApp.activate(ignoringOtherApps: true)
-            window.makeKeyAndOrderFront(nil)
-            // leave no field focused: esc/"c" must work right away; clicking
-            // the reply field still focuses it on the first click
-            window.makeFirstResponder(nil)
-        }
+        // a new ask never opens the panel nor takes focus (that interrupted
+        // typing and left the terminal needing two clicks) — the Claude
+        // mascot in the notch hops and glows until it's answered; hover or
+        // click the notch to see the card
+        if newAsk, soundAttention { playSound("Ping") }
+        indicatorView.attention = !shown.isEmpty
+        render()
     }
 
     // touched only on scanQueue
@@ -5110,18 +5560,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if frame % 2 == 0, termWindow != nil { checkIAQuery() }
         // highlight the pane that owns the keyboard (state-guarded, cheap)
         if frame % 2 == 1, termWindow?.isVisible == true, termPanes.count > 0 {
-            let fr = termWindow?.firstResponder
-            for pane in termPanes { pane.setActive(pane.term === fr) }
-            // remember the focus owner while it's live — hide/show restores it
-            if let t = fr as? LocalProcessTerminalView, termViews.contains(t) {
-                lastFocusedTerm = t
-            }
+            refreshPaneFocus()
+            // minimized-pane chips / tab titles follow their shell's icon+title
+            if !paneChips.isEmpty, frame % 8 == 1 { relayoutChips() }
+            if termTabMode, frame % 8 == 1 { refreshTabBar() }
         }
         // repaint only while something on screen actually animates — an
         // idle/empty indicator repainting 8×/s is pure wasted CPU
         let animating = claudeState == .running || codexState == .running
-            || claudeState == .done || codexState == .done
+            || claudeState == .done || codexState == .done || !asks.isEmpty
         if animating || expanded { render() }
+    }
+
+    /// Light up the pane that owns the keyboard (and dim the rest). Runs on
+    /// the tick and immediately on a pane click; setActive is state-guarded.
+    private func refreshPaneFocus() {
+        let fr = termWindow?.firstResponder
+        for pane in termPanes { pane.setActive(pane.term === fr) }
+        // remember the focus owner while it's live — hide/show restores it
+        if let t = fr as? LocalProcessTerminalView, termViews.contains(t) {
+            lastFocusedTerm = t
+        }
     }
 
     /// Hover peek: resting the cursor on the indicator (~0.35 s) opens the
@@ -5192,9 +5651,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// A real terminal hanging from the notch — borderless, black, rounded
     /// bottom corners, always on top. ⌃⌥⇧T or the context menus toggle it:
     /// it unrolls from the notch like a curtain and rolls back up on hide,
-    /// while the shells keep running in the background. ⌘D splits up to 3
-    /// panes side by side. Run `claude` in one and its confirmations are
-    /// answered right here in the notch.
+    /// while the shells keep running in the background. The layout is a grid:
+    /// ⌘D adds a column, ⇧⌘D splits the focused column into rows (6 shells
+    /// max) — so "one full-height shell + a column split in two" works — and
+    /// dragging a pane's header rearranges them; – parks a pane as a chip in
+    /// the top strip. Run `claude` in one and its confirmations are answered
+    /// right here in the notch.
     @objc fileprivate func toggleTerminal() {
         if let w = termWindow {
             if w.isVisible { hideTerminal(w) } else { showTerminal(w) }
@@ -5211,25 +5673,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                              backing: .buffered, defer: false)
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = true
+        // no window shadow: AppKit recomputes a transparent window's shadow
+        // shape on every content flush — with a near-fullscreen terminal
+        // repainting on each keystroke that recompute was the typing lag
+        panel.hasShadow = false
         panel.level = .statusBar
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
         panel.minSize = NSSize(width: 480, height: 280)
         panel.isMovable = false  // the terminal IS part of the notch — it doesn't move
         panel.alphaValue = cfgAlpha("term-alpha")  // whole-window transparency
-        panel.onCommandKey = { [weak self] ch in
+        panel.onCommandKey = { [weak self] ch, shift in
             guard let self else { return false }
             let term = panel.firstResponder as? LocalProcessTerminalView
             switch ch {
             case "c" where term?.selectionActive == true,
                  "x" where term?.selectionActive == true: term?.copy(term); return true
             case "v" where term != nil: term?.paste(term); return true
-            case self.keySplit: self.addTerminalPane(); return true
+            case self.keySplit: self.addTerminalPane(row: shift); return true
             case self.keyFiles: self.toggleFileBrowser(); return true
             case self.keyFolders: self.toggleQuickFolders(); return true
             case self.keySSH: self.toggleSSHHosts(); return true
             default: return false
+            }
+        }
+        // optional escape hatch (config "term-autohide"): clicking anywhere
+        // else steals key status → the terminal curtains itself away, so a
+        // hung shell never traps the screen (its process keeps running)
+        NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification,
+                                               object: panel, queue: .main) { [weak self] _ in
+            guard let self, self.cfgString("term-autohide") == "1",
+                  self.termWindow?.isVisible == true else { return }
+            // only hide when focus really LEFT the app — moving to one of our
+            // own windows (settings, theme gallery…) keeps the terminal on
+            // screen, e.g. to watch a theme apply live
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let w = self.termWindow, w.isVisible,
+                      NSApp.keyWindow == nil else { return }
+                self.hideTerminal(w)
             }
         }
         // any resize re-centers under the notch, so dragging a corner grows
@@ -5247,10 +5728,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 w.setFrame(f, display: true)
             }
         }
+        // layout mode survives restarts: "tabs" or "grid" (default)
+        termTabMode = ((try? String(contentsOf: configURL("term-layout"), encoding: .utf8)) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines) == "tabs"
         let container = BackdropView(frame: NSRect(origin: .zero, size: NSSize(width: tw, height: th)))
         container.layer?.cornerRadius = 16
         container.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
-        container.layer?.borderColor = NSColor(white: 0.24, alpha: 1).cgColor
+        container.layer?.borderColor = themeAccent().withAlphaComponent(0.35).cgColor
         container.layer?.borderWidth = 1
         // optional wallpaper: a jpg/png (config "term-bg-image") pinned behind
         // the panes, aspect-filled and clipped to the same rounded corners
@@ -5273,6 +5757,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         closeBtn.contentTintColor = NSColor(white: 0.7, alpha: 1)
         closeBtn.frame = NSRect(x: 8, y: th - stripH, width: 20, height: stripH)
         closeBtn.autoresizingMask = [.minYMargin]
+        // ❐/▦: switch between tabs mode and the grid
+        let modeBtn = FirstMouseButton(title: termTabMode ? "▦" : "❐",
+                                       target: self, action: #selector(toggleTermLayout))
+        modeBtn.isBordered = false
+        modeBtn.font = .systemFont(ofSize: 11, weight: .semibold)
+        modeBtn.contentTintColor = NSColor(white: 0.7, alpha: 1)
+        modeBtn.frame = NSRect(x: 30, y: th - stripH, width: 22, height: stripH)
+        modeBtn.autoresizingMask = [.minYMargin]
+        modeBtn.toolTip = L(termTabMode ? "layout_grid_tip" : "layout_tabs_tip")
+        container.addSubview(modeBtn)
+        termModeBtn = modeBtn
         let split = NSSplitView(frame: NSRect(x: 12, y: 12, width: tw - 24, height: th - stripH - 16))
         split.isVertical = true
         split.dividerStyle = .thin
@@ -5280,6 +5775,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         container.addSubview(split)
         container.addSubview(strip)
         container.addSubview(closeBtn)
+        termStrip = strip
         let gripS: CGFloat = 26
         let gripL = TermCornerGrip(isLeft: true)
         gripL.frame = NSRect(x: 0, y: 0, width: gripS, height: gripS)
@@ -5292,14 +5788,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.contentView = container
         termWindow = panel
         termSplit = split
+        if termTabMode {
+            let host = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
+            split.addArrangedSubview(host)
+            tabHost = host
+            layoutTermChrome()
+        }
         applyTerminalBackgroundStyle()
         addTerminalPane()
         showTerminal(panel)
     }
 
-    /// ⌘D: add another shell pane to the notch terminal (up to 3).
-    @objc fileprivate func addTerminalPane() {
-        guard let split = termSplit, termViews.count < 3 else { return }
+    /// ⌘D: add another shell as a new COLUMN. ⇧⌘D: split the focused pane's
+    /// column into rows instead. Up to 6 shells in the grid. In tabs mode
+    /// both just open a new tab (up to 10).
+    @objc fileprivate func addTerminalPane() { addTerminalPane(row: false) }
+
+    fileprivate func addTerminalPane(row: Bool) {
+        guard let outer = termSplit, termViews.count < (termTabMode ? 10 : 6) else { return }
         let term = DropTerminalView(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
         term.font = terminalFont()
         term.nativeBackgroundColor = terminalPaneBG()
@@ -5307,15 +5813,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                                                : NSColor.clear.cgColor
         term.nativeForegroundColor = terminalFG()
         term.caretColor = terminalFG()
+        term.installColors(currentTermTheme().ansiColors)
         term.processDelegate = self
+        term.onFocus = { [weak self] in self?.refreshPaneFocus() }
         let pane = TermPane(term: term)
+        pane.accent = themeAccent()
+        pane.idleIcon = currentTermTheme().icon
         pane.onClose = { [weak self] p in self?.forceClosePane(p) }
+        pane.onMinimize = { [weak self] p in self?.minimizePane(p) }
+        pane.onMoveBegan = { [weak self] p in self?.paneDragBegan(p) }
+        pane.onMoved = { [weak self] p, loc in self?.paneDragMoved(p, loc) }
+        pane.onMoveEnded = { [weak self] p in self?.paneDragEnded(p) }
         // open next to the pane that has the keyboard, not always at the far
-        // right — splitting from the middle pane grows the split right there
+        // right — splitting from the middle pane grows the grid right there
         let focused = termWindow?.firstResponder as? LocalProcessTerminalView
-        let insertAt = termPanes.firstIndex { $0.term === focused }.map { $0 + 1 } ?? termPanes.count
-        split.insertArrangedSubview(pane, at: insertAt)
-        split.adjustSubviews()
+        let focusedPane = termPanes.first { $0.term === focused && $0.window != nil }
+        if termTabMode {
+            // tabs: no grid slot — the pane becomes the active tab below
+        } else if row, let fp = focusedPane, let col = fp.superview as? NSSplitView {
+            // ⇧: stack below the focused pane, inside its column
+            let at = (col.arrangedSubviews.firstIndex(of: fp) ?? col.arrangedSubviews.count - 1) + 1
+            col.insertArrangedSubview(pane, at: at)
+            evenOut(col)
+        } else {
+            // new column right of the focused pane's column (or at the end)
+            let col = makeColumn()
+            col.addArrangedSubview(pane)
+            var at = outer.arrangedSubviews.count
+            if let fcol = focusedPane?.superview as? NSSplitView,
+               let i = outer.arrangedSubviews.firstIndex(of: fcol) { at = i + 1 }
+            outer.insertArrangedSubview(col, at: at)
+            termColumns.append(col)
+        }
+        outer.adjustSubviews()
         // minimal prompt (project + git branch + blinking green block cursor)
         // via our own ZDOTDIR; the user's ~/.zshrc is still sourced first
         var env = ProcessInfo.processInfo.environment
@@ -5338,13 +5868,395 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         term.startProcess(executable: shell, args: ["-l"],
                           environment: env.map { "\($0.key)=\($0.value)" })
         pane.setTitle(URL(fileURLWithPath: startDir).lastPathComponent)
-        // keep the arrays in visual (left→right) order, matching the split
+        // keep the arrays in rough visual order, matching the grid
+        let insertAt = termPanes.firstIndex { $0.term === focused }.map { $0 + 1 } ?? termPanes.count
         termViews.insert(term, at: insertAt)
         termPanes.insert(pane, at: insertAt)
+        if termTabMode { selectTab(pane) }
         termWindow?.makeFirstResponder(term)
+        // GPU renderer (glyph atlas on Metal, like Warp) instead of SwiftTerm's
+        // per-row CoreText drawing on the main thread — the difference between
+        // a terminal that drags and one that keeps up. On by default; config
+        // "term-metal" = 0 falls back to CoreGraphics.
+        if cfgString("term-metal") != "0" {
+            DispatchQueue.main.async { [weak self, weak term] in
+                guard let self, let term, term.window != nil else { return }
+                try? term.setUseMetal(true)
+                self.applyMetalTransparency(term)
+            }
+        }
         // the caret view exists once the terminal took focus — dress it then
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self, weak term] in
             if let term { self?.styleCaret(term) }
+        }
+    }
+
+    /// A column of the grid: an inner split stacking panes top to bottom.
+    private func makeColumn() -> NSSplitView {
+        let col = NSSplitView(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
+        col.isVertical = false
+        col.dividerStyle = .thin
+        return col
+    }
+
+    /// Distribute a split's space evenly among its panes (used right after an
+    /// insert, so the newcomer doesn't start squashed).
+    private func evenOut(_ split: NSSplitView) {
+        split.layoutSubtreeIfNeeded()
+        let n = split.arrangedSubviews.count
+        guard n > 1 else { return }
+        let total = split.isVertical ? split.bounds.width : split.bounds.height
+        for i in 0..<(n - 1) {
+            split.setPosition(total * CGFloat(i + 1) / CGFloat(n), ofDividerAt: i)
+        }
+    }
+
+    /// Widths of a split's arranged subviews as fractions of their summed
+    /// width — the side-pane toggles snapshot these so opening/closing a
+    /// pane never distorts how the user had sized the terminal columns.
+    private func splitFractions(_ split: NSSplitView, excluding: NSView? = nil) -> [CGFloat] {
+        let widths = split.arrangedSubviews.filter { $0 !== excluding }.map { $0.frame.width }
+        let sum = widths.reduce(0, +)
+        guard sum > 0 else { return [] }
+        return widths.map { $0 / sum }
+    }
+
+    /// Re-apply saved width fractions to the split's arranged subviews.
+    /// With `fixedFirst`, subview 0 (a side pane) gets that exact width and
+    /// the fractions divide only the remaining space among the rest.
+    private func applyFractions(_ split: NSSplitView, _ fractions: [CGFloat], fixedFirst: CGFloat? = nil) {
+        split.layoutSubtreeIfNeeded()
+        let count = split.arrangedSubviews.count
+        guard count > 1, count - (fixedFirst != nil ? 1 : 0) == fractions.count else { return }
+        let dt = split.dividerThickness
+        let flexTotal = split.bounds.width - CGFloat(count - 1) * dt - (fixedFirst ?? 0)
+        guard flexTotal > 50 else { return }
+        var pos: CGFloat = 0
+        var divider = 0
+        if let fixedFirst {
+            pos = fixedFirst
+            split.setPosition(pos, ofDividerAt: 0)
+            divider = 1
+        }
+        for f in fractions.dropLast() {
+            pos += (divider > 0 ? dt : 0) + f * flexTotal
+            split.setPosition(pos, ofDividerAt: divider)
+            divider += 1
+        }
+    }
+
+    /// Drop an emptied column split from the outer split.
+    private func dropColumnIfEmpty(_ col: NSSplitView?) {
+        guard let col, termColumns.contains(where: { $0 === col }),
+              col.arrangedSubviews.isEmpty else { return }
+        col.removeFromSuperview()
+        termColumns.removeAll { $0 === col }
+        termSplit?.adjustSubviews()
+    }
+
+    // MARK: - Pane minimize (chips in the top strip)
+
+    /// –: pull the pane out of the grid and park it as a chip (icon + name)
+    /// in the top strip — the shell keeps running, space goes to the others.
+    private func minimizePane(_ pane: TermPane) {
+        guard pane.window != nil, let strip = termStrip else { return }
+        let col = pane.superview as? NSSplitView
+        pane.removeFromSuperview()
+        dropColumnIfEmpty(col)
+        col?.adjustSubviews()
+        minimizedPanes.append(pane)
+        let chip = FirstMouseButton(title: "", target: self, action: #selector(chipTapped(_:)))
+        chip.isBordered = false
+        chip.wantsLayer = true
+        chip.layer?.backgroundColor = NSColor(white: 1, alpha: 0.10).cgColor
+        chip.layer?.cornerRadius = 8
+        chip.font = .monospacedSystemFont(ofSize: 9, weight: .medium)
+        chip.contentTintColor = NSColor(white: 0.8, alpha: 1)
+        chip.toolTip = L("pane_restore")
+        strip.addSubview(chip)
+        paneChips.append((pane, chip))
+        relayoutChips()
+        if termTabMode {
+            // parking the active tab promotes the next open tab
+            if activeTabPane === pane {
+                activeTabPane = nil
+                if let next = termPanes.first(where: { p in
+                    !minimizedPanes.contains { $0 === p } }) { selectTab(next) }
+            }
+            rebuildTabBar()
+        }
+        if let next = termViews.first(where: { $0.window != nil }) {
+            termWindow?.makeFirstResponder(next)
+        }
+    }
+
+    @objc private func chipTapped(_ sender: NSButton) {
+        guard let entry = paneChips.first(where: { $0.chip === sender }) else { return }
+        restorePane(entry.pane)
+    }
+
+    /// Chip click: the pane comes back — as the active tab (tabs mode) or as
+    /// its own column at the right edge (grid).
+    private func restorePane(_ pane: TermPane) {
+        guard let outer = termSplit else { return }
+        removeChip(for: pane)
+        minimizedPanes.removeAll { $0 === pane }
+        if termTabMode {
+            selectTab(pane)
+            return
+        }
+        let col = makeColumn()
+        col.addArrangedSubview(pane)
+        outer.addArrangedSubview(col)
+        termColumns.append(col)
+        outer.adjustSubviews()
+        termWindow?.makeFirstResponder(pane.term)
+        restyleCaretSoon(pane.term)
+    }
+
+    private func removeChip(for pane: TermPane) {
+        if let idx = paneChips.firstIndex(where: { $0.pane === pane }) {
+            paneChips[idx].chip.removeFromSuperview()
+            paneChips.remove(at: idx)
+            relayoutChips()
+        }
+    }
+
+    /// Chips sit left-to-right after the window's ✕, refreshed every second
+    /// from the tick so their icon/name follow what the shell is doing.
+    fileprivate func relayoutChips() {
+        guard let strip = termStrip else { return }
+        var x: CGFloat = 58  // after the window ✕ and the layout-mode button
+        for (pane, chip) in paneChips {
+            chip.title = pane.displayIcon + " " + pane.displayName
+            let w = min(150, max(56, chip.intrinsicContentSize.width + 14))
+            chip.frame = NSRect(x: x, y: 2, width: w, height: strip.bounds.height - 4)
+            x += w + 6
+        }
+    }
+
+    // MARK: - Pane drag-to-move (header drag)
+
+    private func paneDragBegan(_ pane: TermPane) {
+        dragPane = pane
+        pane.alphaValue = 0.55
+        if paneDropIndicator == nil, let c = termWindow?.contentView {
+            let acc = themeAccent()
+            let v = NSView()
+            v.wantsLayer = true
+            v.layer?.backgroundColor = acc.withAlphaComponent(0.16).cgColor
+            v.layer?.borderColor = acc.withAlphaComponent(0.8).cgColor
+            v.layer?.borderWidth = 1.5
+            v.layer?.cornerRadius = 6
+            v.isHidden = true
+            c.addSubview(v)
+            paneDropIndicator = v
+        }
+    }
+
+    /// Track the cursor over the other panes: the nearest edge of whichever
+    /// pane it's on becomes the drop slot, previewed by the glowing overlay.
+    private func paneDragMoved(_ pane: TermPane, _ locInWindow: NSPoint) {
+        guard let container = termWindow?.contentView else { return }
+        dropTarget = nil
+        paneDropIndicator?.isHidden = true
+        for target in termPanes where target !== pane && target.window != nil {
+            let p = target.convert(locInWindow, from: nil)
+            guard target.bounds.contains(p) else { continue }
+            let rx = p.x / max(1, target.bounds.width)
+            let ry = p.y / max(1, target.bounds.height)   // 0 = bottom edge
+            let dists: [(PaneEdge, CGFloat)] = [(.left, rx), (.right, 1 - rx),
+                                                (.bottom, ry), (.top, 1 - ry)]
+            let edge = dists.min { $0.1 < $1.1 }!.0
+            dropTarget = (target, edge)
+            var r = container.convert(target.bounds, from: target)
+            switch edge {
+            case .left:   r.size.width /= 2
+            case .right:  r.origin.x += r.width / 2; r.size.width /= 2
+            case .bottom: r.size.height /= 2
+            case .top:    r.origin.y += r.height / 2; r.size.height /= 2
+            }
+            paneDropIndicator?.frame = r
+            paneDropIndicator?.isHidden = false
+            break
+        }
+    }
+
+    private func paneDragEnded(_ pane: TermPane) {
+        pane.alphaValue = 1
+        paneDropIndicator?.removeFromSuperview()
+        paneDropIndicator = nil
+        dragPane = nil
+        guard let (target, edge) = dropTarget else { return }
+        dropTarget = nil
+        movePane(pane, nextTo: target, edge: edge)
+    }
+
+    /// Re-slot a pane: left/right of the target → its own new column beside
+    /// the target's; top/bottom → stacked in the target's column.
+    private func movePane(_ pane: TermPane, nextTo target: TermPane, edge: PaneEdge) {
+        guard let outer = termSplit, pane !== target,
+              let tcol = target.superview as? NSSplitView else { return }
+        let oldCol = pane.superview as? NSSplitView
+        pane.removeFromSuperview()
+        dropColumnIfEmpty(oldCol)
+        oldCol?.adjustSubviews()
+        switch edge {
+        case .top, .bottom:
+            let ti = tcol.arrangedSubviews.firstIndex(of: target) ?? 0
+            tcol.insertArrangedSubview(pane, at: edge == .top ? ti : ti + 1)
+            evenOut(tcol)
+        case .left, .right:
+            let col = makeColumn()
+            col.addArrangedSubview(pane)
+            let ci = outer.arrangedSubviews.firstIndex(of: tcol)
+                ?? outer.arrangedSubviews.count - 1
+            outer.insertArrangedSubview(col, at: edge == .left ? ci : ci + 1)
+            termColumns.append(col)
+        }
+        outer.adjustSubviews()
+        termWindow?.makeFirstResponder(pane.term)
+        restyleCaretSoon(pane.term)
+    }
+
+    // MARK: - Tabs mode (browser-style: one full-screen terminal per tab)
+
+    @objc private func toggleTermLayout() {
+        if termTabMode { exitTabMode() } else { enterTabMode() }
+    }
+
+    /// Grid → tabs: every open pane becomes a tab, the focused one stays on
+    /// screen filling the whole window. Chips (minimized panes) stay chips.
+    private func enterTabMode() {
+        guard let outer = termSplit, !termTabMode else { return }
+        termTabMode = true
+        let current = termPanes.first { $0.term.window?.firstResponder === $0.term }
+            ?? termPanes.first { $0.window != nil }
+        for pane in termPanes where pane.window != nil { pane.removeFromSuperview() }
+        for col in termColumns { col.removeFromSuperview() }
+        termColumns.removeAll()
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 320))
+        outer.addArrangedSubview(host)
+        tabHost = host
+        outer.adjustSubviews()
+        layoutTermChrome()
+        if let current { selectTab(current) } else { rebuildTabBar() }
+        termModeBtn?.title = "▦"
+        termModeBtn?.toolTip = L("layout_grid_tip")
+        writeConfig("term-layout", "tabs")
+    }
+
+    /// Tabs → grid: every tab comes back as its own column, side by side.
+    private func exitTabMode() {
+        guard let outer = termSplit, termTabMode else { return }
+        termTabMode = false
+        let current = activeTabPane
+        activeTabPane?.removeFromSuperview()
+        activeTabPane = nil
+        tabHost?.removeFromSuperview()
+        tabHost = nil
+        tabBar?.removeFromSuperview()
+        tabBar = nil
+        tabButtons.removeAll()
+        for pane in termPanes where !minimizedPanes.contains(where: { $0 === pane }) {
+            let col = makeColumn()
+            col.addArrangedSubview(pane)
+            outer.addArrangedSubview(col)
+            termColumns.append(col)
+        }
+        outer.adjustSubviews()
+        layoutTermChrome()
+        (current ?? termPanes.first).map { termWindow?.makeFirstResponder($0.term) }
+        for pane in termPanes where pane.window != nil { restyleCaretSoon(pane.term) }
+        termModeBtn?.title = "❐"
+        termModeBtn?.toolTip = L("layout_tabs_tip")
+        writeConfig("term-layout", "grid")
+    }
+
+    /// Places the split (and, in tabs mode, the tab bar above it) inside the
+    /// window: tabs mode carves a 30px row for the tab strip.
+    private func layoutTermChrome() {
+        guard let container = termWindow?.contentView, let split = termSplit else { return }
+        let b = container.bounds
+        let stripH: CGFloat = 22
+        let tabH: CGFloat = termTabMode ? 30 : 0
+        if termTabMode {
+            if tabBar == nil {
+                let bar = NSView()
+                bar.autoresizingMask = [.width, .minYMargin]
+                container.addSubview(bar)
+                tabBar = bar
+            }
+            tabBar?.frame = NSRect(x: 12, y: b.height - stripH - tabH,
+                                   width: b.width - 24, height: tabH)
+        }
+        split.frame = NSRect(x: 12, y: 12, width: b.width - 24,
+                             height: b.height - stripH - tabH - 16)
+    }
+
+    /// Bring one tab's pane on screen (the previous one keeps its shell
+    /// running off-window, exactly like a background browser tab).
+    private func selectTab(_ pane: TermPane) {
+        guard let host = tabHost else { return }
+        if activeTabPane !== pane { activeTabPane?.removeFromSuperview() }
+        if pane.superview !== host {
+            pane.frame = host.bounds
+            pane.autoresizingMask = [.width, .height]
+            host.addSubview(pane)
+        }
+        activeTabPane = pane
+        termWindow?.makeFirstResponder(pane.term)
+        restyleCaretSoon(pane.term)
+        rebuildTabBar()
+    }
+
+    @objc private func tabTapped(_ sender: NSButton) {
+        guard let entry = tabButtons.first(where: { $0.btn === sender }) else { return }
+        if entry.pane !== activeTabPane { selectTab(entry.pane) }
+    }
+
+    /// Rebuild the tab strip from scratch (mode switch, tab added/removed,
+    /// active tab changed). Title/width refreshes ride the tick instead.
+    private func rebuildTabBar() {
+        guard let bar = tabBar else { return }
+        for (_, b) in tabButtons { b.removeFromSuperview() }
+        tabButtons.removeAll()
+        let tabs = termPanes.filter { p in !minimizedPanes.contains { $0 === p } }
+        for pane in tabs {
+            let btn = FirstMouseButton(title: "", target: self, action: #selector(tabTapped(_:)))
+            btn.isBordered = false
+            btn.wantsLayer = true
+            btn.font = .monospacedSystemFont(ofSize: 10, weight: .medium)
+            let active = pane === activeTabPane
+            let acc = themeAccent()
+            // browser-tab look: rounded top corners, the active one glows in
+            // the theme's accent
+            btn.layer?.cornerRadius = 7
+            btn.layer?.maskedCorners = [.layerMinXMaxYCorner, .layerMaxXMaxYCorner]
+            btn.layer?.backgroundColor = (active ? acc.withAlphaComponent(0.16)
+                                                 : NSColor(white: 1, alpha: 0.06)).cgColor
+            btn.contentTintColor = active
+                ? (acc.blended(withFraction: 0.4, of: .white) ?? acc)
+                : NSColor(white: 0.6, alpha: 1)
+            if active {
+                btn.layer?.borderWidth = 1
+                btn.layer?.borderColor = acc.withAlphaComponent(0.5).cgColor
+            }
+            bar.addSubview(btn)
+            tabButtons.append((pane, btn))
+        }
+        refreshTabBar()
+    }
+
+    /// Cheap per-tick refresh: tab titles/icons follow what each shell runs.
+    fileprivate func refreshTabBar() {
+        guard let bar = tabBar else { return }
+        var x: CGFloat = 0
+        for (pane, btn) in tabButtons {
+            btn.title = pane.displayIcon + " " + pane.displayName
+            let w = min(180, max(70, btn.intrinsicContentSize.width + 18))
+            btn.frame = NSRect(x: x, y: 0, width: w, height: bar.bounds.height - 4)
+            x += w + 4
         }
     }
 
@@ -5470,9 +6382,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return dir
     }
 
-    /// Focused terminal (or the first one), for pane→terminal syncing.
+    /// Focused terminal (or the first VISIBLE one — minimized panes have no
+    /// window), for pane→terminal syncing.
     private var focusedTerminal: LocalProcessTerminalView? {
-        termViews.first { $0.window?.firstResponder === $0 } ?? termViews.first
+        termViews.first { $0.window?.firstResponder === $0 }
+            ?? termViews.first { $0.window != nil }
+            ?? termViews.first
     }
 
     /// The quick-folders pane navigated — `cd` the terminal to match,
@@ -5525,8 +6440,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The pane focus should return to on re-show: the last one that owned the
     /// keyboard, as long as it's still alive — otherwise the first pane.
     private func restorableFocusTerm() -> LocalProcessTerminalView? {
-        if let t = lastFocusedTerm, termViews.contains(t) { return t }
-        return termViews.first
+        if let t = lastFocusedTerm, termViews.contains(t), t.window != nil { return t }
+        return termViews.first { $0.window != nil } ?? termViews.first
     }
 
     /// Curtain animation: unroll down from the notch with a tiny spring settle
@@ -5626,6 +6541,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lyr.shadowOpacity = 0.85
         lyr.shadowRadius = 6
         lyr.shadowOffset = .zero
+        // explicit shape: without it CA renders the glow offscreen on every
+        // frame of the blink
+        lyr.shadowPath = CGPath(rect: caret.bounds, transform: nil)
         lyr.sublayers?.filter { $0.name == "notchCaretGrad" }.forEach { $0.removeFromSuperlayer() }
         let g = CAGradientLayer()
         g.name = "notchCaretGrad"
@@ -5651,10 +6569,162 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func terminalFG() -> NSColor { colorFromHex(cfgString("term-fg")) ?? neonMint }
     func terminalBG() -> NSColor { colorFromHex(cfgString("term-bg")) ?? .black }
 
+    /// The selected theme (config "term-theme"); the first one (Notch) if unset.
+    func currentTermTheme() -> TermTheme { termTheme(id: cfgString("term-theme")) }
+
+    /// The theme's chrome highlight, used everywhere the terminal window
+    /// paints an accent (border, active pane, tabs, drop indicator).
+    func themeAccent() -> NSColor { colorFromHex(currentTermTheme().accent) ?? neonMint }
+
+    /// Theme picked in the gallery: persist it (id + fg/bg, so the color
+    /// wells stay in sync as fine-tuning) and restyle every open shell live.
+    private func applyTermTheme(_ theme: TermTheme) {
+        writeConfig("term-theme", theme.id)
+        writeConfig("term-fg", theme.fg)
+        writeConfig("term-bg", theme.bg)
+        fgWellRef?.color = colorFromHex(theme.fg) ?? neonMint
+        bgWellRef?.color = colorFromHex(theme.bg) ?? .black
+        themeNameLabelRef?.stringValue = theme.name
+        applyTerminalBackgroundStyle()
+        let fg = terminalFG()
+        for t in termViews {
+            t.nativeForegroundColor = fg
+            t.caretColor = fg
+            t.installColors(theme.ansiColors)
+            restyleCaretSoon(t)
+        }
+        // full chrome, not just cell colors: window border, pane headers,
+        // titles, focus animations and tab strip all take the theme's accent
+        let acc = themeAccent()
+        termWindow?.contentView?.layer?.borderColor = acc.withAlphaComponent(0.35).cgColor
+        for pane in termPanes {
+            pane.accent = acc
+            pane.idleIcon = theme.icon
+        }
+        if termTabMode { rebuildTabBar() }
+        relayoutChips()
+        for tile in themeTiles { tile.isSelected = tile.theme.id == theme.id }
+    }
+
+    /// Configuración > Terminal > "Elegir tema…": a gallery of mini terminal
+    /// previews — click one and every open shell restyles on the spot.
+    @objc private func showThemeGallery() {
+        NSApp.activate(ignoringOtherApps: true)
+        themeWindow?.close()
+        themeTiles.removeAll()
+        let hint = NSTextField(labelWithString: L("theme_hint"))
+        hint.textColor = .secondaryLabelColor
+        hint.font = .systemFont(ofSize: 11)
+        let grid = NSStackView()
+        grid.orientation = .vertical
+        grid.alignment = .leading
+        grid.spacing = 10
+        grid.translatesAutoresizingMaskIntoConstraints = false
+        let current = currentTermTheme().id
+        // big live mock: repaints with whatever theme the mouse hovers, and
+        // sticks to the picked one — you preview without leaving the window
+        let big = ThemeBigPreview(theme: currentTermTheme())
+        let perRow = 4
+        var i = 0
+        while i < termThemes.count {
+            let rowThemes = Array(termThemes[i..<min(i + perRow, termThemes.count)])
+            let tiles = rowThemes.map { theme -> ThemePreviewTile in
+                let tile = ThemePreviewTile(theme: theme)
+                tile.isSelected = theme.id == current
+                tile.onHover = { [weak big] t in big?.theme = t }
+                tile.onPick = { [weak self, weak big] t in
+                    big?.theme = t
+                    self?.applyTermTheme(t)
+                }
+                themeTiles.append(tile)
+                return tile
+            }
+            let rowStack = NSStackView(views: tiles)
+            rowStack.orientation = .horizontal
+            rowStack.spacing = 10
+            grid.addArrangedSubview(rowStack)
+            i += perRow
+        }
+        let doc = FlippedView()
+        doc.translatesAutoresizingMaskIntoConstraints = false
+        doc.addSubview(grid)
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.documentView = doc
+        NSLayoutConstraint.activate([
+            grid.topAnchor.constraint(equalTo: doc.topAnchor),
+            grid.leadingAnchor.constraint(equalTo: doc.leadingAnchor),
+            grid.trailingAnchor.constraint(equalTo: doc.trailingAnchor),
+            grid.bottomAnchor.constraint(equalTo: doc.bottomAnchor),
+            doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            scroll.widthAnchor.constraint(equalToConstant: 4 * 150 + 3 * 10 + 16),
+            scroll.heightAnchor.constraint(equalToConstant: 300),
+        ])
+        let root = NSStackView(views: [hint, big, scroll])
+        root.orientation = .vertical
+        root.alignment = .leading
+        root.spacing = 10
+        root.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 660, height: 470),
+                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        w.title = L("theme_title")
+        w.isReleasedWhenClosed = false
+        w.contentView = root
+        w.setContentSize(root.fittingSize)
+        w.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 2)
+        positionOnNotchScreen(w)
+        themeWindow = w
+        w.makeKeyAndOrderFront(nil)
+    }
+
+    /// Re-dress a pane's caret shortly after it moved/restyled — moving a
+    /// view across the hierarchy strips its Core Animations (the caret's
+    /// glow/blink included).
+    private func restyleCaretSoon(_ term: LocalProcessTerminalView) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self, weak term] in
+            if let term { self?.styleCaret(term) }
+        }
+    }
+
     /// Optional terminal wallpaper (config "term-bg-image", a jpg/png path).
+    /// Decoded once per path and downscaled to the screen's pixel size — a
+    /// 4K PNG handed to the layer as-is was resampled on every composite.
     func terminalBGImage() -> NSImage? {
         let p = cfgString("term-bg-image")
-        return p.isEmpty ? nil : NSImage(contentsOfFile: p)
+        if p.isEmpty { return nil }
+        if p == bgImageCache.path { return bgImageCache.image }
+        var img = NSImage(contentsOfFile: p)
+        if let src = img?.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+            let px = screen.frame.size.applying(.init(scaleX: screen.backingScaleFactor,
+                                                      y: screen.backingScaleFactor))
+            let k = max(px.width / CGFloat(src.width), px.height / CGFloat(src.height))
+            if k < 1, let ctx = CGContext(data: nil, width: Int(CGFloat(src.width) * k),
+                                          height: Int(CGFloat(src.height) * k), bitsPerComponent: 8,
+                                          bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue) {
+                ctx.interpolationQuality = .high
+                ctx.draw(src, in: CGRect(x: 0, y: 0, width: ctx.width, height: ctx.height))
+                if let small = ctx.makeImage() {
+                    img = NSImage(cgImage: small, size: NSSize(width: ctx.width, height: ctx.height))
+                }
+            }
+        }
+        bgImageCache = (p, img)
+        return img
+    }
+    private var bgImageCache: (path: String, image: NSImage?) = ("", nil)
+
+    /// The Metal layer is opaque by default: with a wallpaper it must let the
+    /// (translucent) terminal background through, like the CoreText path.
+    func applyMetalTransparency(_ term: LocalProcessTerminalView) {
+        let see = terminalBGImage() != nil
+        for v in term.subviews where v is MTKView {
+            v.layer?.isOpaque = !see
+            (v as? MTKView)?.layer?.backgroundColor = NSColor.clear.cgColor
+            v.needsDisplay = true
+        }
     }
 
     /// The color the panes actually paint with. With a wallpaper, the
@@ -5679,6 +6749,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // SwiftTerm fills cells with the (possibly translucent) color; the
             // backing layer must not stay opaque black or the image is blocked
             t.layer?.backgroundColor = img == nil ? terminalBG().cgColor : NSColor.clear.cgColor
+            applyMetalTransparency(t)
         }
     }
 
@@ -5692,18 +6763,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         removePane(pane)
     }
 
-    /// Drop one pane from the split (✕ button or its shell exiting). Focus
-    /// moves to a surviving pane; the last pane closing closes the terminal.
+    /// Drop one pane from the grid (✕ button or its shell exiting) — also
+    /// covers minimized panes (their chip goes too). Focus moves to a
+    /// surviving pane; the last pane closing closes the terminal.
     private func removePane(_ pane: TermPane) {
         if let idx = termViews.firstIndex(of: pane.term) { termViews.remove(at: idx) }
         if let idx = termPanes.firstIndex(where: { $0 === pane }) { termPanes.remove(at: idx) }
+        removeChip(for: pane)
+        minimizedPanes.removeAll { $0 === pane }
+        let col = pane.superview as? NSSplitView
         pane.removeFromSuperview()
+        dropColumnIfEmpty(col)
+        col?.adjustSubviews()
         termSplit?.adjustSubviews()
         if termViews.isEmpty {
             forceCloseTerminal()
-        } else {
-            termWindow?.makeFirstResponder(termViews.first)
+            return
         }
+        if termTabMode {
+            // closing the active tab promotes a neighbour; any close redraws the strip
+            if activeTabPane === pane {
+                activeTabPane = nil
+                if let next = termPanes.first(where: { p in
+                    !minimizedPanes.contains { $0 === p } }) { selectTab(next) }
+            }
+            rebuildTabBar()
+        }
+        termWindow?.makeFirstResponder(termViews.first { $0.window != nil } ?? termViews.first)
     }
 
     /// Full close: kills every shell (✕ button, hung shells) and discards the
@@ -5712,6 +6798,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for t in termViews { t.terminate() }
         termViews.removeAll()
         termPanes.removeAll()
+        termColumns.removeAll()
+        minimizedPanes.removeAll()
+        paneChips.removeAll()
+        tabButtons.removeAll()
+        activeTabPane = nil
+        tabHost = nil
+        tabBar = nil
+        dragPane = nil
+        dropTarget = nil
+        paneDropIndicator = nil
         fileBrowser = nil
         quickFolders = nil
         sshHosts = nil
@@ -5738,19 +6834,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc fileprivate func toggleQuickFolders() {
         guard let split = termSplit else { return }
         if let qf = quickFolders {
+            let fractions = splitFractions(split, excluding: qf)
             qf.removeFromSuperview()
             quickFolders = nil
             split.adjustSubviews()
+            applyFractions(split, fractions)
             return
         }
+        let fractions = splitFractions(split)
         let qf = QuickFoldersPane(startDir: URL(fileURLWithPath: filesStartDir()))
         qf.onNavigate = { [weak self] url in self?.cdTerminal(to: url) }
         quickFolders = qf
         split.insertArrangedSubview(qf, at: 0)
         split.setHoldingPriority(NSLayoutConstraint.Priority(260), forSubviewAt: 0)
         split.adjustSubviews()
-        DispatchQueue.main.async { [weak split, weak qf] in
-            split?.setPosition(230, ofDividerAt: 0)
+        DispatchQueue.main.async { [weak self, weak split, weak qf] in
+            guard let self, let split else { return }
+            self.applyFractions(split, fractions, fixedFirst: 230)
             qf.map { AppDelegate.slideIn($0) }
         }
     }
@@ -5760,9 +6860,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc fileprivate func toggleSSHHosts() {
         guard let split = termSplit else { return }
         if let sp = sshHosts {
+            let fractions = splitFractions(split, excluding: sp)
             sp.removeFromSuperview()
             sshHosts = nil
             split.adjustSubviews()
+            applyFractions(split, fractions)
             return
         }
         let sp = SSHHostsPane()
@@ -5774,11 +6876,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.termWindow?.makeFirstResponder(term)
         }
         sshHosts = sp
+        let fractions = splitFractions(split)
         split.insertArrangedSubview(sp, at: 0)
         split.setHoldingPriority(NSLayoutConstraint.Priority(260), forSubviewAt: 0)
         split.adjustSubviews()
-        DispatchQueue.main.async { [weak split, weak sp] in
-            split?.setPosition(230, ofDividerAt: 0)
+        DispatchQueue.main.async { [weak self, weak split, weak sp] in
+            guard let self, let split else { return }
+            self.applyFractions(split, fractions, fixedFirst: 230)
             sp.map { AppDelegate.slideIn($0) }
         }
     }
@@ -5804,18 +6908,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc fileprivate func toggleFileBrowser() {
         guard let split = termSplit else { return }
         if let fb = fileBrowser {
+            // restore the column widths the user had, not a proportional guess
+            let fractions = splitFractions(split, excluding: fb)
             fb.removeFromSuperview()
             fileBrowser = nil
             split.adjustSubviews()
+            applyFractions(split, fractions)
             return
         }
+        let fractions = splitFractions(split)
         let fb = FileBrowserPane(startDir: URL(fileURLWithPath: filesStartDir()))
         fileBrowser = fb
         split.insertArrangedSubview(fb, at: 0)
         split.setHoldingPriority(NSLayoutConstraint.Priority(260), forSubviewAt: 0)  // keep width; terminals flex
         split.adjustSubviews()
-        DispatchQueue.main.async { [weak split] in
-            split?.setPosition(420, ofDividerAt: 0)  // sidebar + list need real width
+        DispatchQueue.main.async { [weak self, weak split] in
+            guard let self, let split else { return }
+            // sidebar + list need real width; the columns share the rest in
+            // the same proportions they had before the pane appeared
+            self.applyFractions(split, fractions, fixedFirst: 420)
             // only now the pane is in the window — earlier, makeFirstResponder
             // would fail and the arrow keys would need a click first
             fb.focusInitial()
@@ -5968,6 +7079,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         bgWell.widthAnchor.constraint(equalToConstant: 44).isActive = true
         bgWell.heightAnchor.constraint(equalToConstant: 24).isActive = true
         bgWellRef = bgWell
+        let themeName = smallLabel(currentTermTheme().name)
+        themeNameLabelRef = themeName
+        let autohideCheck = NSButton(checkboxWithTitle: L("term_autohide"), target: nil, action: nil)
+        autohideCheck.state = cfgString("term-autohide") == "1" ? .on : .off
+        autohideCheckRef = autohideCheck
 
         // /ia model picker: starts disabled with the saved value, then GET
         // /api/tags fills it in — stays disabled (and is never saved) when
@@ -6073,12 +7189,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             row(L("files_dir"), [filesDirLbl, button(L("choose_dir"), #selector(chooseFilesDir)),
                                  button(L("clear_dir"), #selector(clearFilesDir))]),
             row(L("term_font"), [fontPopup, fontSize, smallLabel("pt")]),
+            row(L("term_theme"), [button(L("theme_choose"), #selector(showThemeGallery)), themeName]),
             row(L("term_colors"), [smallLabel(L("term_fg_lbl")), fgWell,
                                    smallLabel(L("term_bg_lbl")), bgWell]),
             row(L("term_bg_image"), [termBGImgLbl, button(L("choose_dir"), #selector(chooseTermBGImage)),
                                      button(L("clear_dir"), #selector(clearTermBGImage))]),
             row(L("term_size"), [termSizeField, termSizePctLabel]),
             row(L("term_alpha"), [termAlphaField, taPct]),
+            row(L("term_autohide_lbl"), [autohideCheck]),
             row(L("actions_title"), [button(L("actions_edit"), #selector(editActions))]),
         ])
         let aiTab = group([
@@ -6200,6 +7318,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if let c = menubarCheckRef {
             writeConfig("menubar-mode", c.state == .on ? "1" : "")  // empty deletes the flag
+        }
+        if let c = autohideCheckRef {
+            writeConfig("term-autohide", c.state == .on ? "1" : "")
         }
         if let p = fontPopupRef {
             writeConfig("term-font", p.indexOfSelectedItem == 0 ? "" : (p.titleOfSelectedItem ?? ""))
